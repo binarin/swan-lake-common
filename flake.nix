@@ -15,6 +15,9 @@
 
     home-manager.url = "github:binarin/home-manager/swan-lake-current/release-26.05";
     home-manager.inputs.nixpkgs.follows = "nixpkgs";
+
+    sops-nix.url = "github:binarin/sops-nix/swan-lake-current";
+    sops-nix.inputs.nixpkgs.follows = "nixpkgs";
   };
 
   outputs =

@@ -42,6 +42,27 @@
         "type": "github"
       }
     },
+    "home-manager": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1792818383,
+        "narHash": "sha256-199i7ubVSXTMl+0AAlL7cVCXSjcI+jWByMcimYjeMX0=",
+        "owner": "binarin",
+        "repo": "home-manager",
+        "rev": "24f2190587513b9c2f73db112a17844ae912d965",
+        "type": "github"
+      },
+      "original": {
+        "owner": "binarin",
+        "ref": "swan-lake-current/release-26.05",
+        "repo": "home-manager",
+        "type": "github"
+      }
+    },
     "import-tree": {
       "locked": {
         "lastModified": 1788467110,
@@ -94,9 +115,32 @@
       "inputs": {
         "disko": "disko",
         "flake-parts": "flake-parts",
+        "home-manager": "home-manager",
         "import-tree": "import-tree",
         "nixpkgs": "nixpkgs",
-        "nixpkgs-unstable": "nixpkgs-unstable"
+        "nixpkgs-unstable": "nixpkgs-unstable",
+        "sops-nix": "sops-nix"
+      }
+    },
+    "sops-nix": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1793052255,
+        "narHash": "sha256-Y/JIHTnMlOabDfyaSBubWGLDIVGihLEUuoMhFvQKaDo=",
+        "owner": "binarin",
+        "repo": "sops-nix",
+        "rev": "60182817ee048ac94b4c68ea76d5ef2e8aac730d",
+        "type": "github"
+      },
+      "original": {
+        "owner": "binarin",
+        "ref": "swan-lake-current",
+        "repo": "sops-nix",
+        "type": "github"
       }
     }
   },
