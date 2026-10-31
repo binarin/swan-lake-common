@@ -9,6 +9,9 @@
     nixpkgs-unstable.url = "github:binarin/nixpkgs/swan-lake-current/nixpkgs-unstable";
 
     import-tree.url = "github:binarin/import-tree/swan-lake-current";
+
+    disko.url = "github:binarin/disko/swan-lake-current";
+    disko.inputs.nixpkgs.follows = "nixpkgs";
   };
 
   outputs =
