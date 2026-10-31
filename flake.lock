@@ -21,6 +21,23 @@
         "type": "github"
       }
     },
+    "emacs-tramp-rpc": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1791350417,
+        "narHash": "sha256-PsqmbRdppVWZpN+M0FFSMvjKrQHGVR8X/yTev09Mhw4=",
+        "owner": "binarin",
+        "repo": "emacs-tramp-rpc",
+        "rev": "c9cb8bfc0bd7f4e2c49245902fefa49fbe6ac8b4",
+        "type": "github"
+      },
+      "original": {
+        "owner": "binarin",
+        "ref": "swan-lake-current",
+        "repo": "emacs-tramp-rpc",
+        "type": "github"
+      }
+    },
     "flake-parts": {
       "inputs": {
         "nixpkgs-lib": [
@@ -114,6 +131,7 @@
     "root": {
       "inputs": {
         "disko": "disko",
+        "emacs-tramp-rpc": "emacs-tramp-rpc",
         "flake-parts": "flake-parts",
         "home-manager": "home-manager",
         "import-tree": "import-tree",

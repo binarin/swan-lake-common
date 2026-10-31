@@ -18,6 +18,9 @@
 
     sops-nix.url = "github:binarin/sops-nix/swan-lake-current";
     sops-nix.inputs.nixpkgs.follows = "nixpkgs";
+
+    emacs-tramp-rpc.url = "github:binarin/emacs-tramp-rpc/swan-lake-current";
+    emacs-tramp-rpc.flake = false;
   };
 
   outputs =
