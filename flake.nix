@@ -12,6 +12,9 @@
 
     disko.url = "github:binarin/disko/swan-lake-current";
     disko.inputs.nixpkgs.follows = "nixpkgs";
+
+    home-manager.url = "github:binarin/home-manager/swan-lake-current/release-26.05";
+    home-manager.inputs.nixpkgs.follows = "nixpkgs";
   };
 
   outputs =
