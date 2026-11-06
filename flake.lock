@@ -21,6 +21,30 @@
         "type": "github"
       }
     },
+    "emacs-overlay": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ],
+        "nixpkgs-stable": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1793772322,
+        "narHash": "sha256-d+8KUtXg79GqnoIGnKADaJQ4T8ZKv8mC1o2V193jwEI=",
+        "owner": "binarin",
+        "repo": "emacs-overlay",
+        "rev": "693a02e24d99e44651298d1612d64d9cd24364b7",
+        "type": "github"
+      },
+      "original": {
+        "owner": "binarin",
+        "ref": "swan-lake-current",
+        "repo": "emacs-overlay",
+        "type": "github"
+      }
+    },
     "emacs-tramp-rpc": {
       "flake": false,
       "locked": {
@@ -131,6 +155,7 @@
     "root": {
       "inputs": {
         "disko": "disko",
+        "emacs-overlay": "emacs-overlay",
         "emacs-tramp-rpc": "emacs-tramp-rpc",
         "flake-parts": "flake-parts",
         "home-manager": "home-manager",

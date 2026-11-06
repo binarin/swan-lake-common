@@ -17,6 +17,9 @@ let
     (emacsPackagesFor basePackage).emacsWithPackages (
       e: with e; [
         (tramp-rpc-builder e)
+        batppuccin
+        zenburn-theme
+
         consult
         corfu
         vertico
@@ -26,7 +29,9 @@ let
         embark-consult
         magit
         ws-butler
-        zenburn-theme
+        nix-mode
+        direnv
+
         treesit-grammars.with-all-grammars
       ]
     );

@@ -4,7 +4,9 @@ let
   nixpkgsConfig = {
     allowUnfree = true;
   };
-  defaultOverlays = [ ];
+  defaultOverlays = [
+    inputs.emacs-overlay.overlays.package
+  ];
   importNixpkgs =
     {
       input,
