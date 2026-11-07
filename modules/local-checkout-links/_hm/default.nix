@@ -14,21 +14,27 @@ let
     p != ""
     && !(builtins.hasContext p)
     && lib.all (x: x != "" && x != "." && x != "..") (lib.splitString "/" p);
-  overlap = a: b: a == b || lib.hasPrefix (a + "/") b || lib.hasPrefix (b + "/") a;
+  overlap =
+    a: b:
+    a == b
+    || lib.hasPrefix (lib.removeSuffix "/" a + "/") b
+    || lib.hasPrefix (lib.removeSuffix "/" b + "/") a;
   rootValid =
     p:
     p == null
     || (
       !builtins.hasContext p
       && lib.hasPrefix "/" p
-      && !(overlap "/nix/store" p)
+      && (p == "/" || !(overlap "/nix/store" p))
       && (p == "/" || relative (lib.removePrefix "/" p))
     );
-  homeFiles = map (f: "${config.home.homeDirectory}/${f.target}") (
+  # Path addition and toString normalize lexically, without reading home or
+  # following symlinks. HM normalizes these targets when building its files tree.
+  homeFiles = map (f: toString (/. + "${config.home.homeDirectory}/${f.target}")) (
     lib.filter (f: f.enable) (lib.attrValues config.home.file)
   );
   state = "${config.xdg.stateHome}/home-manager/local-checkout-links";
-  helper = "${pkgs.python3}/bin/python3 ${../tools/local-checkout-links/reconcile.py}";
+  helper = "${pkgs.python3}/bin/python3 ${../_runtime/reconcile.py}";
   rawManifest = pkgs.writeText "local-checkout-links-raw.json" (
     builtins.toJSON {
       home = config.home.homeDirectory;

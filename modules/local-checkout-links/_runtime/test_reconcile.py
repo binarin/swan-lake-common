@@ -432,8 +432,8 @@ class Runtime(unittest.TestCase):
     def test_discovery_race_is_detected(self):
         self.directory_setup()
         original_kind = r.kind
-        def change(path):
-            value = original_kind(path)
+        def change(path, **kwargs):
+            value = original_kind(path, **kwargs)
             if path == self.local / 'a':
                 (self.local / 'late').write_text('late addition')
             return value
@@ -450,6 +450,105 @@ class Runtime(unittest.TestCase):
         with self.assertRaisesRegex(r.Error, 'overlap'):
             self.run_links()
         self.assertEqual(self.dest.read_text(), 'user')
+
+    def test_home_file_aliases_reject_active_and_old_ownership_without_writes(self):
+        self.dest.parent.mkdir()
+        self.dest.symlink_to(self.fallback)
+        aliases = ('config/./file', 'config/a/../file', 'config//file',
+                   './config', 'other/../config/file/child', 'config/..')
+        for target in aliases:
+            with self.subTest(target=target):
+                self.manifest['homeFiles'] = [str(self.home) + '/' + target]
+                before = self.snapshot()
+                with self.assertRaisesRegex(r.Error, 'overlaps home.file'):
+                    self.run_links()
+                self.assertEqual(self.snapshot(), before)
+        self.manifest['homeFiles'] = [str(self.home) + '/config/./sibling']
+        self.run_links()
+        self.manifest['files'] = {}
+        for ownership in ('links', 'pending'):
+            if ownership == 'pending':
+                self.manifest['homeFiles'] = []
+                self.reconciler().save({'version': 1, 'links': {}, 'pending': {
+                    'path': 'config/file', 'old': None, 'new': str(self.local)}})
+            for target in aliases:
+                with self.subTest(handback=target, ownership=ownership):
+                    self.manifest['homeFiles'] = [str(self.home) + '/' + target]
+                    before = self.snapshot()
+                    with self.assertRaisesRegex(r.Error, 'handback'):
+                        self.run_links()
+                    self.assertEqual(self.snapshot(), before)
+
+    def test_nested_dangling_fallback_rejected_but_local_links_fall_back_or_retire(self):
+        tree = self.directory_setup()
+        (self.fallback / 'nested/broken').symlink_to('/nonexistent-zl0040')
+        before = self.snapshot()
+        with self.assertRaisesRegex(r.Error, 'dangling fallback symlink'):
+            self.run_links()
+        self.assertEqual(self.snapshot(), before)
+        (self.fallback / 'nested/broken').unlink()
+        self.run_links()
+        (self.local / 'a').unlink()
+        (self.local / 'a').symlink_to('/nonexistent-zl0040')
+        (self.local / 'extra').unlink()
+        (self.local / 'extra').symlink_to('/nonexistent-zl0040')
+        self.run_links()
+        self.assertEqual(os.readlink(tree / 'a'), str(self.fallback / 'a'))
+        self.assertFalse(os.path.lexists(tree / 'extra'))
+        self.assertEqual(self.ledger()['links']['tree/a'], str(self.fallback / 'a'))
+
+    @unittest.skipUnless(os.environ.get('REAL_TRASH'), 'requires pinned trash-cli')
+    def test_real_trash_first_use_in_watched_ancestor(self):
+        self.backup = Path(os.environ['REAL_TRASH'])
+        entry = self.manifest['files'].pop('config/file')
+        self.manifest['files']['.local/app/config'] = entry
+        dest = self.home / '.local/app/config'
+        dest.parent.mkdir(parents=True)
+        dest.write_text('first use backup')
+        self.assertFalse((self.home / '.local/share').exists())
+        with patch.dict(os.environ, HOME=str(self.home), XDG_DATA_HOME=str(self.home / '.local/share')):
+            self.run_links()
+            self.assertEqual(os.readlink(dest), str(self.local))
+            files = list((self.home / '.local/share/Trash/files').iterdir())
+            self.assertEqual([p.read_text() for p in files], ['first use backup'])
+            inode = dest.lstat().st_ino
+            self.run_links()
+            self.assertEqual(dest.lstat().st_ino, inode)
+            self.assertEqual(list((self.home / '.local/share/Trash/files').iterdir()), files)
+
+    @unittest.skipUnless(os.environ.get('REAL_TRASH'), 'requires pinned trash-cli')
+    def test_trash_creation_does_not_mask_unrelated_or_source_races(self):
+        self.backup = Path(os.environ['REAL_TRASH'])
+        entry = self.manifest['files'].pop('config/file')
+        self.manifest['files']['.local/app/config'] = entry
+        dest = self.home / '.local/app/config'
+        dest.parent.mkdir(parents=True)
+        real_run = r.subprocess.run
+        with patch.dict(os.environ, HOME=str(self.home), XDG_DATA_HOME=str(self.home / '.local/share')):
+            for change in ('addition', 'replacement', 'source', 'source-directory'):
+                with self.subTest(change=change):
+                    shutil.rmtree(self.home / '.local/share', ignore_errors=True)
+                    unrelated = self.home / '.local/unrelated'
+                    unrelated.write_text('preserve')
+                    dest.write_text('backup bytes')
+                    def backup(*args, **kwargs):
+                        result = real_run(*args, **kwargs)
+                        if change == 'addition':
+                            (self.home / '.local/raced').write_text('raced')
+                        elif change == 'replacement':
+                            unrelated.rename(unrelated.with_name('old'))
+                            unrelated.write_text('replacement')
+                        elif change == 'source':
+                            self.local.write_text('changed source')
+                        else:
+                            (self.checkout / 'new').write_text('added source')
+                        return result
+                    with patch.object(r.subprocess, 'run', backup):
+                        with self.assertRaisesRegex(r.Error, 'changed during reconciliation'):
+                            self.run_links()
+                    self.assertFalse(os.path.lexists(dest))
+                    files = list((self.home / '.local/share/Trash/files').iterdir())
+                    self.assertEqual([p.read_text() for p in files], ['backup bytes'])
 
     @unittest.skipUnless(os.environ.get('REAL_TRASH'), 'requires pinned trash-cli')
     def test_real_trash_files_directories_dangling(self):

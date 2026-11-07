@@ -35,6 +35,11 @@ let
               source = "file";
               fallback = ./fallback/file;
             };
+            files.".local/app/config" = {
+              checkout = "project";
+              source = "file";
+              fallback = ./fallback/file;
+            };
             files.tree = {
               checkout = "project";
               source = "tree";
@@ -91,7 +96,14 @@ let
     (checkout / 'tree/.hidden').write_text('hidden')
     (home / 'tree').mkdir()
     (home / 'tree/unrelated').write_text('preserve')
+    first_conflict = home / '.local/app/config'
+    first_conflict.parent.mkdir(parents=True)
+    first_conflict.write_text('first trash backup')
+    assert not (home / '.local/share').exists()
     activate('active')
+    assert os.readlink(first_conflict) == str(checkout / 'file')
+    assert any(p.is_file() and p.read_text() == 'first trash backup'
+        for p in (home / '.local/share/Trash/files').iterdir())
     assert os.readlink(target) == str(checkout / 'file')
     assert (home / 'tree/file').read_text() == 'tree local'
     assert (home / 'tree/nested/child').read_text() == 'nested fallback\n'

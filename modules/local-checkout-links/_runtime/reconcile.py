@@ -32,7 +32,7 @@ def relative(value):
 
 
 def overlaps(a, b):
-    return a == b or a.startswith(b + '/') or b.startswith(a + '/')
+    return a == b or a.startswith(b.rstrip('/') + '/') or b.startswith(a.rstrip('/') + '/')
 
 
 def identity(path):
@@ -44,7 +44,7 @@ def identity(path):
         return None
 
 
-def kind(path):
+def kind(path, required=False):
     try:
         s = os.lstat(path)
     except FileNotFoundError:
@@ -53,6 +53,8 @@ def kind(path):
         try:
             s = os.stat(path)
         except FileNotFoundError:
+            if required:
+                raise Error(f'dangling fallback symlink: {path}')
             return None
         if not stat.S_ISREG(s.st_mode):
             raise Error(f'source symlink must resolve to a regular file: {path}')
@@ -63,12 +65,12 @@ def kind(path):
     raise Error(f'unsupported source type: {path}')
 
 
-def inventory(root, watch=None):
+def inventory(root, watch=None, required=False):
     result = {}
     def visit(path, name):
         if watch:
             watch(path)
-        t = kind(path)
+        t = kind(path, required=True) if required else kind(path)
         if t is None:
             return
         result[name] = t
@@ -81,7 +83,7 @@ def inventory(root, watch=None):
 
 def prepare(raw, immutable=False):
     for entry in raw['files'].values():
-        tree = inventory(entry['fallback'])
+        tree = inventory(entry['fallback'], required=True)
         if tree.get('') != entry['type']:
             raise Error(f'fallback type mismatch: {entry["fallback"]}')
         if immutable:
@@ -106,7 +108,12 @@ class Reconciler:
             raise Error('home must be a real directory')
         if not self.state.is_absolute() or '..' in self.state.parts:
             raise Error('invalid state directory')
-        self.protected = manifest.get('homeFiles', [])
+        # Match HM's build-time lexical normalization, never resolve through home.
+        self.protected = []
+        for target in manifest.get('homeFiles', []):
+            if not isinstance(target, str) or not target.startswith('/') or '\0' in target:
+                raise Error('invalid home.file target')
+            self.protected.append(os.path.normpath('/' + target.lstrip('/')))
         targets = list(manifest['files'])
         for target in targets:
             relative(target)
@@ -305,6 +312,47 @@ class Reconciler:
                 if watched.startswith(str(path) + '/'):
                     del self.expected[watched]
 
+    def trash_creation_watches(self, path):
+        # Pinned trash may mkdir -p $XDG_DATA_HOME/Trash/{info,files}. Only
+        # the first existing ancestor of a missing branch changes metadata.
+        # Snapshot its entries so accepting that one addition cannot hide an
+        # unrelated replacement/addition. Source watches are never refreshed.
+        data_home = os.environ.get('XDG_DATA_HOME', str(Path(os.environ.get('HOME', str(self.home))) / '.local/share'))
+        snapshots = {}
+        for leaf in ('info', 'files'):
+            child = Path(os.path.abspath(os.path.join(data_home, 'Trash', leaf)))
+            while identity(child) is None and child != child.parent:
+                parent = child.parent
+                before = identity(parent)
+                if before is not None:
+                    if (str(parent) in self.expected and parent != path.parent
+                            and stat.S_ISDIR(before[2])):
+                        if parent not in snapshots:
+                            entries = {p.name: identity(p) for p in parent.iterdir()}
+                            snapshots[parent] = (set(), before, entries)
+                        snapshots[parent][0].add(child.name)
+                    break
+                child = parent
+        return snapshots
+
+    def refresh_trash_creation(self, snapshots, path):
+        for parent, (children, before, entries) in snapshots.items():
+            after = identity(parent)
+            if after == before:
+                continue
+            current = {p.name: identity(p) for p in parent.iterdir()} if after and after[:3] == before[:3] else {}
+            created = [current.pop(name, None) for name in children]
+            # Backup also changes metadata of a child containing the target.
+            # Its inode/type must survive; other entries must match exactly.
+            def stable(items):
+                return {name: value[:3] if parent / name in path.parents and value and stat.S_ISDIR(value[2])
+                        else value for name, value in items.items()}
+            if (not all(node and stat.S_ISDIR(node[2]) for node in created)
+                    or not after or after[:3] != before[:3]
+                    or stable(current) != stable(entries)):
+                raise Error(f'path changed during reconciliation: {parent}; retry activation')
+            self.expected[str(parent)] = after
+
     def apply(self, data, desired):
         self.save(data)  # prove state is writable before home mutations
         for name, old in sorted(list(data['links'].items()), reverse=True):
@@ -335,9 +383,12 @@ class Reconciler:
                 self.unchanged()
                 if s:
                     print(f'trash {path}', flush=True)
+                    creation = self.trash_creation_watches(path)
+                    self.unchanged()
                     result = subprocess.run([self.trash, '--', str(path)], check=False)
                     if result.returncode or os.path.lexists(path):
                         raise Error(f'backup failed for {path} (exit {result.returncode}); preserved backup if moved; stopping')
+                    self.refresh_trash_creation(creation, path)
                     self.refresh(path)
                 self.unchanged()
                 with closing_fd(self.parent_fd(path)) as fd:

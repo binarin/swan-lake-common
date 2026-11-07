@@ -34,8 +34,59 @@ let
   good = hm base;
   closure = pkgs.closureInfo { rootPaths = [ good.activationPackage ]; };
   succeeds = extra: (builtins.tryEval (hm extra).activationPackage.drvPath).success;
+  aliasAssertions =
+    lib.concatMap
+      (target: [
+        (
+          !(succeeds {
+            imports = [ base ];
+            home.file.ordinary = {
+              inherit target;
+              text = "collision";
+            };
+          })
+        )
+        (
+          !(succeeds {
+            home.localCheckoutLinks = {
+              checkouts.project = null;
+              files.".config/config/file" = file;
+            };
+            xdg.configFile.ordinary = {
+              inherit target;
+              text = "collision";
+            };
+          })
+        )
+      ])
+      [
+        "config/./file"
+        "config/a/../file"
+        "config//file"
+        "./config"
+        "other/../config/file/child"
+      ];
+  danglingFallback = pkgs.runCommand "dangling-fallback" { } ''
+    mkdir -p "$out/nested"
+    echo valid > "$out/valid"
+    ln -s /nonexistent-zl0040 "$out/nested/broken"
+  '';
+  danglingManifest = pkgs.writeText "dangling-fallback-manifest.json" (
+    builtins.toJSON {
+      files.tree = {
+        fallback = danglingFallback;
+        type = "directory";
+      };
+    }
+  );
   assertions = [
     (succeeds base)
+    (succeeds {
+      home.localCheckoutLinks = {
+        checkouts.project = "/";
+        files.a = file;
+      };
+    })
     (succeeds {
       home.localCheckoutLinks = {
         checkouts.project = null;
@@ -156,7 +207,10 @@ let
     )
     (succeeds {
       imports = [ base ];
-      home.file."config/sibling".text = "okay";
+      home.file.ordinary = {
+        target = "config/./sibling";
+        text = "okay";
+      };
     })
     (
       !(succeeds {
@@ -189,20 +243,25 @@ in
         REAL_TRASH = lib.getExe pkgs.trash-cli;
       }
       ''
-        cp -r ${../../tools/local-checkout-links} runtime
+        cp -r ${../_runtime} runtime
         chmod -R u+w runtime
         cd runtime
         python3 -m unittest -v
         touch "$out"
       '';
   local-checkout-links-module =
-    assert lib.all (x: x) assertions;
+    assert lib.all (x: x) (assertions ++ aliasAssertions);
     pkgs.runCommand "local-checkout-links-module" { } ''
       test -x ${good.activationPackage}/activate
       grep -q 'checkLocalCheckoutLinks' ${good.activationPackage}/activate
-      grep -Fx '${../../tools/local-checkout-links/reconcile.py}' ${closure}/store-paths
+      grep -Fx '${../_runtime/reconcile.py}' ${closure}/store-paths
       grep -Fx '${builtins.path { path = ./fallback/file; }}' ${closure}/store-paths
+      if ${pkgs.python3}/bin/python3 ${../_runtime/reconcile.py} \
+        ${danglingManifest} --prepare "$TMPDIR/bad.json" > "$TMPDIR/bad.log" 2>&1; then
+        echo 'dangling fallback unexpectedly accepted' >&2
+        exit 1
+      fi
+      grep -F 'dangling fallback symlink:' "$TMPDIR/bad.log"
       touch "$out"
     '';
-  local-checkout-links-activation = import ./activation.nix { inherit pkgs inputs module; };
 }
