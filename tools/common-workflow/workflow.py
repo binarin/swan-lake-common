@@ -177,7 +177,13 @@ def finalize(args):
     original = oldnode["original"]
     if original != dict(type="git", url=TEMP[4:].split("?", 1)[0], ref=url[len(TEMP):]):
         raise ValueError("temporary declaration/lock mismatch")
-    tested = oldnode["locked"]["rev"]
+    locked = oldnode["locked"]
+    if (locked.get("type") != "git" or locked.get("url") != original["url"]
+            or locked.get("ref") != original["ref"]
+            or not re.fullmatch(r"[0-9a-f]{40}", locked.get("rev", ""))
+            or not re.fullmatch(r"sha256-[A-Za-z0-9+/]{43}=", locked.get("narHash", ""))):
+        raise ValueError("malformed temporary locked source")
+    tested = locked["rev"]
     # Default waits for the tested revision. --allow-newer explicitly accepts another promotion.
     rev = promoted(args.timeout, args.interval, None if args.allow_newer else tested)
     text = snapshot[0].decode()
@@ -223,8 +229,8 @@ def install(paths, snapshot, replacements):
         if [p.read_bytes() for p in paths] != snapshot:
             raise ValueError("originals changed during finalization; refusing replacement")
         for path, temp, before in zip(paths, prepared, snapshot):
-            os.replace(temp, path)
             replaced.append((path, before))
+            os.replace(temp, path)
     except BaseException:
         for path, before in replaced:
             path.write_bytes(before)

@@ -158,7 +158,8 @@ class Finalization(unittest.TestCase):
                 old = lock()
                 old["nodes"]["renamed"]["original"] = {
                     "type": "git", "url": w.TEMP[4:].split("?", 1)[0], "ref": "feature"}
-                old["nodes"]["renamed"]["locked"]["type"] = "git"
+                old["nodes"]["renamed"]["locked"].update(
+                    type="git", url=old["nodes"]["renamed"]["original"]["url"], ref="feature")
                 (root / "flake.nix").write_text('{ inputs.common.url = ' + json.dumps(url) + '; outputs = _: {}; }')
                 (root / "flake.lock").write_text(json.dumps(old))
                 subprocess.run(["git", "init", "-q", str(root)], check=True)
