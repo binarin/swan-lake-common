@@ -81,18 +81,23 @@ or `\'`, so avoid such arguments for hosts where fish is the login shell.
 
 ## Checks
 
-`nix flake check` runs:
+Each check is its own flake-parts module in this directory, picked up by
+`import-tree` like the module itself, and `nix flake check` runs them:
 
-- `remote-session-launchers-golden`: entries and wrappers for `fixture.nix`
-  compared with `golden/` (all under `home-modules/remote-session-launchers/tests/`;
-  the regeneration command is in `default.nix` there);
-- `remote-session-launchers-desktop-file-validate`;
-- `remote-session-launchers-negative`: invalid ids, hosts, names, colors, tags,
-  duplicate titles and malformed `remote` values must fail;
-- `remote-session-launchers-chain`: every entry is run against fake ssh, foot,
-  niri and uwsm (plus the real mosh client and jq), with awkward arguments and
-  bash, dash and zsh as remote shells, and checks the argv that reaches the remote
-  program; it also checks the exact-title focus and uwsm marker handling.
+- [`golden.nix`](golden.nix): `remote-session-launchers-golden` compares the
+  entries and wrappers generated for its fixture with [`golden/`](golden/)
+  (the regeneration command is in the file), and
+  `remote-session-launchers-desktop-file-validate` validates the same fixture
+  built with the real packages;
+- [`negative.nix`](negative.nix): `remote-session-launchers-negative` requires
+  invalid ids, hosts, names, colors, tags, duplicate titles and malformed
+  `remote` values to fail;
+- [`chain.nix`](chain.nix): `remote-session-launchers-chain` runs every entry
+  against fake ssh, foot, niri and uwsm ([`fakes.py`](fakes.py), driven by
+  [`chain.py`](chain.py)) plus the real mosh client and jq, with awkward
+  arguments and bash, dash and zsh as remote shells. It checks the argv that
+  reaches the remote program, the exact-title focus and the uwsm marker
+  handling.
 
 Not covered: real foot rendering, real niri focus, real ssh or mosh
 connections and remote `nix run`.
