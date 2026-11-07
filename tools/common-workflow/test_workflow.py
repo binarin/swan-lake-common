@@ -129,6 +129,12 @@ class Finalization(unittest.TestCase):
             with self.subTest(node=node), self.assertRaises(ValueError):
                 w.validate_conversion(old, new)
 
+    def test_dependency_declaration_churn(self):
+        old, new = lock(), lock()
+        new["nodes"]["dep"]["original"] = {"type": "path", "path": "/tmp/other"}
+        with self.assertRaisesRegex(ValueError, "dependency graph"):
+            w.validate_conversion(old, new)
+
     def test_resolved_follows_graph(self):
         old, new = lock(), lock()
         old["nodes"]["root"]["inputs"]["dep"] = "dep"

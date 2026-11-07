@@ -109,7 +109,8 @@ def graph(lock, key, active=()):
     if key in active:
         raise ValueError("cyclic dependency graph")
     node = lock["nodes"][key]
-    return {"locked": node.get("locked"), "flake": node.get("flake", True),
+    return {"locked": node.get("locked"), "original": node.get("original"),
+            "flake": node.get("flake", True),
             "inputs": {name: graph(lock, resolve(lock, edge), active + (key,))
                        for name, edge in node.get("inputs", {}).items()}}
 
@@ -140,6 +141,7 @@ def validate_conversion(old, new):
     if same:
         a, b = graph(old, oldkey), graph(new, newkey)
         a["locked"] = b["locked"] = None
+        a["original"] = b["original"] = None
         if a != b:
             raise ValueError("same revision changed resolved dependency graph")
     return same
