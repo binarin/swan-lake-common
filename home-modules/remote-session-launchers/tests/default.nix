@@ -77,4 +77,7 @@ in
         desktop-file-validate "''${entries[@]}"
         touch $out
       '';
+
+  remote-session-launchers-negative = import ./negative.nix { inherit pkgs module; };
+  remote-session-launchers-chain = import ./chain.nix { inherit pkgs home; };
 }
