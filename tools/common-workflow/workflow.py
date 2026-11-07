@@ -175,8 +175,7 @@ def finalize(args):
     old = json.loads(snapshot[1])
     _, oldnode = common_node(old)
     original = oldnode["original"]
-    if (original.get("type") != "git" or original.get("url") != TEMP[4:].split("?", 1)[0]
-            or original.get("ref") != url[len(TEMP):]):
+    if original != dict(type="git", url=TEMP[4:].split("?", 1)[0], ref=url[len(TEMP):]):
         raise ValueError("temporary declaration/lock mismatch")
     tested = oldnode["locked"]["rev"]
     # Default waits for the tested revision. --allow-newer explicitly accepts another promotion.

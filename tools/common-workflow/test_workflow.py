@@ -84,6 +84,28 @@ class Overrides(unittest.TestCase):
         self.assertEqual(w.override_argv(["deploy", ".#host", "--", "--offline"], url),
                          ["deploy", ".#host", "--"] + flags + ["--offline"])
 
+    def test_checkout_selection(self):
+        with tempfile.TemporaryDirectory(prefix="checkout space ") as tmp:
+            root = Path(tmp) / "consumer"
+            root.mkdir()
+            common = root.parent / "swan-lake-common"
+            cwd = Path.cwd()
+            args = argparse.Namespace(common=None, dirty=False, command=["--", "nix", "build", "a b"])
+            with patch.object(w, "run", return_value=str(root)):
+                with self.assertRaisesRegex(ValueError, "use --common"):
+                    w.with_common(args)
+                common.mkdir()
+                (common / "flake.nix").write_text("{}")
+                for dirty in [False, True]:
+                    args.dirty = dirty
+                    with patch.object(w.os, "execvp") as execute:
+                        w.with_common(args)
+                    cmd = execute.call_args.args[1]
+                    self.assertEqual(cmd[-1], "a b")
+                    self.assertIn("%20", cmd[4])
+                    self.assertTrue(cmd[4].startswith("path:" if dirty else "git+file:"))
+                    self.assertEqual(Path.cwd(), cwd)
+
     def test_reject(self):
         for command in [[], ["nix", "run"], ["sh", "-c", "nix build"], ["nixos-rebuild", "build"]]:
             with self.assertRaises(ValueError):
