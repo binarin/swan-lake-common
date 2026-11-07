@@ -1,7 +1,7 @@
 name: Common workflow
 on:
   push:
-    branches: [master, zl-0036-common-workflow]
+    branches: [master]
   pull_request:
     types: [opened, synchronize, reopened]
 jobs:
