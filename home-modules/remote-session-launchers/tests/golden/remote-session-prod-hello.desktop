@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=prod "hello" \\ nix run
+Exec=/nix/store/HASH-remote-session-prod-hello
+Terminal=false
+Categories=System;
+Icon=foot

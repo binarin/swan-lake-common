@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=box mosh tmux
+Exec=/nix/store/HASH-remote-session-box-tmux
+Terminal=false
+Categories=System;
+Icon=foot

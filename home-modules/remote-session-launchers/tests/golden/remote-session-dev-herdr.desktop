@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=dev herdr
+Exec=/nix/store/HASH-remote-session-dev-herdr
+Terminal=false
+Categories=System;
+Icon=foot

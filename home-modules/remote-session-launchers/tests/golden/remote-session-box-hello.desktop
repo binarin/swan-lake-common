@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=box nix run
+Exec=/nix/store/HASH-remote-session-box-hello
+Terminal=false
+Categories=System;
+Icon=foot

@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=dev shell
+Exec=/nix/store/HASH-remote-session-dev-shell
+Terminal=false
+Categories=System;
+Icon=foot

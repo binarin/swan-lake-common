@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=prod btop
+Exec=/nix/store/HASH-remote-session-prod-btop
+Terminal=false
+Categories=System;
+Icon=foot

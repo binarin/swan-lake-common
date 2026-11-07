@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=box mosh
+Exec=/nix/store/HASH-remote-session-box-shell
+Terminal=false
+Categories=System;
+Icon=foot
