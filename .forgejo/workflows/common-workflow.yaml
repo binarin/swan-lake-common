@@ -1,0 +1,16 @@
+name: Common workflow
+on:
+  push:
+    branches: [master, zl-0036-common-workflow]
+  pull_request:
+    types: [opened, synchronize, reopened]
+jobs:
+  workflow-tools:
+    name: common-workflow
+    runs-on: native
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - run: nix flake check
+      - run: nix develop -c python3 tools/common-workflow/integration.py
