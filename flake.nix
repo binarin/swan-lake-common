@@ -19,6 +19,9 @@
     sops-nix.url = "github:binarin/sops-nix/swan-lake-current";
     sops-nix.inputs.nixpkgs.follows = "nixpkgs";
 
+    emacs-niri-awareness.url = "github:binarin/emacs-niri-awareness";
+    emacs-niri-awareness.flake = false;
+
     emacs-overlay.url = "github:binarin/emacs-overlay/swan-lake-current";
     emacs-overlay.inputs.nixpkgs.follows = "nixpkgs";
     emacs-overlay.inputs.nixpkgs-stable.follows = "nixpkgs";

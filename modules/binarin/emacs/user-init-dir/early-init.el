@@ -2,21 +2,9 @@
 (require 'cl-lib)
 (require 'rx)
 
-(defvar b/xdg-app "emacs-swan-lake")
-(defvar b/xdg-state-home (file-name-concat
-			  (or (getenv "XDG_STATE_HOME")
-			      (expand-file-name "~/.local/state"))
-			  b/xdg-app))
-(defvar b/xdg-cache-home (file-name-concat
-			  (or (getenv "XDG_CACHE_HOME")
-			      (expand-file-name "~/.cache"))
-			  b/xdg-app))
-(defvar b/xdg-runtime-dir (file-name-concat
-			   (or (getenv "XDG_RUNTIME_DIR")
-			       (expand-file-name "~/tmp"))
-			   b/xdg-app))
-
-
+(when load-file-name
+  (load (file-name-concat (file-name-directory load-file-name) "user-lisp/b-xdg") nil t))
+(require 'b-xdg)
 
 (cl-loop
  for dir in (list b/xdg-state-home b/xdg-cache-home b/xdg-runtime-dir)
@@ -47,7 +35,6 @@
                        "org-caldav-backup.org"
                        "magit-githooks"
                        "ielm-history.eld"
-		       "auto-save-dir"
                        "diary")
                       (or eol "/")))
         (cache-rx (rx bol
@@ -72,7 +59,7 @@
       (when (listp new-name) (setf new-name (car new-name)))
       (cond
        ((string-prefix-p "user-lisp" new-name)
-	(let ((rw-dir (make-path "~/personal-workspace/nixos-config" "files/emacs/user-lisp")))
+	(let ((rw-dir (make-path "~/personal-workspace/swan-lake-umbrella/swan-lake-common" "modules/binarin/emacs/user-init-dir/user-lisp")))
 	  (if (file-exists-p rw-dir)
 	      rw-dir
 	    (make-path user-emacs-directory "user-lisp"))))

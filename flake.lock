@@ -21,6 +21,22 @@
         "type": "github"
       }
     },
+    "emacs-niri-awareness": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1785501810,
+        "narHash": "sha256-+HeWcoPr5ivylZm5xIwgxsnRwmKQ7mkZfWgV7UlkwOM=",
+        "owner": "binarin",
+        "repo": "emacs-niri-awareness",
+        "rev": "8474ac212d56527507a94c59566273e0735001ac",
+        "type": "github"
+      },
+      "original": {
+        "owner": "binarin",
+        "repo": "emacs-niri-awareness",
+        "type": "github"
+      }
+    },
     "emacs-overlay": {
       "inputs": {
         "nixpkgs": [
@@ -155,6 +171,7 @@
     "root": {
       "inputs": {
         "disko": "disko",
+        "emacs-niri-awareness": "emacs-niri-awareness",
         "emacs-overlay": "emacs-overlay",
         "emacs-tramp-rpc": "emacs-tramp-rpc",
         "flake-parts": "flake-parts",

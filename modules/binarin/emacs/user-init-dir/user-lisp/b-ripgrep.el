@@ -232,7 +232,7 @@ function properly")
   "List of paths (globs) to ignore in `b/ripgrep-main'.")
 
 ;;;###autoload
-(cl-defun b/ripgrep-main (needle &rest paths)
+(defun b/ripgrep-main (needle &rest paths)
   (interactive "sPattern: ")
   (let ((default-directory b/ripgrep-main-target))
     (b/ripgrep needle
@@ -256,7 +256,7 @@ function properly")
   (let ((default-directory (project-root project)))
     (call-interactively #'b/ripgrep)))
 
-;; (setf (alist-get (rx "*b/ripgrep*") display-buffer-alist nil nil #'equal)
-;;       '(b/display-buffer-use-dedicated-frame))
+(setf (alist-get (rx "*b/ripgrep*") display-buffer-alist nil nil #'equal)
+      '(b/display-buffer-use-dedicated-frame))
 
 (provide 'b-ripgrep)
