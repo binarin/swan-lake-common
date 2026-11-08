@@ -25,6 +25,12 @@
 
     emacs-tramp-rpc.url = "github:binarin/emacs-tramp-rpc/swan-lake-current";
     emacs-tramp-rpc.flake = false;
+
+    zwanenzang.url = "git+https://forgejo.lynx-lizard.ts.net/binarin/zwanenzang";
+    zwanenzang.inputs.flake-parts.follows = "flake-parts";
+    zwanenzang.inputs.nixpkgs.follows = "nixpkgs";
+    zwanenzang.inputs.nixpkgs-unstable.follows = "nixpkgs-unstable";
+    zwanenzang.inputs.import-tree.follows = "import-tree";
   };
 
   outputs =

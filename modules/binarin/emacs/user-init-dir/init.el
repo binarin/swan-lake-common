@@ -84,6 +84,8 @@
 (load-theme 'batppuccin-mocha t)
 (add-to-list 'default-frame-alist '(font . "IosevkaTerm Nerd Font-16"))
 
+
+
 ;;; § Completion
 
 (setf enable-recursive-minibuffers t)
@@ -300,3 +302,17 @@
 (use-package toml-ts-mode
   :ensure nil
   :mode "\\.toml\\'")
+
+;;; § Org Mode
+
+(setf org-startup-folded 'show2levels
+      org-startup-shrink-all-tables t
+      org-cycle-separator-lines 0
+      org-fold-catch-invisible-edits 'smart
+      org-hide-block-startup t
+      org-log-into-drawer "LOGBOOK")
+
+(setf org-todo-keywords
+      '((sequence "TODO(t)" "NEXT(n!)" "|" "DONE(d!)")
+	(sequence "|" "CNCL(c@)")
+	(sequence "WAIT(w!/!)" "|")))

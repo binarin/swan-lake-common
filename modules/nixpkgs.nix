@@ -6,6 +6,7 @@ let
   };
   defaultOverlays = [
     inputs.emacs-overlay.overlays.package
+    inputs.zwanenzang.overlays.default
   ];
   importNixpkgs =
     {

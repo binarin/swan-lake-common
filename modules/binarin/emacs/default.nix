@@ -9,6 +9,15 @@ let
       packageRequires = [ epkgs.msgpack ];
     };
 
+  # zwanenzang-builder = epkgs:
+  #   epkgs.trivialBuild  {
+  #     pname = "zwanenzang";
+  #     version = "0.0.0";
+  #     src = "${inputs.zwanenzang}/emacs";
+  #   };
+
+  # zwanenzang-builder = import "${inputs.zwanenzang}/nix/_packages/zwanenzang-el.nix";
+  
   emacsPackageFn =
     {
       emacsPackagesFor,
@@ -17,9 +26,10 @@ let
     (emacsPackagesFor basePackage).emacsWithPackages (
       e: with e; [
         (tramp-rpc-builder e)
+        # (zwanenzang-builder e)
+        zwanenzang
         batppuccin
         zenburn-theme
-
         consult
         corfu
         vertico
@@ -31,6 +41,8 @@ let
         ws-butler
         nix-mode
         direnv
+        ghostel
+
 
         treesit-grammars.with-all-grammars
       ]
@@ -41,6 +53,7 @@ let
       buildEnv,
       fd,
       ripgrep,
+      zwanenzang,
       finalEmacsBinary,
     }:
     buildEnv {
@@ -48,6 +61,7 @@ let
       paths = [
         fd
         ripgrep
+        zwanenzang
       ];
       postBuild = ''
         ln -sf "${lib.getExe finalEmacsBinary}" "$out/bin/emacs"
