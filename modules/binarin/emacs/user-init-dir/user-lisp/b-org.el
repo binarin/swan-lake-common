@@ -14,6 +14,7 @@
 (require 'b-visual)
 (require 'ox)
 (require 'b-wprintidle)
+(require 'zwanenzang)
 
 
 (setf org-startup-folded 'show2levels
