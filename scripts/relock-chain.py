@@ -376,12 +376,15 @@ def resolve_chain(base: Path, overrides: dict[str, Path]) -> list[tuple[Repo, Pa
         raise Failure(f"unknown --repo names: {', '.join(sorted(unknown))}")
 
     script_repo = Path(__file__).resolve().parents[1]
+    # Prefer the checkout the script lives in, but fall back to --base when
+    # the script is executed from a read-only store copy.
+    default_common = script_repo if (script_repo / ".git").exists() else base / "swan-lake-common"
     chain = []
     for spec in CHAIN:
         if spec.name in overrides:
             path = overrides[spec.name]
         elif spec.name == "common":
-            path = script_repo
+            path = default_common
         else:
             path = base / spec.directory
         chain.append((spec, path))
