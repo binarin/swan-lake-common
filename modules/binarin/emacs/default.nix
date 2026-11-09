@@ -33,6 +33,13 @@ in
                 msgpack
               ];
             })
+            # Built in this package set from zwanenzang's own packaging, so
+            # it matches whichever Emacs the consumer builds, and does not
+            # depend on zwanenzang's overlay being applied to `pkgs`.
+            (epkgs.callPackage "${inputs.zwanenzang}/nix/_packages/zwanenzang-el.nix" {
+              zwanenzang =
+                inputs.zwanenzang.packages.${final.stdenv.hostPlatform.system}.zwanenzang;
+            })
           ];
           flakyConfigDir =
             { emacsWithPackages, ... }:
@@ -166,6 +173,10 @@ in
 
           home.packages = [
             config.programs.emacs.package
+            # The CLI the Emacs client shells out to; the library comes with
+            # the Emacs package above. Taken straight from the input so the
+            # module works in configurations without zwanenzang's overlay.
+            inputs.zwanenzang.packages.${pkgs.stdenv.hostPlatform.system}.zwanenzang
             (pkgs.writeShellScriptBin "emacs-as-console-editor" ''
               exec emacsclient -a 'emacs -nw' -nw "$@"
             '')
