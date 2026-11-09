@@ -10,6 +10,10 @@
 
     import-tree.url = "github:binarin/import-tree/swan-lake-current";
 
+    llm-agents.url = "github:binarin/llm-agents.nix/swan-lake-current";
+    llm-agents.inputs.nixpkgs.follows = "nixpkgs-unstable";
+    llm-agents.inputs.flake-parts.follows = "flake-parts";
+
     disko.url = "github:binarin/disko/swan-lake-current";
     disko.inputs.nixpkgs.follows = "nixpkgs";
 
