@@ -35,6 +35,21 @@ let
         cp -r dist-pkg/. "$out/"
         cp -r node_modules "$out/node_modules"
 
+        # Pi labels index.js extensions by their parent directory, which is
+        # "bundle" upstream. Route the manifest through a named directory so
+        # the extension list shows "subagents".
+        mkdir "$out/subagents"
+        echo 'export { default } from "../bundle/index.js";' > "$out/subagents/index.js"
+        node --input-type=module <<'JS'
+        import fs from 'node:fs';
+        const file = process.env.out + '/package.json';
+        const pkg = JSON.parse(fs.readFileSync(file, 'utf8'));
+        if (JSON.stringify(pkg.pi.extensions) !== JSON.stringify(['./bundle/index.js']))
+          throw new Error('unexpected pi.extensions: ' + JSON.stringify(pkg.pi.extensions));
+        pkg.pi.extensions = ['./subagents/index.js'];
+        fs.writeFileSync(file, JSON.stringify(pkg, null, 2) + '\n');
+        JS
+
         runHook postInstall
       '';
 
@@ -50,6 +65,7 @@ let
         const require = createRequire(process.cwd() + '/package.json');
         const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
         assert.equal(pkg.version, '${finalAttrs.version}');
+        assert.deepEqual(pkg.pi.extensions, ['./subagents/index.js']);
         for (const paths of Object.values(pkg.pi)) {
           for (const path of paths) assert.ok(fs.existsSync(path), path);
         }
