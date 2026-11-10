@@ -21,6 +21,9 @@ let
   defaultOverlays = [
     inputs.emacs-overlay.overlays.package
     inputs.zwanenzang.overlays.default
+    self.overlays.pi-subagents
+    self.overlays.pi-claude-bridge
+    self.overlays.pi-with-extensions
   ];
 
   # llm-agents is developed against nixpkgs-unstable (see the input's follows
