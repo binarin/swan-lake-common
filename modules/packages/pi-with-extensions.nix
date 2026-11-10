@@ -4,12 +4,23 @@ let
     {
       lib,
       symlinkJoin,
+      runCommand,
       makeWrapper,
       python3,
       pi,
       pi-subagents,
       pi-claude-bridge,
     }:
+    let
+      # A named directory with index.ts gives a short label in Pi's
+      # extension list instead of the hashed store file name.
+      subagentsClaudeBridge = runCommand "pi-subagents-claude-bridge" { } ''
+        mkdir -p "$out/subagents-claude-bridge"
+        substitute ${../../lib/pi-subagents-claude-bridge.ts} "$out/subagents-claude-bridge/index.ts" \
+          --subst-var-by piSubagents ${pi-subagents} \
+          --subst-var-by piClaudeBridge ${pi-claude-bridge}
+      '';
+    in
     symlinkJoin {
       name = "pi-with-extensions-${pi.version}";
       paths = [ pi ];
@@ -30,7 +41,7 @@ let
           --replace-fail 'exec "${pi}/libexec/pi/pi"' \
             "exec \"$out/libexec/pi/pi\""
         wrapProgram "$out/bin/pi" \
-          --add-flags ${lib.escapeShellArg "--extension ${pi-subagents} --extension ${pi-claude-bridge}"}
+          --add-flags ${lib.escapeShellArg "--extension ${pi-subagents} --extension ${pi-claude-bridge} --extension ${subagentsClaudeBridge}/subagents-claude-bridge"}
       '';
       meta = pi.meta // {
         platforms = lib.intersectLists pi.meta.platforms lib.platforms.linux;
