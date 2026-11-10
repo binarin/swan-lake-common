@@ -7,7 +7,12 @@
   #   programs.herdr-app.instances.sl = "Swan Lake";
   #
   # installs `herdr-sl`, a "Herdr (Swan Lake)" desktop entry, and keeps that
-  # instance's home in ~/.config/herdrs/sl (persisted under impermanence).
+  # instance's home in ~/.config/herdrs/sl.
+  # It also talks to its own herdr-core (HC_SESSION=sl: socket
+  # $XDG_RUNTIME_DIR/herdr-core/sl.sock, state ~/.local/state/herdr-core/sl),
+  # since spaces, tabs, terminals and machines live in the core, not the app
+  # home; HERDR_APP_HOME alone only separates settings/keys/layouts.
+  # Both directories are persisted under impermanence.
   flake.homeModules.herdr-app =
     {
       config,
@@ -22,6 +27,7 @@
 
       validName = n: builtins.match "[A-Za-z0-9][A-Za-z0-9._-]*" n != null;
       relHome = name: ".config/herdrs/${name}";
+      relCoreState = name: ".local/state/herdr-core/${name}";
 
       mkInstance =
         name: title:
@@ -48,7 +54,8 @@
           ''
             makeWrapper ${lib.getExe cfg.package} "$out/bin/${bin}" \
               --set HERDR_APP_HOME ${lib.escapeShellArg "${config.home.homeDirectory}/${relHome name}"} \
-              --set HERDR_APP_ID ${lib.escapeShellArg bin}
+              --set HERDR_APP_ID ${lib.escapeShellArg bin} \
+              --set HC_SESSION ${lib.escapeShellArg name}
             install -Dm444 ${desktop}/share/applications/${bin}.desktop \
               "$out/share/applications/${bin}.desktop"
             # The entry's icon, for when the plain app is not installed too.
@@ -75,8 +82,9 @@
           };
           description = ''
             Instance name to desktop title. Each `<name> = "<Title>"` gets a
-            `herdr-<name>` binary with `HERDR_APP_HOME=~/.config/herdrs/<name>`
-            and a desktop entry titled `Herdr (<Title>)`.
+            `herdr-<name>` binary with `HERDR_APP_HOME=~/.config/herdrs/<name>`,
+            its own herdr-core session (`HC_SESSION=<name>`), and a desktop
+            entry titled `Herdr (<Title>)`.
           '';
         };
       };
@@ -93,7 +101,10 @@
           }
 
           (lib.optionalAttrs (options ? impermanence) {
-            impermanence.persist-directories = map relHome (lib.attrNames cfg.instances);
+            impermanence.persist-directories = lib.concatMap (name: [
+              (relHome name)
+              (relCoreState name)
+            ]) (lib.attrNames cfg.instances);
           })
         ]
       );
