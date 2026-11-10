@@ -33,6 +33,13 @@
     emacs-tramp-rpc.url = "github:binarin/emacs-tramp-rpc/swan-lake-current";
     emacs-tramp-rpc.flake = false;
 
+    # Not a flake: only the checkout is needed, and modules/omnidiff.nix builds
+    # it against this flake's nixpkgs. Declaring it this way keeps omnidiff's
+    # own nixpkgs and flake-utils inputs out of flake.lock, rather than locking
+    # a second nixpkgs merely to read the derivation.
+    omnidiff.url = "github:binarin/omnidiff/swan-lake-current";
+    omnidiff.flake = false;
+
     zwanenzang.url = "git+https://forgejo.lynx-lizard.ts.net/binarin/zwanenzang";
     zwanenzang.inputs.flake-parts.follows = "flake-parts";
     zwanenzang.inputs.nixpkgs.follows = "nixpkgs";
