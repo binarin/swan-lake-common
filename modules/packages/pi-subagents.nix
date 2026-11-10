@@ -10,17 +10,17 @@ let
     }:
     buildNpmPackage (finalAttrs: {
       pname = "pi-subagents";
-      version = "0.80.0";
+      version = "0.87.0";
 
       src = fetchFromGitHub {
         owner = "nicobailon";
         repo = "pi-subagents";
-        rev = "80f8f79d51ee8075fd39baf7fe8ff36b43c3a790";
-        hash = "sha256-/XjtoCIQu1c0DwOM+aeWWBmyk7JFuQWB10o9RLJk/kU=";
+        rev = "52e68e9ef0e563d5c97b28519f9999f1b5fbbbea";
+        hash = "sha256-jjumBpE2OrUmeut7M3wZDlLjEA9mbA7Q21NepUYHU5s=";
       };
 
       nodejs = nodejs_24;
-      npmDepsHash = "sha256-0eDwWHfFmxouY8uf0VURFYn6dWbDnh6x1Hj8AaARCvc=";
+      npmDepsHash = "sha256-aGw6EkTn6zIf29rx69B/6lEjHjxF6ZZCHbslXhy4ITg=";
       npmRebuildFlags = [ "--ignore-scripts" ];
       npmBuildScript = "build:pkg";
 
