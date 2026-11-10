@@ -46,6 +46,11 @@
       ];
       absShared = "${config.home.homeDirectory}/${cfg.sharedDirectory}";
       nested = a: b: a == b || lib.hasPrefix "${a}/" b || lib.hasPrefix "${b}/" a;
+      # Run by every wrapper, so the links never dangle. Not an activation
+      # step: a newly persisted directory is bind-mounted after Home Manager
+      # activation, hiding anything activation created there. A failure is
+      # left for the app to report.
+      mkShared = "mkdir -p ${lib.escapeShellArgs (map (d: "${absShared}/${d}") sharedDirs)} || true";
 
       mkInstance =
         name: title:
@@ -73,7 +78,8 @@
             makeWrapper ${lib.getExe cfg.package} "$out/bin/${bin}" \
               --set HERDR_APP_HOME ${lib.escapeShellArg "${config.home.homeDirectory}/${relHome name}"} \
               --set HERDR_APP_ID ${lib.escapeShellArg bin} \
-              --set HC_SESSION ${lib.escapeShellArg name}
+              --set HC_SESSION ${lib.escapeShellArg name} \
+              --run ${lib.escapeShellArg mkShared}
             install -Dm444 ${desktop}/share/applications/${bin}.desktop \
               "$out/share/applications/${bin}.desktop"
             # The entry's icon, for when the plain app is not installed too.
@@ -113,7 +119,7 @@
           default = ".config/herdrs/shared";
           description = ''
             Home-relative directory holding the `mods/`, `themes/` and
-            `layouts/` every instance home links to. Created on activation;
+            `layouts/` every instance home links to. Created by each instance wrapper;
             the app fills in its shipped mods and layouts on start.
           '';
         };
@@ -181,11 +187,6 @@
                 }) sharedDirs
               ) (lib.attrNames cfg.instances)
             );
-
-            # So the links never dangle before the first app start.
-            home.activation.herdrAppSharedDirectory = lib.hm.dag.entryAfter [ "writeBoundary" ] ''
-              run mkdir -p ${lib.concatMapStringsSep " " (d: lib.escapeShellArg "${absShared}/${d}") sharedDirs}
-            '';
 
             home.localCheckoutLinks.files = lib.mkIf (cfg.settings != null) (
               lib.genAttrs' (lib.attrNames cfg.instances) (

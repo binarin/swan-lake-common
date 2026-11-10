@@ -100,8 +100,7 @@ pkgs.runCommand "herdr-app-instances" { } ''
     t=$(readlink "$(readlink "$f/.config/herdrs/sl/$d")")
     [ "$t" = "/home/tester/.config/herdrs/shared/$d" ] || { echo "$d -> $t"; exit 1; }
   done
-  a=${builtins.toFile "activation" plain.config.home.activation.herdrAppSharedDirectory.data}
-  grep -qx 'run mkdir -p /home/tester/.config/herdrs/shared/mods /home/tester/.config/herdrs/shared/themes /home/tester/.config/herdrs/shared/layouts' "$a"
+  grep -qx 'mkdir -p /home/tester/.config/herdrs/shared/mods /home/tester/.config/herdrs/shared/themes /home/tester/.config/herdrs/shared/layouts || true' "$(readlink -f "$p/bin/herdr-sl")"
   # Builds the local-checkout-links manifest (fallback validation) too.
   [ -e ${withSettings.activationPackage}/activate ]
   touch $out
