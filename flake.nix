@@ -23,10 +23,6 @@
     sops-nix.url = "github:binarin/sops-nix/swan-lake-current";
     sops-nix.inputs.nixpkgs.follows = "nixpkgs";
 
-    # Source of the claudy-comment-detector agent skill.
-    citelao-dotfiles.url = "github:citelao/dotfiles";
-    citelao-dotfiles.flake = false;
-
     emacs-niri-awareness.url = "github:binarin/emacs-niri-awareness";
     emacs-niri-awareness.flake = false;
 

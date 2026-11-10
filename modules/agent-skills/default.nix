@@ -92,7 +92,10 @@
       config = {
         programs.agent-skills.skills = {
           grilling.source = lib.mkDefault ./_skills/grilling;
-          claudy-comment-detector.source = lib.mkDefault "${inputs.citelao-dotfiles}/dotfiles/.chezmoitemplates/skills/claudy-comment-detector";
+          claudy-comment-detector.source = lib.mkDefault (builtins.fetchurl {
+            url = "https://raw.githubusercontent.com/citelao/dotfiles/d804f322eac538576230ddeeeafc780542bd98f3/dotfiles/.chezmoitemplates/skills/claudy-comment-detector/SKILL.md";
+            sha256 = "sha256-4kE0FLldUuutxrWjmCEU7j38uNb0p0SngFAxG+pncbw=";
+          });
         };
 
         assertions = lib.mapAttrsToList (

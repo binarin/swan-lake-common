@@ -34,22 +34,6 @@
         "type": "github"
       }
     },
-    "citelao-dotfiles": {
-      "flake": false,
-      "locked": {
-        "lastModified": 1791819138,
-        "narHash": "sha256-n3bDBA9NxWsVorIkwn0gJWwYySFpaAGJLHLoU+1fDF0=",
-        "owner": "citelao",
-        "repo": "dotfiles",
-        "rev": "d804f322eac538576230ddeeeafc780542bd98f3",
-        "type": "github"
-      },
-      "original": {
-        "owner": "citelao",
-        "repo": "dotfiles",
-        "type": "github"
-      }
-    },
     "disko": {
       "inputs": {
         "nixpkgs": [
@@ -247,7 +231,6 @@
     },
     "root": {
       "inputs": {
-        "citelao-dotfiles": "citelao-dotfiles",
         "disko": "disko",
         "emacs-niri-awareness": "emacs-niri-awareness",
         "emacs-overlay": "emacs-overlay",
