@@ -12,7 +12,18 @@
   # $XDG_RUNTIME_DIR/herdr-core/sl.sock, state ~/.local/state/herdr-core/sl),
   # since spaces, tabs, terminals and machines live in the core, not the app
   # home; HERDR_APP_HOME alone only separates settings/keys/layouts.
-  # Both directories are persisted under impermanence.
+  #
+  # Look and code are shared: each home's mods/, themes/ and layouts/ is a
+  # symlink into one shared directory (~/.config/herdrs/shared by default),
+  # and `settings` optionally links every home's settings.json to a single
+  # file in a mutable checkout (home.localCheckoutLinks). The rest of a home
+  # (view.json, window.json, shared.json, data/, installed.json, the control
+  # socket, ...) is per-window state and stays separate; one home is one
+  # running window. layouts/.state (splitter sizes, picked panels) lives in
+  # layouts/ and so is shared too.
+  #
+  # Instance homes, core state and the shared directory are persisted under
+  # impermanence.
   flake.homeModules.herdr-app =
     {
       config,
@@ -28,6 +39,13 @@
       validName = n: builtins.match "[A-Za-z0-9][A-Za-z0-9._-]*" n != null;
       relHome = name: ".config/herdrs/${name}";
       relCoreState = name: ".local/state/herdr-core/${name}";
+      sharedDirs = [
+        "mods"
+        "themes"
+        "layouts"
+      ];
+      absShared = "${config.home.homeDirectory}/${cfg.sharedDirectory}";
+      nested = a: b: a == b || lib.hasPrefix "${a}/" b || lib.hasPrefix "${b}/" a;
 
       mkInstance =
         name: title:
@@ -67,6 +85,9 @@
     {
       key = "swan-lake-common.modules.home.herdr-app";
 
+      # Backs `settings`; same module path as a direct import, so deduplicated.
+      imports = [ self.homeModules.local-checkout-links ];
+
       options.programs.herdr-app = {
         package = mkOption {
           type = types.package;
@@ -87,24 +108,102 @@
             entry titled `Herdr (<Title>)`.
           '';
         };
+        sharedDirectory = mkOption {
+          type = types.str;
+          default = ".config/herdrs/shared";
+          description = ''
+            Home-relative directory holding the `mods/`, `themes/` and
+            `layouts/` every instance home links to. Created on activation;
+            the app fills in its shipped mods and layouts on start.
+          '';
+        };
+        settings = mkOption {
+          default = null;
+          description = ''
+            Link every instance's `settings.json` (fonts, zoom, sounds,
+            appearance) to one file in a mutable checkout, through
+            `home.localCheckoutLinks.files`. `null` leaves each instance's
+            settings its own.
+          '';
+          example = lib.literalExpression ''
+            {
+              checkout = "nixos-config";
+              source = "files/herdr-app/settings.json";
+              fallback = ./settings.json;
+            }
+          '';
+          type = types.nullOr (
+            types.submodule {
+              options = {
+                checkout = mkOption {
+                  type = types.str;
+                  description = "Name in `home.localCheckoutLinks.checkouts`.";
+                };
+                source = mkOption {
+                  type = types.str;
+                  description = "Path of settings.json within the checkout.";
+                };
+                fallback = mkOption {
+                  type = types.path;
+                  description = "Immutable settings.json used when the checkout is absent.";
+                };
+              };
+            }
+          );
+        };
       };
 
       config = lib.mkIf (cfg.instances != { }) (
         lib.mkMerge [
           {
-            assertions = lib.mapAttrsToList (name: _: {
-              assertion = validName name;
-              message = "programs.herdr-app.instances.${name}: name must match [A-Za-z0-9][A-Za-z0-9._-]*";
-            }) cfg.instances;
+            assertions =
+              lib.mapAttrsToList (name: _: {
+                assertion = validName name;
+                message = "programs.herdr-app.instances.${name}: name must match [A-Za-z0-9][A-Za-z0-9._-]*";
+              }) cfg.instances
+              ++ [
+                {
+                  assertion = lib.all (name: !nested cfg.sharedDirectory (relHome name)) (
+                    lib.attrNames cfg.instances
+                  );
+                  message = "programs.herdr-app.sharedDirectory must not be, contain or sit inside an instance home.";
+                }
+              ];
 
             home.packages = lib.mapAttrsToList mkInstance cfg.instances;
+
+            home.file = lib.listToAttrs (
+              lib.concatMap (
+                name:
+                map (dir: {
+                  name = "${relHome name}/${dir}";
+                  value.source = config.lib.file.mkOutOfStoreSymlink "${absShared}/${dir}";
+                }) sharedDirs
+              ) (lib.attrNames cfg.instances)
+            );
+
+            # So the links never dangle before the first app start.
+            home.activation.herdrAppSharedDirectory = lib.hm.dag.entryAfter [ "writeBoundary" ] ''
+              run mkdir -p ${lib.concatMapStringsSep " " (d: lib.escapeShellArg "${absShared}/${d}") sharedDirs}
+            '';
+
+            home.localCheckoutLinks.files = lib.mkIf (cfg.settings != null) (
+              lib.genAttrs' (lib.attrNames cfg.instances) (
+                name:
+                lib.nameValuePair "${relHome name}/settings.json" {
+                  inherit (cfg.settings) checkout source fallback;
+                }
+              )
+            );
           }
 
           (lib.optionalAttrs (options ? impermanence) {
-            impermanence.persist-directories = lib.concatMap (name: [
-              (relHome name)
-              (relCoreState name)
-            ]) (lib.attrNames cfg.instances);
+            impermanence.persist-directories =
+              lib.concatMap (name: [
+                (relHome name)
+                (relCoreState name)
+              ]) (lib.attrNames cfg.instances)
+              ++ [ cfg.sharedDirectory ];
           })
         ]
       );
