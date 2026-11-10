@@ -55,6 +55,19 @@ let
         npm prune --omit=dev --ignore-scripts --legacy-peer-deps
         mkdir -p "$out"
         cp -r package.json src node_modules README.md LICENSE "$out/"
+
+        # Pi labels local index.ts extensions by their parent directory.
+        # A root entry point identifies this package rather than just "src",
+        # without moving upstream files that resolve assets relative to src.
+        node --input-type=module <<'JS'
+        import fs from 'node:fs';
+        const root = process.env.out;
+        const pkg = JSON.parse(fs.readFileSync(root + '/package.json', 'utf8'));
+        pkg.pi.extensions = ['./index.ts'];
+        fs.writeFileSync(root + '/package.json', JSON.stringify(pkg, null, 2) + '\n');
+        fs.writeFileSync(root + '/index.ts', 'export { default } from "./src/index.ts";\n');
+        JS
+
         runHook postInstall
       '';
 
@@ -67,6 +80,8 @@ let
         import fs from 'node:fs';
         const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
         assert.equal(pkg.version, '${finalAttrs.version}');
+        assert.deepEqual(pkg.pi.extensions, ['./index.ts']);
+        assert.equal(fs.readFileSync('index.ts', 'utf8'), 'export { default } from "./src/index.ts";\n');
         for (const path of pkg.pi.extensions) assert.ok(fs.existsSync(path), path);
         for (const name of Object.keys(pkg.dependencies)) {
           await import(name === '@modelcontextprotocol/sdk' ? name + '/server/mcp.js' : name);
