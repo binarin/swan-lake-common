@@ -318,11 +318,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1794247510,
-        "narHash": "sha256-QE6Tx7aKQYqVvB/U5ZLY6MqTvkJ3MGlj1YDRBYsZGL8=",
+        "lastModified": 1794310929,
+        "narHash": "sha256-diZh+P6xgfAQRuh5DC77s6PekXG9JAS5zylTZumjWIc=",
         "ref": "refs/heads/master",
-        "rev": "48eddda8ed9ecf137ad3d82d7386206acdc94bd1",
-        "revCount": 95,
+        "rev": "f50e8c9bfd307ce95dbb7aa5cebc0452f640774a",
+        "revCount": 100,
         "type": "git",
         "url": "https://forgejo.lynx-lizard.ts.net/binarin/zwanenzang"
       },
