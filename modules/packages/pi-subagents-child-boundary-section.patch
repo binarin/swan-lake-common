@@ -1,0 +1,73 @@
+--- a/src/runs/shared/subagent-prompt-runtime.ts
++++ b/src/runs/shared/subagent-prompt-runtime.ts
+@@ -46,6 +46,9 @@
+ 	"If you need to edit files, use the available editing tools. Do not print tool-call syntax, patches, or pseudo-tool calls as text.",
+ ].join("\n");
+ 
++/** Prompt section that carries the child boundary when Pi renders the prompt. */
++const CHILD_BOUNDARY_SECTION = "subagent_boundary";
++
+ export const CHILD_FANOUT_BOUNDARY_INSTRUCTIONS = [
+ 	"You are a child subagent with explicit fanout responsibility for this assigned task.",
+ 	"The parent session owns final orchestration, acceptance, and follow-up implementation launches.",
+@@ -259,7 +262,16 @@
+ 	// message instead (see projectForkRequest).
+ 	if (config.forkCacheKey) return;
+ 	pi.on("before_agent_start", (event) => {
+-		const finalized = appendChildBoundary(event.systemPrompt, { fanoutChild: config.fanoutChild, structuredOutput: Boolean(config.structuredOutput) });
++		const boundaryOptions = { fanoutChild: config.fanoutChild, structuredOutput: Boolean(config.structuredOutput) };
++		// Add the boundary as a prompt section while Pi still renders the prompt from its
++		// options. Providers that forward only structured prompt parts, such as
++		// pi-claude-bridge, drop a returned prompt but forward sections.
++		const options = event.systemPromptOptions;
++		if (options?.sections && options.forceSystemPrompt === undefined) {
++			options.sections[CHILD_BOUNDARY_SECTION] = childBoundary(boundaryOptions);
++			return undefined;
++		}
++		const finalized = appendChildBoundary(event.systemPrompt, boundaryOptions);
+ 		return finalized === event.systemPrompt ? undefined : { systemPrompt: finalized };
+ 	});
+ }
+--- a/test/unit/child-prompt-sections.test.ts
++++ b/test/unit/child-prompt-sections.test.ts
+@@ -15,6 +15,12 @@
+ type Run = { flags: Flags; fixture?: Fixture; unsetFlags?: boolean; fanout?: boolean; structured?: boolean; prompts?: string[]; toolTurn?: boolean; hooks?: Array<(pi: ExtensionAPI) => void> };
+ 
+ const count = (text: string, part: string) => text.split(part).length - 1;
++// The boundary is a prompt section, which Pi renders as a tagged block after the other sections.
++const boundarySection = (boundary: string) => `\n\n<subagent_boundary>\n${boundary}\n</subagent_boundary>`;
++const withBoundarySection = (render: string, rewritten: string) => {
++	assert.ok(rewritten.startsWith(`${render}\n\n`), "nothing to strip, so the rewrite only appends the boundary");
++	return render + boundarySection(rewritten.slice(render.length + 2));
++};
+ 
+ describe("child provider system prompt", () => {
+ 	let root: string;
+@@ -103,7 +109,7 @@
+ 			assert.doesNotMatch(capture, /GLOBAL-CONTEXT-MARKER/);
+ 			assert.doesNotMatch(request, /GLOBAL-CONTEXT-MARKER/);
+ 			assert.match(request, /REPO-CONTEXT-MARKER/);
+-			assert.ok(request.endsWith(`\n\n${CHILD_SUBAGENT_BOUNDARY_INSTRUCTIONS}`));
++			assert.ok(request.endsWith(boundarySection(CHILD_SUBAGENT_BOUNDARY_INSTRUCTIONS)));
+ 			assert.equal(count(request, CHILD_SUBAGENT_BOUNDARY_INSTRUCTIONS), 1);
+ 		}
+ 	});
+@@ -130,7 +136,7 @@
+ 			// The launch without the removed resources leaves rewriteSubagentPrompt nothing to strip, so it only appends the boundary.
+ 			const [render] = await providerPrompts({ ...run, fixture: { ...run.fixture, ...absent }, unsetFlags: true });
+ 			const [actual] = await providerPrompts(run);
+-			assert.equal(actual, rewriteSubagentPrompt(render!, { ...run.flags, structuredOutput: run.structured }));
++			assert.equal(actual, withBoundarySection(render!, rewriteSubagentPrompt(render!, { ...run.flags, structuredOutput: run.structured })));
+ 		});
+ 	}
+ 
+@@ -139,7 +145,7 @@
+ 		const seen: string[] = [];
+ 		const [rewritten] = await providerPrompts({ flags, fanout: true, hooks: [(pi) => pi.on("before_agent_start", (event) => { seen.push(event.systemPrompt); })] });
+ 		// With everything inherited the filter removes nothing, so the prompt seen mid-chain is Pi's original render.
+-		assert.equal(rewritten, rewriteSubagentPrompt(seen[0]!, { ...flags, fanoutChild: true }));
+-		assert.ok(rewritten!.endsWith(`\n\n${CHILD_FANOUT_BOUNDARY_INSTRUCTIONS}`));
++		assert.equal(rewritten, withBoundarySection(seen[0]!, rewriteSubagentPrompt(seen[0]!, { ...flags, fanoutChild: true })));
++		assert.ok(rewritten!.endsWith(boundarySection(CHILD_FANOUT_BOUNDARY_INSTRUCTIONS)));
+ 	});
+ });

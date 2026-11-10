@@ -7,6 +7,7 @@ let
       buildNpmPackage,
       fetchFromGitHub,
       nodejs_24,
+      git,
     }:
     buildNpmPackage (finalAttrs: {
       pname = "pi-subagents";
@@ -19,10 +20,26 @@ let
         hash = "sha256-jjumBpE2OrUmeut7M3wZDlLjEA9mbA7Q21NepUYHU5s=";
       };
 
+      # pi-subagents returns the child boundary as a replacement system prompt,
+      # which pi-claude-bridge drops. Add it as a prompt section instead, which
+      # the bridge forwards to Claude Code.
+      patches = [ ./pi-subagents-child-boundary-section.patch ];
+
       nodejs = nodejs_24;
       npmDepsHash = "sha256-aGw6EkTn6zIf29rx69B/6lEjHjxF6ZZCHbslXhy4ITg=";
       npmRebuildFlags = [ "--ignore-scripts" ];
       npmBuildScript = "build:pkg";
+
+      # Upstream's prompt tests cover the patched boundary. The watchdog test
+      # in the second file needs git.
+      doCheck = true;
+      nativeCheckInputs = [ git ];
+      checkPhase = ''
+        runHook preCheck
+        node --experimental-strip-types --import ./test/support/isolated-temp-root.mjs --test \
+          test/unit/child-prompt-sections.test.ts test/unit/subagent-prompt-runtime.test.ts
+        runHook postCheck
+      '';
 
       # This is a Pi resource package, not the upstream installer CLI (which
       # clones a mutable checkout into ~/.pi). Keep the manifest at $out so the
