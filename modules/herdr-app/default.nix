@@ -97,8 +97,13 @@
       options.programs.herdr-app = {
         package = mkOption {
           type = types.package;
-          default = pkgs.llm-agents.herdr-app;
-          defaultText = lib.literalExpression "pkgs.llm-agents.herdr-app";
+          # 0.1.14's capability-based asset loader refuses our shared mods
+          # symlink and logs "a path led outside of the filesystem" on every
+          # repaint. Backport upstream #427 until the next release is pinned.
+          default = pkgs.llm-agents.herdr-app.overrideAttrs (old: {
+            patches = (old.patches or [ ]) ++ lib.optional (old.version == "0.1.14") ./linked-assets.patch;
+          });
+          defaultText = lib.literalExpression "pkgs.llm-agents.herdr-app (with the 0.1.14 linked-assets fix)";
           description = "herdr-app package the instances wrap.";
         };
         instances = mkOption {

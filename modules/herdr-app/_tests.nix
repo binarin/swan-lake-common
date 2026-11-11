@@ -44,6 +44,8 @@ let
   };
 
   plain = hm { };
+  defaultPackage = plain.options.programs.herdr-app.package.default;
+  needsLinkedAssetsFix = pkgs.llm-agents.herdr-app.version == "0.1.14";
   persisted = hm impermanenceStub;
   fails = extra: !(builtins.tryEval (hm extra).activationPackage.drvPath).success;
 
@@ -61,6 +63,9 @@ let
 
   expect = cond: msg: lib.assertMsg cond "herdr-app test: ${msg}";
 in
+assert expect (
+  !needsLinkedAssetsFix || builtins.elem ./linked-assets.patch defaultPackage.patches
+) "the default 0.1.14 package includes upstream's linked-assets fix";
 assert expect (
   persisted.config.impermanence.persist-directories == [
     ".config/herdrs/sl"
@@ -85,7 +90,20 @@ assert expect (
   && settingsLinks.".config/herdrs/sl/settings.json".source == "herdr/settings.json"
   && settingsLinks.".config/herdrs/sl/settings.json".checkout == "cfg"
 ) "every instance's settings.json links to the shared checkout file";
-pkgs.runCommand "herdr-app-instances" { } ''
+pkgs.runCommand "herdr-app-instances" { nativeBuildInputs = [ pkgs.patch ]; } ''
+  ${lib.optionalString needsLinkedAssetsFix ''
+    # Apply against the pinned release, not a newer reference checkout. Only
+    # the affected files are needed; don't build the GUI for wrapper tests.
+    mkdir -p source/src source/vendor/gpui-kit/crates/shell/src
+    cp ${pkgs.llm-agents.herdr-app.src}/src/main.rs source/src/
+    cp ${pkgs.llm-agents.herdr-app.src}/vendor/gpui-kit/crates/shell/src/assets.rs \
+      source/vendor/gpui-kit/crates/shell/src/
+    chmod -R u+w source
+    patch --batch --fuzz=0 -d source -p1 < ${./linked-assets.patch}
+    grep -q 'AppAssets::new(mods::app_dir()).following_links()' source/src/main.rs
+    grep -q 'fn following_links_serves_a_linked_folder_but_not_traversal()' \
+      source/vendor/gpui-kit/crates/shell/src/assets.rs
+  ''}
   p=${plain.config.home.path}
   out_=$("$p/bin/herdr-sl")
   [ "$out_" = "/home/tester/.config/herdrs/sl|herdr-sl|sl" ] || { echo "env: $out_"; exit 1; }
