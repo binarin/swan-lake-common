@@ -95,14 +95,14 @@ pkgs.runCommand "agent-skills" { } ''
 
   f=${defaults.config.home-files}
   for d in .claude/skills .codex/skills .pi/agent/skills; do
-    check "$f/$d" claudy-comment-detector grilling
+    check "$f/$d" claudy-comment-detector grilling hc-handoff
   done
   grep -qx 'name: claudy-comment-detector' "$f/.pi/agent/skills/claudy-comment-detector/SKILL.md"
 
   f=${extended.config.home-files}
-  check "$f/.claude/skills" direct from-dir from-file grilling
-  check "$f/.codex/skills" from-dir from-file grilling
-  check "$f/.pi/agent/skills" from-dir from-file grilling
+  check "$f/.claude/skills" direct from-dir from-file grilling hc-handoff
+  check "$f/.codex/skills" from-dir from-file grilling hc-handoff
+  check "$f/.pi/agent/skills" from-dir from-file grilling hc-handoff
   # Codex skips a symlinked SKILL.md (openai/codex#10470); pi gets the same copy.
   for d in .codex/skills .pi/agent/skills; do
     [ ! -L "$(readlink -f "$f/$d/from-file")/SKILL.md" ] || { echo "$d/from-file/SKILL.md is a symlink"; exit 1; }
@@ -110,6 +110,6 @@ pkgs.runCommand "agent-skills" { } ''
 
   f=${piOnly.config.home-files}
   [ ! -e "$f/.claude" ] && [ ! -e "$f/.codex" ]
-  check "$f/.pi/agent/skills" claudy-comment-detector grilling
+  check "$f/.pi/agent/skills" claudy-comment-detector grilling hc-handoff
   touch $out
 ''

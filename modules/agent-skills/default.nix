@@ -87,14 +87,15 @@
           }
         '';
         description = ''
-          Agent skills by name. Two are predefined and enabled:
-          `grilling` and `claudy-comment-detector`.
+          Agent skills by name. Three are predefined and enabled:
+          `grilling`, `hc-handoff` and `claudy-comment-detector`.
         '';
       };
 
       config = {
         programs.agent-skills.skills = {
           grilling.source = lib.mkDefault ./_skills/grilling;
+          hc-handoff.source = lib.mkDefault ./_skills/hc-handoff;
           claudy-comment-detector.source = lib.mkDefault (builtins.fetchurl {
             url = "https://raw.githubusercontent.com/citelao/dotfiles/d804f322eac538576230ddeeeafc780542bd98f3/dotfiles/.chezmoitemplates/skills/claudy-comment-detector/SKILL.md";
             sha256 = "sha256-4kE0FLldUuutxrWjmCEU7j38uNb0p0SngFAxG+pncbw=";
