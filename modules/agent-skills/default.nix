@@ -23,7 +23,10 @@
 
       enabled = lib.filterAttrs (_: s: s.enable) cfg.skills;
       isDir = s: lib.pathIsDirectory s.source;
-      skillFile = s: if isDir s then "${s.source}/SKILL.md" else s.source;
+      # Append to the source rather than interpolating it: interpolation names
+      # a store copy that `nix flake check --no-build` does not create, so
+      # reading SKILL.md through it would fail.
+      skillFile = s: if isDir s then s.source + "/SKILL.md" else s.source;
 
       # Reading a built store path during evaluation would be import from
       # derivation; such sources skip the name check.
