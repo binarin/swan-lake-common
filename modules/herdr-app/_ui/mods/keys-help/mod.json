@@ -1,0 +1,13 @@
+{
+  "place": "none",
+  "cloned_from": {
+    "name": "help",
+    "version": "0.1.14"
+  },
+  "title": "Keys",
+  "overlay": {
+    "kind": "dialog",
+    "width": 680,
+    "height": 0.8
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "global": {
+    "ctrl-o": "mod.open:tmux-prefix"
+  },
+  "terminal": {
+    "ctrl-o": "mod.open:tmux-prefix",
+    "ctrl-backspace": "send:\u0017",
+    "ctrl-left": "send:\u001bb",
+    "ctrl-right": "send:\u001bf",
+    "ctrl-shift-c": "terminal.copy",
+    "ctrl-shift-v": "terminal.paste",
+    "ctrl-v": "terminal.paste_image",
+    "ctrl-insert": "terminal.copy",
+    "shift-insert": "terminal.paste"
+  },
+  "mod:tmux-prefix": {
+    "ctrl-o": "tmux-prefix.last-tab"
+  }
+}

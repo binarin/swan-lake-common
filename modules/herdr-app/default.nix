@@ -22,6 +22,10 @@
   # running window. layouts/.state (splitter sizes, picked panels) lives in
   # layouts/ and so is shared too.
   #
+  # `ui.enable` adds the swan-lake UI from ./_ui (mods, a `main-hosts` layout
+  # and keys.json; see the option), from the store or, with `ui.checkout`, linked
+  # from a mutable swan-lake-common checkout so edits apply live.
+  #
   # Instance homes, core state and the shared directory are persisted under
   # impermanence.
   flake.homeModules.herdr-app =
@@ -51,6 +55,52 @@
       # activation, hiding anything activation created there. A failure is
       # left for the app to report.
       mkShared = "mkdir -p ${lib.escapeShellArgs (map (d: "${absShared}/${d}") sharedDirs)} || true";
+
+      # programs.herdr-app.ui: the files under ./_ui, as home-relative target ->
+      # { src (relative to _ui), type }. Mods and the layout go to the shared
+      # directory (every instance links to it), keys.json into each instance.
+      uiDir = ./_ui;
+      uiCheckoutDir = "modules/herdr-app/_ui";
+      uiMods = [
+        "tmux-prefix"
+        "last-tab"
+        "host-spaces"
+        "host-agents"
+        "host-tabs"
+        "host-picker"
+        "keys-help"
+      ];
+      uiLinks =
+        lib.listToAttrs (
+          map (
+            m:
+            lib.nameValuePair "${cfg.sharedDirectory}/mods/${m}" {
+              src = "mods/${m}";
+              type = "directory";
+            }
+          ) uiMods
+        )
+        // {
+          "${cfg.sharedDirectory}/layouts/${uiLayout}.json" = {
+            src = "layouts/${uiLayout}.json";
+            type = "file";
+          };
+        }
+        // lib.optionalAttrs cfg.ui.keys (
+          lib.genAttrs' (lib.attrNames cfg.instances) (
+            name:
+            lib.nameValuePair "${relHome name}/keys.json" {
+              src = "keys.json";
+              type = "file";
+            }
+          )
+        );
+      uiLayout = "main-hosts";
+      hostTagsJson = builtins.toJSON {
+        hosts = lib.mapAttrs (
+          _: t: if builtins.isString t then { alias = t; } else lib.filterAttrs (_: v: v != null) t
+        ) cfg.ui.hostTags;
+      };
 
       mkInstance =
         name: title:
@@ -128,6 +178,71 @@
             the app fills in its shipped mods and layouts on start.
           '';
         };
+        ui = {
+          enable = lib.mkEnableOption ''
+            the swan-lake Herdr UI, shared by every instance: a `main-hosts`
+            layout (Herdr's main, with host-spaces, host-agents and host-tabs:
+            a colored [alias] of each space's and agent's machine, an overview of
+            every space's tabs, unread agents, numbers while the prefix is open),
+            a Ctrl+O prefix with nested keymaps and repeat maps (tmux-prefix,
+            last-tab), a fuzzy go-to (host-picker) and one list of every key
+            (keys-help). Switch to it once per instance:
+            `herdr-<name> do layout.switch --name main-hosts`
+          '';
+          checkout = mkOption {
+            type = types.nullOr types.str;
+            default = null;
+            example = "swan-lake-common";
+            description = ''
+              Name in `home.localCheckoutLinks.checkouts` of a swan-lake-common
+              checkout to link the UI files from (edits show at once; a file
+              added to a mod needs an activation). `null`: from the store.
+            '';
+          };
+          keys = mkOption {
+            type = types.bool;
+            default = true;
+            description = ''
+              Also link the UI's keys.json into every instance: only Ctrl+O and
+              the clipboard keys stay outside the prefix, so terminals get
+              everything else. Replaces Herdr's default keys.
+            '';
+          };
+          hostTags = mkOption {
+            type = types.attrsOf (
+              types.either types.nonEmptyStr (
+                types.submodule {
+                  options = {
+                    alias = mkOption {
+                      type = types.nonEmptyStr;
+                      description = "Shown as [alias].";
+                    };
+                    color = mkOption {
+                      type = types.nullOr types.str;
+                      default = null;
+                      description = "A theme color name (ansi1..ansi15, accent, ...) or #rrggbb; null: picked from the name.";
+                    };
+                  };
+                }
+              )
+            );
+            default = { };
+            example = {
+              local = {
+                alias = "local";
+                color = "ansi2";
+              };
+              my-long-dev-vm-name = "dev";
+            };
+            description = ''
+              Host tags, written to each instance's host-tags.json. Keys: Herdr's
+              machine name (`hc machine ls`), that machine's host, or `local`
+              for this computer. A string is only the alias. A machine not listed
+              shows its own name.
+            '';
+          };
+        };
+
         settings = mkOption {
           default = null;
           description = ''
@@ -202,6 +317,28 @@
               )
             );
           }
+
+          (lib.mkIf cfg.ui.enable {
+            home.file = lib.mkMerge [
+              (lib.genAttrs' (lib.attrNames cfg.instances) (
+                name: lib.nameValuePair "${relHome name}/host-tags.json" { text = hostTagsJson; }
+              ))
+              (lib.mkIf (cfg.ui.checkout == null) (
+                lib.mapAttrs (_: l: {
+                  source = uiDir + "/${l.src}";
+                  recursive = l.type == "directory";
+                }) uiLinks
+              ))
+            ];
+            home.localCheckoutLinks.files = lib.mkIf (cfg.ui.checkout != null) (
+              lib.mapAttrs (_: l: {
+                inherit (l) type;
+                checkout = cfg.ui.checkout;
+                source = "${uiCheckoutDir}/${l.src}";
+                fallback = uiDir + "/${l.src}";
+              }) uiLinks
+            );
+          })
 
           (lib.optionalAttrs (options ? impermanence) {
             impermanence.persist-directories =
