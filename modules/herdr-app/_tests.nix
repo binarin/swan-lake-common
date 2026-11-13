@@ -11,7 +11,7 @@ let
     mkdir -p $out/bin $out/share/icons/hicolor/scalable/apps
     cat > $out/bin/herdr-app <<'EOF'
     #!${pkgs.runtimeShell}
-    echo "$HERDR_APP_HOME|$HERDR_APP_ID|$HC_SESSION"
+    echo "$HERDR_APP_HOME|$HERDR_APP_ID|$HC_SESSION|$HERDR_APP_TITLE"
     EOF
     chmod +x $out/bin/herdr-app
     echo '<svg/>' > $out/share/icons/hicolor/scalable/apps/herdr-app.svg
@@ -92,6 +92,9 @@ assert expect (
   !needsLinkedAssetsFix || builtins.elem ./linked-assets.patch defaultPackage.patches
 ) "the default 0.1.14 package includes upstream's linked-assets fix";
 assert expect (
+  !needsLinkedAssetsFix || builtins.elem ./instance-title.patch defaultPackage.patches
+) "the default 0.1.14 package supports instance window titles";
+assert expect (
   persisted.config.impermanence.persist-directories == [
     ".config/herdrs/sl"
     ".local/state/herdr-core/sl"
@@ -154,18 +157,23 @@ pkgs.runCommand "herdr-app-instances" { nativeBuildInputs = [ pkgs.patch ]; } ''
     # Apply against the pinned release, not a newer reference checkout. Only
     # the affected files are needed; don't build the GUI for wrapper tests.
     mkdir -p source/src source/vendor/gpui-kit/crates/shell/src
-    cp ${pkgs.llm-agents.herdr-app.src}/src/main.rs source/src/
+    cp ${pkgs.llm-agents.herdr-app.src}/src/{main,setup}.rs source/src/
     cp ${pkgs.llm-agents.herdr-app.src}/vendor/gpui-kit/crates/shell/src/assets.rs \
       source/vendor/gpui-kit/crates/shell/src/
     chmod -R u+w source
     patch --batch --fuzz=0 -d source -p1 < ${./linked-assets.patch}
+    patch --batch --fuzz=0 -d source -p1 < ${./instance-title.patch}
+    grep -q 'HERDR_APP_TITLE' source/src/main.rs
+    grep -q 'HERDR_APP_TITLE' source/src/setup.rs
     grep -q 'AppAssets::new(mods::app_dir()).following_links()' source/src/main.rs
     grep -q 'fn following_links_serves_a_linked_folder_but_not_traversal()' \
       source/vendor/gpui-kit/crates/shell/src/assets.rs
   ''}
   p=${plain.config.home.path}
   out_=$("$p/bin/herdr-sl")
-  [ "$out_" = "/home/tester/.config/herdrs/sl|herdr-sl|sl" ] || { echo "env: $out_"; exit 1; }
+  [ "$out_" = "/home/tester/.config/herdrs/sl|herdr-sl|sl|Herdr (Swan Lake)" ] || { echo "env: $out_"; exit 1; }
+  out_=$(${withSettings.config.home.path}/bin/herdr-bk)
+  [ "$out_" = "/home/tester/.config/herdrs/bk|herdr-bk|bk|Herdr (BK)" ] || { echo "env: $out_"; exit 1; }
   d="$p/share/applications/herdr-sl.desktop"
   grep -qx 'Name=Herdr (Swan Lake)' "$d"
   grep -qx 'Exec=herdr-sl' "$d"

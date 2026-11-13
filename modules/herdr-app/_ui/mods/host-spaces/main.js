@@ -12,7 +12,7 @@
 
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
-import { spaces, machines, panes, agents, run, openOverlay, exec, hc, theme, shared, setShared, watchFolder, window, layout, readTextFile, appHome, nextCommand } from "herdr";
+import { spaces, machines, panes, agents, run, openOverlay, exec, hc, theme, shared, setShared, watchFolder, window, layout, readTextFile, appHome, nextCommand, props, closeOverlay } from "herdr";
 
 // ---- host tags: the same block in host-spaces and host-agents; keep them in sync ----
 // A colored [alias] for the machine a space or agent runs on, read from
@@ -138,8 +138,106 @@ export function tone(t, status) {
   return t[status] ?? t.unknown;
 }
 
+// Space and overview-tab menus, based on Herdr's menu 0.1.14.
+const UNREAD = "host-agents.unread";
+const canMark = (a) => a.status === "idle" || a.status === "done";
+const marks = () => shared(UNREAD) ?? {};
+const targets = () => {
+  const p = props();
+  return agents().filter((a) => p.tab === "space" ? a.space === p.target.id : a.tab === p.target.id);
+};
+
+function setUnread(on) {
+  const next = { ...marks() };
+  const at = Date.now();
+  for (const a of targets()) {
+    if (!on) delete next[a.address];
+    else if (canMark(a) && !next[a.address]) next[a.address] = { at, left: !a.focused };
+  }
+  setShared(UNREAD, next);
+}
+
+function items(git) {
+  const { tab, target: tg } = props();
+  const mine = targets(), unread = marks();
+  const attention = [
+    ...(mine.some((a) => canMark(a) && !unread[a.address]) ? [["Mark unread", "unread", {}]] : []),
+    ...(mine.some((a) => unread[a.address]) ? [["Mark read", "read", {}]] : []),
+  ];
+  if (tab === "tab") return [
+    ...attention,
+    ["Rename", "tab.rename", { id: tg.id }],
+    ["New tab", "tab.new", { space: tg.space }],
+    ["Close", "tab.close", { id: tg.id }],
+  ];
+  return [
+    ...attention,
+    ["Rename", "space.rename", { id: tg.id }],
+    ...(git ? [["New worktree", "worktree", { space: tg.id, action: "new" }], ["Open worktree", "worktree", { space: tg.id, action: "open" }]] : []),
+    ...(git === "linked" ? [["Remove worktree", "worktree", { space: tg.id, action: "remove" }]] : []),
+    ["Close", "space.close", { id: tg.id }],
+  ];
+}
+
+function initMenu(cx) {
+  const state = { at: 0, git: null, handle: cx.focus_handle() };
+  state.handle.focus();
+  const p = props();
+  const space = p.tab === "space" && spaces().find((s) => s.id === p.target.id);
+  const tabs = new Set((space?.tabs ?? []).map((t) => t.id));
+  const folder = space && (panes().find((p) => tabs.has(p.tab) && p.cwd)?.cwd || space.folder);
+  if (folder) cx.spawn(async (cx) => {
+    try {
+      const top = await exec("git", ["rev-parse", "--show-toplevel"], { cwd: folder, on: space.machine });
+      const common = await exec("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd: folder, on: space.machine });
+      if (top.code === 0 && common.code === 0) state.git = common.stdout.trim() === `${top.stdout.trim()}/.git` ? "main" : "linked";
+    } catch {}
+    cx.notify();
+  });
+  return state;
+}
+
+function choose(state, i) {
+  const it = items(state.git)[i];
+  if (!it) return;
+  closeOverlay(props().overlay);
+  if (it[1] === "unread" || it[1] === "read") setUnread(it[1] === "unread");
+  else if (it[1] === "worktree") openOverlay({ mod: "worktree", kind: "dialog", ...(it[2].action === "open" ? { width: 560, height: 480 } : { width: 440, height: 260 }), props: it[2] });
+  else run(it[1], it[2]);
+}
+
+function menuIcon(command) {
+  const name = command === "unread" || command === "read" ? "circle-check"
+    : command.endsWith(".close") ? "x" : command.endsWith(".rename") ? "square-pen"
+    : command === "worktree" ? "git-branch" : "plus";
+  return `mods/workspace-chrome/${name}.svg`;
+}
+
+function renderMenu(state) {
+  const t = theme(), list = items(state.git);
+  state.at = Math.min(state.at, list.length - 1);
+  return v_flex().id("space-menu").track_focus(state.handle).w_full().min_h(0).p(5).bg(t.popover).text_size(12.8)
+    .on_key_down((e, cx) => {
+      if (e.key === "down") state.at = (state.at + 1) % list.length;
+      else if (e.key === "up") state.at = (state.at + list.length - 1) % list.length;
+      else if (e.key === "enter") choose(state, state.at);
+      else if (e.key === "escape") closeOverlay(props().overlay);
+      else return;
+      cx.notify();
+    })
+    .children(list.map((it, i) => v_flex()
+      .when(i > 0 && it[1].endsWith(".close"), (el) => el.child(div().mx(7).my(4).h(1).bg(t.border)))
+      .child(h_flex().id(`sm-${i}`).h(31).px(8).gap(9).rounded(7).items_center().text_color(t.foreground)
+        .when(i === state.at, (el) => el.bg(t.selected))
+        .hover((s) => s.bg(t.hover))
+        .on_click(() => choose(state, i))
+        .child(svg(menuIcon(it[1])).size(14).flex_none().text_color(t.muted))
+        .child(div().flex_1().child(it[0])))));
+}
+
 export default class Spaces extends View {
   init(_props, cx) {
+    if (props()?.contextMenu) { this.contextMenu = initMenu(cx); return; }
     this.git = {}; // where() -> { name, branch, ahead, behind, repo, linked }, null: not a repo
     this.checked = {}; // where() -> when it was last looked at
     this.unsure = new Set(); // where()s git couldn't answer for (a machine away)
@@ -348,7 +446,7 @@ export default class Spaces extends View {
 
   menu(w) {
     // A popup is as tall as its items; height is only the most.
-    openOverlay({ mod: "menu", kind: "popup", width: 200, height: 260, props: { tab: "space", target: { id: w.id } } });
+    openOverlay({ mod: "host-spaces", kind: "popup", width: 200, height: 320, props: { contextMenu: true, tab: "space", target: { id: w.id } } });
   }
 
   orderingDue(now) {
@@ -574,7 +672,7 @@ export default class Spaces extends View {
         .when(here, (el) => el.bg(t.hover))
         .hover((s) => s.bg(t.hover))
         .on_click(() => run("tab.select", { id: tab.id }))
-        .on_mouse_down("right", (_e, cx) => { cx.stop_propagation(); openOverlay({ mod: "menu", kind: "popup", width: 200, props: { tab: "tab", target: { id: tab.id, space: w.id } } }); })
+        .on_mouse_down("right", (_e, cx) => { cx.stop_propagation(); openOverlay({ mod: "host-spaces", kind: "popup", width: 200, height: 220, props: { contextMenu: true, tab: "tab", target: { id: tab.id, space: w.id } } }); })
         .child(div().w(12).flex_none().text_size(10.5).text_color(shared(PREFIX_OPEN) && w.active ? t.accent : t.dim).when(Boolean(shared(PREFIX_OPEN)) && w.active, el => el.font_bold()).child(String(i + 1)))
         .child(mark)
         .child(div().flex_shrink(1).min_w(0).truncate()
@@ -601,11 +699,13 @@ export default class Spaces extends View {
       .when(w.active, (el) => el.bg(t.selected))
       .when(!w.active, (el) => el.hover((s) => s.bg(t.hover)))
       .on_click(() => run("space.select", { id: w.id }))
+      .on_mouse_down("right", () => this.menu(w))
       .child(div().text_color(this.tags.color(t, w.machine)).when(w.active, (el) => el.font_bold()).child(String(i + 1)))
       .child(div().absolute().right(5).text_color(tone(t, w.status)).child(glyph(w.status))));
   }
 
   render() {
+    if (this.contextMenu) return renderMenu(this.contextMenu);
     const t = theme();
     const collapsed = narrow();
     const palette = ["ansi6", "ansi3", "ansi4", "ansi5", "ansi2", "ansi1"];

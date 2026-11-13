@@ -1,0 +1,12 @@
+diff --git a/src/main.rs b/src/main.rs
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -215,1 +215,1 @@
+-                    title: Some("Herdr".into()),
++                    title: Some(std::env::var("HERDR_APP_TITLE").ok().filter(|s| !s.trim().is_empty()).unwrap_or_else(|| "Herdr".into()).into()),
+diff --git a/src/setup.rs b/src/setup.rs
+--- a/src/setup.rs
++++ b/src/setup.rs
+@@ -79,1 +79,1 @@
+-        titlebar: Some(TitlebarOptions { title: Some("Herdr".into()), ..Default::default() }),
++        titlebar: Some(TitlebarOptions { title: Some(std::env::var("HERDR_APP_TITLE").ok().filter(|s| !s.trim().is_empty()).unwrap_or_else(|| "Herdr".into()).into()), ..Default::default() }),

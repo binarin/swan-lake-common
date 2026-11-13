@@ -128,6 +128,7 @@
             makeWrapper ${lib.getExe cfg.package} "$out/bin/${bin}" \
               --set HERDR_APP_HOME ${lib.escapeShellArg "${config.home.homeDirectory}/${relHome name}"} \
               --set HERDR_APP_ID ${lib.escapeShellArg bin} \
+              --set HERDR_APP_TITLE ${lib.escapeShellArg "Herdr (${title})"} \
               --set HC_SESSION ${lib.escapeShellArg name} \
               --run ${lib.escapeShellArg mkShared}
             install -Dm444 ${desktop}/share/applications/${bin}.desktop \
@@ -150,10 +151,16 @@
           # 0.1.14's capability-based asset loader refuses our shared mods
           # symlink and logs "a path led outside of the filesystem" on every
           # repaint. Backport upstream #427 until the next release is pinned.
+          # Instance launchers also need a title override: upstream hard-codes Herdr.
           default = pkgs.llm-agents.herdr-app.overrideAttrs (old: {
-            patches = (old.patches or [ ]) ++ lib.optional (old.version == "0.1.14") ./linked-assets.patch;
+            patches =
+              (old.patches or [ ])
+              ++ lib.optionals (old.version == "0.1.14") [
+                ./linked-assets.patch
+                ./instance-title.patch
+              ];
           });
-          defaultText = lib.literalExpression "pkgs.llm-agents.herdr-app (with the 0.1.14 linked-assets fix)";
+          defaultText = lib.literalExpression "pkgs.llm-agents.herdr-app (with 0.1.14 linked-assets and instance-title patches)";
           description = "herdr-app package the instances wrap.";
         };
         instances = mkOption {
@@ -166,7 +173,8 @@
             Instance name to desktop title. Each `<name> = "<Title>"` gets a
             `herdr-<name>` binary with `HERDR_APP_HOME=~/.config/herdrs/<name>`,
             its own herdr-core session (`HC_SESSION=<name>`), and a desktop
-            entry titled `Herdr (<Title>)`.
+            entry and window titled `Herdr (<Title>)` (`HERDR_APP_TITLE`, supported
+            by the patched default package).
           '';
         };
         sharedDirectory = mkOption {
