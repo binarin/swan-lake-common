@@ -113,6 +113,13 @@ let
     assert lib.assertMsg (validName user) "ssh-trust: invalid account name `${user}`";
     "${machine}--${user}";
 
+  # The registry as the signing CLI reads it.
+  registryDocument = {
+    schema = "swan-lake-ssh-trust-registry";
+    version = 1;
+    keys = mapAttrs (_: k: { inherit (k) publicKey description trust; }) keys;
+  };
+
   manifestSchema = "swan-lake-ssh-trust-manifest";
   manifestVersion = 1;
 
@@ -150,6 +157,7 @@ in
     normalizeDirectKey
     directKeyLine
     defaultPrincipal
+    registryDocument
     manifestSchema
     manifestVersion
     mkManifest
