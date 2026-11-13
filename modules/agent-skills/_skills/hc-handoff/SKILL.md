@@ -21,11 +21,11 @@ for the local-core recipe below, even on a host reached over SSH. An absent
 SSH back to the desktop or an app control socket when the core holds the
 layout.
 
-The desktop stores its topology in the core's `herdr-app` document. Read it
-through the documented `doc.get` RPC. Confirm that the caller's space and tab
-exist there before launching. Inspect the installed `hc schema` for the RPC
-contract; do not directly edit the core's files on disk. Use version-checked
-`doc.set` so a concurrent desktop edit is not overwritten.
+The desktop stores its topology in the core's `herdr-app` document. The
+bundled helper reads it with `doc.get`, confirms the caller's space and tab,
+and uses version-checked `doc.set` to preserve concurrent desktop edits.
+Inspect the installed `hc schema` for compatibility; do not directly edit
+the core's files on disk.
 
 ## Launch and register a visible tab
 
@@ -34,96 +34,28 @@ Choose a unique terminal/tab name, target directory and first message. The
 message states that this is an independent continuation, its assigned work,
 and its next step. It must not ask the new session to report to the launcher.
 
-The following recipe uses the caller's local core and creates the pi session
-on the same host. Set `HANDOFF_NAME`, `HANDOFF_DIR`, `HANDOFF_TASK`, and
-`HANDOFF_MODEL` in the environment first (model is a resolved provider/id).
-It preserves the conversation with `pi --fork`, not a shared writable session.
+Use `scripts/handoff.py`, resolved relative to this skill's directory (not
+the project working directory). It requires Python 3, `hc` and `pi`, uses
+the caller's local core, and creates the pi session on the same host.
+Set these environment variables before invoking it:
+
+- `HANDOFF_NAME`: unique terminal/tab name.
+- `HANDOFF_DIR`: absolute target working directory.
+- `HANDOFF_TASK`: the first message.
+- `HANDOFF_MODEL`: resolved provider/model ID.
+
+It also reads the inherited `HC_TERMINAL_SOCKET`, `HC_TERMINAL_ID` and
+`PI_SESSION_FILE`. Run:
 
 ```sh
-python3 - <<'PY'
-import json
-import os
-import socket
-import subprocess
-import uuid
-
-name = os.environ['HANDOFF_NAME']
-directory = os.environ['HANDOFF_DIR']
-task = os.environ['HANDOFF_TASK']
-model = os.environ['HANDOFF_MODEL']
-session = os.environ['PI_SESSION_FILE']
-assert os.path.isfile(session), 'Missing session context; do not launch fresh'
-
-sock = socket.socket(socket.AF_UNIX)
-sock.settimeout(15)
-sock.connect(os.environ['HC_TERMINAL_SOCKET'])
-stream = sock.makefile('rwb')
-sequence = 0
-
-def rpc(method, params):
-    global sequence
-    sequence += 1
-    request = dict(jsonrpc='2.0', id=sequence, method=method, params=params)
-    stream.write((json.dumps(request) + '\n').encode())
-    stream.flush()
-    while True:
-        line = stream.readline()
-        if not line:
-            raise RuntimeError('Core disconnected; inspect state before retrying')
-        reply = json.loads(line)
-        if reply.get('id') == sequence:
-            if 'error' in reply:
-                raise RuntimeError(reply['error'])
-            return reply['result']
-
-caller = json.loads(subprocess.check_output(
-    ['hc', 'get', os.environ['HC_TERMINAL_ID'], '--json']))
-space_id = caller['labels']['herdr.space']
-caller_tab = caller['labels']['herdr.tab']
-layout = rpc('doc.get', {'name': 'herdr-app'})
-space = next(s for s in layout['value']['spaces'] if s['id'] == space_id)
-assert any(t['id'] == caller_tab for t in space['tabs'])
-
-tab_id = 'tb' + uuid.uuid4().hex
-pane_id = 'p' + uuid.uuid4().hex
-created = json.loads(subprocess.check_output([
-    'hc', 'run', '--bg', '--no-parent', '--keep', '--name', name,
-    '--cwd', directory,
-    '--label', 'herdr.space=' + space_id,
-    '--label', 'herdr.tab=' + tab_id,
-    '--', 'pi', '--fork', session, '--model', model, '--name', name, task,
-], text=True))
-terminal = created['address']
-print(json.dumps(dict(terminal=terminal, tab=tab_id, space=space_id)), flush=True)
-new_tab = dict(id=tab_id, name=name, root=dict(
-    id=tab_id, type='row', children=[dict(
-        id=pane_id, type='block', content=dict(terminal=terminal))]))
-
-# Retry only explicit version conflicts, always against a fresh document.
-for attempt in range(5):
-    layout = rpc('doc.get', {'name': 'herdr-app'})
-    space = next(s for s in layout['value']['spaces'] if s['id'] == space_id)
-    if any(t['id'] == tab_id for t in space['tabs']):
-        break
-    space['tabs'].append(new_tab)
-    try:
-        rpc('doc.set', dict(name='herdr-app', value=layout['value'],
-                            version=layout['version']))
-        break
-    except RuntimeError as error:
-        if 'conflict' not in str(error) or attempt == 4:
-            raise
-
-layout = rpc('doc.get', {'name': 'herdr-app'})
-space = next(s for s in layout['value']['spaces'] if s['id'] == space_id)
-assert next(t for t in space['tabs'] if t['id'] == tab_id) == new_tab
-print('Verified desktop tab:', name, terminal, flush=True)
-PY
+python3 <absolute-skill-directory>/scripts/handoff.py
 ```
 
-Labels alone do not create a tab: both terminal labels and the layout entry
-are required. The app observes the document update and shows the new tab
-in the caller's space; this does not require switching the user's focus.
+The helper forks the conversation with `pi --fork`, prints the created
+terminal/tab/space IDs, then registers and verifies the tab. Labels alone
+do not create a tab: both terminal labels and the layout entry are required.
+The app observes the document update and shows the new tab in the caller's
+space; this does not require switching the user's focus.
 
 A failure after terminal creation can leave a hidden live agent. Retain the
 printed terminal/tab IDs, inspect `doc.get` and `hc get`, and either finish

@@ -82,7 +82,7 @@ assert expect (
   piOnly.config.home.file ? ".pi/agent/skills/grilling"
   && !(piOnly.config.home.file ? ".claude/skills/grilling/SKILL.md")
 ) "skills reach pi without claude-code or codex enabled";
-pkgs.runCommand "agent-skills" { } ''
+pkgs.runCommand "agent-skills" { nativeBuildInputs = [ pkgs.python3 ]; } ''
   set -eu
   check() { # dir, expected skills
     d=$1; shift
@@ -100,7 +100,13 @@ pkgs.runCommand "agent-skills" { } ''
   grep -qx 'name: claudy-comment-detector' "$f/.pi/agent/skills/claudy-comment-detector/SKILL.md"
   for d in .claude/skills .codex/skills .pi/agent/skills; do
     cmp ${./_skills/hc-handoff/SKILL.md} "$f/$d/hc-handoff/SKILL.md"
+    cmp ${./_skills/hc-handoff/scripts/handoff.py} "$f/$d/hc-handoff/scripts/handoff.py"
   done
+  python3 - <<'PY'
+  from pathlib import Path
+  path = Path('${./_skills/hc-handoff/scripts/handoff.py}')
+  compile(path.read_text(), str(path), 'exec')
+  PY
 
   f=${extended.config.home-files}
   check "$f/.claude/skills" direct from-dir from-file grilling hc-handoff
