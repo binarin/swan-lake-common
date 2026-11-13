@@ -98,6 +98,9 @@ pkgs.runCommand "agent-skills" { } ''
     check "$f/$d" claudy-comment-detector grilling hc-handoff
   done
   grep -qx 'name: claudy-comment-detector' "$f/.pi/agent/skills/claudy-comment-detector/SKILL.md"
+  for d in .claude/skills .codex/skills .pi/agent/skills; do
+    cmp ${./_skills/hc-handoff/SKILL.md} "$f/$d/hc-handoff/SKILL.md"
+  done
 
   f=${extended.config.home-files}
   check "$f/.claude/skills" direct from-dir from-file grilling hc-handoff
