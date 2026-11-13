@@ -336,7 +336,7 @@ class Runtime(unittest.TestCase):
                 rec.apply(data, desired)
             self.assertEqual(list(self.trash.iterdir()), [])
 
-    def test_overlap_and_one_step_handback_rejected(self):
+    def test_source_overlap_rejected(self):
         self.manifest['files']['config/file']['source'] = 'source'
         self.manifest['checkouts']['test'] = str(self.home)
         self.manifest['files']['config/file']['source'] = 'config'
@@ -345,10 +345,26 @@ class Runtime(unittest.TestCase):
         self.manifest['checkouts']['test'] = str(self.checkout)
         self.manifest['files']['config/file']['source'] = 'source'
         self.run_links()
+
+    def test_one_step_handback_preserves_paths_and_retires_other_links(self):
+        entry = copy.deepcopy(self.manifest['files']['config/file'])
+        self.manifest['files']['other/file'] = entry
+        self.run_links()
         self.manifest['files'] = {}
         self.manifest['homeFiles'] = [str(self.dest)]
-        with self.assertRaisesRegex(r.Error, 'handback'):
-            self.run_links()
+        before = self.snapshot()
+        self.run_links(check=True)
+        self.run_links(dry=True)
+        self.assertEqual(self.snapshot(), before)
+        inode = self.dest.lstat().st_ino
+        self.run_links()
+        self.assertEqual(self.dest.lstat().st_ino, inode)
+        self.assertEqual(os.readlink(self.dest), str(self.local))
+        self.assertFalse(os.path.lexists(self.home / 'other/file'))
+        self.assertEqual(self.ledger()['links'], {})
+        self.assertEqual(list(self.trash.iterdir()), [])
+        self.run_links()
+        self.assertEqual(self.dest.lstat().st_ino, inode)
 
     def test_real_interruptions_leave_recoverable_journal(self):
         for stage in ('journal', 'trash', 'install', 'ledger'):
@@ -451,7 +467,7 @@ class Runtime(unittest.TestCase):
             self.run_links()
         self.assertEqual(self.dest.read_text(), 'user')
 
-    def test_home_file_aliases_reject_active_and_old_ownership_without_writes(self):
+    def test_home_file_aliases_reject_active_ownership_without_writes(self):
         self.dest.parent.mkdir()
         self.dest.symlink_to(self.fallback)
         aliases = ('config/./file', 'config/a/../file', 'config//file',
@@ -465,19 +481,41 @@ class Runtime(unittest.TestCase):
                 self.assertEqual(self.snapshot(), before)
         self.manifest['homeFiles'] = [str(self.home) + '/config/./sibling']
         self.run_links()
+
+    def test_handback_aliases_and_pending_recovery_never_mutate_protected_paths(self):
+        self.run_links()
         self.manifest['files'] = {}
-        for ownership in ('links', 'pending'):
-            if ownership == 'pending':
-                self.manifest['homeFiles'] = []
-                self.reconciler().save({'version': 1, 'links': {}, 'pending': {
-                    'path': 'config/file', 'old': None, 'new': str(self.local)}})
-            for target in aliases:
-                with self.subTest(handback=target, ownership=ownership):
+        aliases = ('config/./file', 'config/a/../file', 'config//file',
+                   './config', 'other/../config/file/child', 'config/..')
+        for target in aliases:
+            for actual in ('old', 'new', 'replacement', 'absent', 'parent-link'):
+                with self.subTest(target=target, actual=actual):
+                    parent = self.dest.parent
+                    if parent.is_symlink():
+                        parent.unlink()
+                        parent.mkdir()
+                    if os.path.lexists(self.dest):
+                        self.dest.unlink()
+                    if actual in ('old', 'new'):
+                        self.dest.symlink_to(self.local if actual == 'old' else self.fallback)
+                    elif actual == 'replacement':
+                        self.dest.write_text('HM or user replacement')
+                    elif actual == 'parent-link':
+                        parent.rmdir()
+                        parent.symlink_to(self.checkout)
+                    self.reconciler().save({'version': 1, 'links': {'config/file': str(self.local)},
+                        'pending': {'path': 'config/file', 'old': str(self.local), 'new': str(self.fallback)}})
                     self.manifest['homeFiles'] = [str(self.home) + '/' + target]
                     before = self.snapshot()
-                    with self.assertRaisesRegex(r.Error, 'handback'):
-                        self.run_links()
+                    self.run_links(check=True)
+                    self.run_links(dry=True)
                     self.assertEqual(self.snapshot(), before)
+                    self.run_links()
+                    after = self.snapshot()
+                    self.assertEqual({p: v for p, v in before.items() if p.startswith('home/config')},
+                                     {p: v for p, v in after.items() if p.startswith('home/config')})
+                    self.assertEqual(list(self.trash.iterdir()), [])
+                    self.assertEqual(self.ledger(), {'version': 1, 'links': {}, 'pending': None})
 
     def test_nested_dangling_fallback_rejected_but_local_links_fall_back_or_retire(self):
         tree = self.directory_setup()

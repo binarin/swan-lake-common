@@ -186,9 +186,19 @@ class Reconciler:
         for name in list(data['links']) + ([pending['path']] if pending else []):
             if overlaps(str(self.home / name), str(self.state)):
                 raise Error('ledger overlaps state')
-            if any(overlaps(str(self.home / name), p) for p in self.protected):
-                raise Error('old ownership overlaps home.file; activate empty declarations before handback')
         return data
+
+    def relinquish(self, data):
+        # HM owns these paths now. Forget stale ownership without unlinking or
+        # recovering operations there, even if HM installed the same link text.
+        pending = data['pending']
+        names = set(data['links']) | ({pending['path']} if pending else set())
+        for name in sorted(names):
+            if any(overlaps(str(self.home / name), p) for p in self.protected):
+                print(f'release ownership to home.file {self.home / name} (preserve path)')
+                data['links'].pop(name, None)
+                if pending and pending['path'] == name:
+                    data['pending'] = None
 
     def save(self, data):
         self.state_path()
@@ -283,6 +293,7 @@ class Reconciler:
 
     def preflight(self):
         data = self.load()
+        self.relinquish(data)
         self.recover(data)
         desired = self.select()
         self.observe_destinations(desired, data['links'])

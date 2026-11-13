@@ -81,7 +81,7 @@ let
     def run(command, env=None):
         subprocess.run(command, shell=True, check=True, env=dict(os.environ, **(env or {})))
     def activate(name, env=None):
-        run(generations[name] + '/activate', env)
+        run(generations[name] + '/activate', dict(HOME_MANAGER_BACKUP_COMMAND='${pkgs.lib.getExe pkgs.trash-cli}', **(env or {})))
     def snapshot():
         return {str(p): (p.lstat().st_ino, p.lstat().st_mtime_ns, p.lstat().st_mode,
             os.readlink(p) if p.is_symlink() else p.read_bytes() if p.is_file() else None)
@@ -134,6 +134,35 @@ let
     activate('active')
     trash = home / '.local/share/Trash/files'
     assert any(p.is_file() and p.read_text() == 'user conflict' for p in trash.iterdir())
+    # HM accepts identical non-HM symlinks, but rejects differing ones before
+    # its backup command runs. Exercise direct handback with identical content.
+    (checkout / 'file').write_text('store fallback\n')
+    ledger_path = home / '.local/state/home-manager/local-checkout-links/ledger.json'
+    ledger = json.loads(ledger_path.read_text())
+    ledger['pending'] = {'path': 'config/file', 'old': str(checkout / 'file'),
+        'new': str((pathlib.Path(generations['handback']) / 'home-files').resolve() / 'config/file')}
+    ledger_path.write_text(json.dumps(ledger))
+    before = snapshot()
+    activate('handback', {'DRY_RUN': ""})
+    assert snapshot() == before, 'dry handback mutated home/state/trash'
+    activate('handback')
+    assert '-home-manager-files/' in os.readlink(target)
+    assert target.read_text() == 'store fallback\n'
+    assert json.loads(ledger_path.read_text()) == {'version': 1, 'links': {}, 'pending': None}
+    activate('handback')
+    assert '-home-manager-files/' in os.readlink(target)
+    (checkout / 'file').write_text('returned')
+    activate('active')
+    assert target.read_text() == 'returned'
+    # Non-link conflicts go to trash even with an existing fixed-name backup.
+    target.unlink()
+    target.write_text('handback conflict')
+    (home / 'config/file.backup').write_text('keep old backup')
+    activate('handback')
+    assert target.read_text() == 'store fallback\n'
+    assert (home / 'config/file.backup').read_text() == 'keep old backup'
+    assert any(p.is_file() and p.read_text() == 'handback conflict' for p in trash.iterdir())
+    activate('active')
     # Empty declarations retire exact owned links but preserve replacements.
     hidden = home / 'tree/.hidden'
     hidden.unlink()
@@ -143,7 +172,7 @@ let
     assert hidden.read_text() == 'user replacement'
     assert (home / 'tree/unrelated').read_text() == 'preserve'
     assert not os.path.lexists(home / 'tree/file')
-    # The documented second activation hands the path back to ordinary HM.
+    # Two-step handback is still supported.
     activate('handback')
     assert '-home-manager-files/' in os.readlink(target)
     assert target.read_text() == 'store fallback\n'

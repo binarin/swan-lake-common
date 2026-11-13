@@ -75,9 +75,17 @@ snapshot or protection against malicious concurrent home edits. Back up valuable
 content independently.
 
 Disable/remove a declaration and activate while keeping this module imported.
-To hand a target back to `home.file`, first activate its removal, then declare
-`home.file` in a second generation. A one-step handback is rejected to protect
-new HM ownership. To uninstall this module, first activate empty declarations,
+A target can be handed back to `home.file` in the same generation that removes
+its checkout declaration. Overlapping stale ledger entries and pending operations
+are forgotten without touching those paths: HM performs its normal collision
+checks, backup and linking, and checkout cleanup must not unlink HM's new files.
+This includes ancestor/descendant overlaps and normalized target aliases. Active
+checkout declarations still cannot overlap `home.file`. A check or dry run only
+reports the ownership release; it does not change the ledger. Ordinary HM backup
+requirements still apply to conflicting content. In particular, HM rejects a
+non-HM symlink with differing content before invoking its backup command; retire
+that link in an intermediate activation or move it to trash before handback.
+A two-generation handback also remains supported. To uninstall this module, first activate empty declarations,
 then remove the import. Rollbacks to generations predating the import cannot
 clean custom links automatically.
 
