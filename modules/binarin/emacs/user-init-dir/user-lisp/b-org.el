@@ -27,7 +27,9 @@
 (setf org-todo-keywords
       '((sequence "TODO(t)" "NEXT(n!)" "|" "DONE(d!)")
 	(sequence "|" "CNCL(c@)")
-	(sequence "WAIT(w!/!)" "|")))
+	(sequence "WAIT(w!/!)" "|")
+	;; zwanenzang tickets: an agent works on it / it awaits my review.
+	(sequence "AGNT(a!)" "REVW(r!)" "|")))
 
 (b/with-zenburn
   (setf org-todo-keyword-faces
@@ -35,6 +37,8 @@
 	  ("NEXT" . ,zenburn-cyan)
 	  ("DONE" . ,zenburn-green-3)
 	  ("WAIT" . ,zenburn-orange)
+	  ("AGNT" . ,zenburn-blue)
+	  ("REVW" . ,zenburn-magenta)
 	  ("CNCL" . ,zenburn-fg-05))))
 
 (setf org-fast-tag-selection-single-key t
