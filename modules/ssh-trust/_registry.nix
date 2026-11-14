@@ -7,15 +7,6 @@
   schemaVersion = 1;
 
   keys = {
-    hsm-tz = {
-      description = "Trezor, trezor-agent identity root@pve (formerly trezor-root-pve)";
-      publicKey = "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBAAHsiCVekjyoPDPOGPJFJ5z9FQUfSmThnGWHABNfjz0APf/qcdHHy+Yj2bG0ICcDbBrE10MJiQjrnYRlKUGvAE=";
-      trust = {
-        login = true;
-        userCa = true;
-      };
-    };
-
     hsm-tz-ca = {
       description = "Trezor, trezor-agent identity trusted-user-ca (formerly trezor-trusted-user-ca)";
       publicKey = "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBKx4e7PnTrPabkbTwYVsCum+j/Fxgs46NR2ltvgqmUnsJyxVm42rhoqNBp9+1D2Xt0WxikWUBXpe5liSPZzFleo=";
@@ -88,6 +79,11 @@
       description = "Agent experimentation key";
       publicKey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJJEu8TMOeD/d6H+1wt6vKBypE3gGJig1JS+zcdmCq4U";
       comment = "claude-nixos-config - 2025-02-26";
+    };
+
+    termius-phone = {
+      description = "Termius biometric key on the phone";
+      publicKey = "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBGwIi8r9zz3FC6i8tCjW5dVNXgWvYjkPoW9y3qvxYyUlQmVZ99O2wq/wVxpbJuSiJm280bHIA60awbWbjPx6bUA=";
     };
 
     binarin-at-nixos = {

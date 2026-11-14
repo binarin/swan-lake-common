@@ -9,7 +9,6 @@ let
   inherit (pkgs) lib;
 
   hsmIds = [
-    "hsm-tz"
     "hsm-tz-ca"
     "hsm-yk-sk-nfc"
     "hsm-yk-usb-a-5-nfc-fixed"
@@ -115,8 +114,10 @@ let
           "termius-tab-s9"
           "trezor-root-pve"
           "trezor-trusted-user-ca"
+          "hsm-tz"
         ];
         pkcs11 = sshTrust.keys.pkcs11-raum-root.trust;
+        termius = sshTrust.keys.termius-phone.trust;
       };
       expected = {
         login = hsmIds;
@@ -126,17 +127,21 @@ let
           login = false;
           userCa = false;
         };
+        termius = {
+          login = false;
+          userCa = false;
+        };
       };
     };
 
     identity-parsing = {
       actual = map sshTrust.identityOf [
-        "${sshTrust.keys.hsm-tz.publicKey} some comment"
+        "${sshTrust.keys.hsm-tz-ca.publicKey} some comment"
         ''restrict,command="a b" ${sshTrust.keys.binarin-at-nixos.publicKey} binarin@nixos''
         sshTrust.keys.hsm-yk-usb-c-5-nfc.publicKey
       ];
       expected = [
-        sshTrust.keys.hsm-tz.publicKey
+        sshTrust.keys.hsm-tz-ca.publicKey
         sshTrust.keys.binarin-at-nixos.publicKey
         sshTrust.keys.hsm-yk-usb-c-5-nfc.publicKey
       ];
