@@ -26,7 +26,7 @@
     };
 
     hsm-yk-usb-c-5-nfc = {
-      description = "Resident FIDO2 key on YubiKey 5 NFC (USB-C, keychain)";
+      description = "Resident FIDO2 key on YubiKey 5C NFC (USB-C, keychain)";
       publicKey = "sk-ssh-ed25519@openssh.com AAAAGnNrLXNzaC1lZDI1NTE5QG9wZW5zc2guY29tAAAAIDaRvW2TCKgLVQuHAv5FyNqQuFidJ+5WhIaV9j6nGU3HAAAABHNzaDo=";
       comment = "usb-c yubi - residen ssh fido2";
       trust = {
