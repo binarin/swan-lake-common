@@ -13,7 +13,8 @@ let
     permittedInsecurePackages = [
       "qtwebengine-5.15.19"
       "python3.12-ecdsa-0.19.1"
-      "python3.13-ecdsa-0.19.1"
+      "python3.13-ecdsa-0.19.2"
+      "python3.14-ecdsa-0.19.2"
       "olm-3.2.16"
       "immich-2.7.5"
     ];
