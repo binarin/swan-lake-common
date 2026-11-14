@@ -55,6 +55,15 @@
       };
     };
 
+    hsm-yk-sk-nfc = {
+      description = "Resident FIDO2 key on Security Key NFC by Yubico (physical backup)";
+      publicKey = "sk-ssh-ed25519@openssh.com AAAAGnNrLXNzaC1lZDI1NTE5QG9wZW5zc2guY29tAAAAIJYQxFVMl+r7g9vjDEG+ffCSAec1sRWadWSIa2aupEiOAAAABHNzaDo=";
+      trust = {
+        login = true;
+        userCa = true;
+      };
+    };
+
     pkcs11-raum-root = {
       description = "root PKCS#11 key on raum, for Proxmox VE operations";
       publicKey = "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBPKyEXbiRblfl23aNjy73yHjFfV/xct885HH4eIzuW3X2VT0BS/jMEFhNJE7eFJE5vO/QIwJ1FKbEonPRGOvNBI=";
