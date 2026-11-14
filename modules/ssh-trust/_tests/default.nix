@@ -9,8 +9,8 @@ let
   inherit (pkgs) lib;
 
   hsmIds = [
+    "hsm-security-a"
     "hsm-tz-ca"
-    "hsm-yk-sk-nfc"
     "hsm-yk-usb-a-5-nfc-fixed"
     "hsm-yk-usb-a-5-nfc-keychain"
     "hsm-yk-usb-c-5-nfc"

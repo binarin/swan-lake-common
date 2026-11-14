@@ -46,7 +46,7 @@
       };
     };
 
-    hsm-yk-sk-nfc = {
+    hsm-security-a = {
       description = "Resident FIDO2 key on Security Key NFC by Yubico (physical backup)";
       publicKey = "sk-ssh-ed25519@openssh.com AAAAGnNrLXNzaC1lZDI1NTE5QG9wZW5zc2guY29tAAAAIJYQxFVMl+r7g9vjDEG+ffCSAec1sRWadWSIa2aupEiOAAAABHNzaDo=";
       trust = {
