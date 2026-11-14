@@ -81,9 +81,17 @@
       comment = "claude-nixos-config - 2025-02-26";
     };
 
+    # Termius biometric keys: direct login everywhere, never CAs.
     termius-phone = {
       description = "Termius biometric key on the phone";
       publicKey = "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBGwIi8r9zz3FC6i8tCjW5dVNXgWvYjkPoW9y3qvxYyUlQmVZ99O2wq/wVxpbJuSiJm280bHIA60awbWbjPx6bUA=";
+      trust.login = true;
+    };
+
+    termius-tablet = {
+      description = "Termius biometric key on the Galaxy Tab (formerly termius-tab-s9)";
+      publicKey = "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBPMpogmbCYL1eZcImgz+QDH5xW5BoTDUP4/daxglmaBul2tp9SFnMT7f73Z9rVF5XSsavVm4j8mLNV6t3I2xCKI=";
+      trust.login = true;
     };
 
     binarin-at-nixos = {

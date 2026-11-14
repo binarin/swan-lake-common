@@ -15,7 +15,14 @@ let
     "hsm-yk-usb-a-5-nfc-keychain"
     "hsm-yk-usb-c-5-nfc"
   ];
+  # Direct login only.
+  termiusIds = [
+    "termius-tablet"
+    "termius-phone"
+  ];
+  loginIds = lib.sort lib.lessThan (hsmIds ++ termiusIds);
   hsmLines = map sshTrust.keyLine hsmIds;
+  loginLines = map sshTrust.keyLine loginIds;
 
   nixos =
     extra:
@@ -117,20 +124,20 @@ let
           "hsm-tz"
         ];
         pkcs11 = sshTrust.keys.pkcs11-raum-root.trust;
-        termius = sshTrust.keys.termius-phone.trust;
+        termius = map (id: sshTrust.keys.${id}.trust) termiusIds;
       };
       expected = {
-        login = hsmIds;
+        login = loginIds;
         ca = hsmIds;
         retired = [ ];
         pkcs11 = {
           login = false;
           userCa = false;
         };
-        termius = {
-          login = false;
+        termius = map (_: {
+          login = true;
           userCa = false;
-        };
+        }) termiusIds;
       };
     };
 
@@ -159,11 +166,11 @@ let
       };
       expected = {
         root = {
-          keys = hsmLines;
+          keys = loginLines;
           principals = [ "alpha--root" ];
         };
         binarin = {
-          keys = hsmLines;
+          keys = loginLines;
           principals = [ "alpha--binarin" ];
         };
         svc = {
@@ -187,7 +194,7 @@ let
         ];
       }) "binarin";
       expected = {
-        keys = hsmLines;
+        keys = loginLines;
         principals = [
           "alpha--binarin"
           "root"
@@ -268,9 +275,9 @@ let
             (ssh (nixos { users.users.root.openssh.authorizedKeys.keys = [ "extra-root-line" ]; }) "root").keys;
         };
       expected = {
-        keys = hsmLines;
+        keys = loginLines;
         principals = [ "alpha--binarin" ];
-        root = hsmLines ++ [ "extra-root-line" ];
+        root = loginLines ++ [ "extra-root-line" ];
       };
     };
 
@@ -399,7 +406,7 @@ let
             "root"
           ];
           root = {
-            keys = hsmLines;
+            keys = loginLines;
             principals = [ "murmur--root" ];
           };
           allebedev = [
