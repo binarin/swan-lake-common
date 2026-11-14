@@ -666,7 +666,7 @@ fn staging_requires_runtime_dir() {
 }
 
 #[test]
-fn yubikey_serial_must_be_the_only_device() {
+fn yubikey_serial_must_be_connected() {
     let f = Fixture::new();
     let subject = f.path("subject.pub");
     let ca = f.path("ca");
@@ -683,10 +683,16 @@ fn yubikey_serial_must_be_the_only_device() {
             false,
             "is not connected (found",
         ),
+        // Other keys may be connected alongside the requested one.
         (
-            "YubiKey 5 NFC (5.2.7) [OTP+FIDO+CCID] Serial: 123\nSecurity Key NFC (5.7.1) [FIDO]",
+            "YubiKey 5C (5.7.1) [OTP+FIDO+CCID] Serial: 999\nYubiKey 5 NFC (5.2.7) [OTP+FIDO+CCID] Serial: 123\nSecurity Key NFC (5.7.1) [FIDO]",
+            true,
+            "",
+        ),
+        (
+            "YubiKey 5C (5.7.1) [OTP+FIDO+CCID] Serial: 999\nSecurity Key NFC (5.7.1) [FIDO]",
             false,
-            "several keys connected",
+            "is not connected (found",
         ),
     ];
     for (listing, ok, want) in cases {

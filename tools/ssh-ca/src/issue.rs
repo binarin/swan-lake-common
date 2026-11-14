@@ -50,7 +50,7 @@ impl Signer {
                 path,
                 yubikey_serial: Some(serial),
             } => format!(
-                "key file {} on YubiKey serial {serial} (must be the only key ykman lists)",
+                "key file {} on YubiKey serial {serial} (OpenSSH signs on the device holding the credential)",
                 path.display()
             ),
         }
@@ -96,7 +96,7 @@ impl Signer {
                     );
                 }
                 if let Some(serial) = yubikey_serial {
-                    check_single_yubikey(serial)?;
+                    check_yubikey_present(serial)?;
                 }
             }
         }
@@ -104,11 +104,11 @@ impl Signer {
     }
 }
 
-/// `ykman list` must show exactly one device, the requested serial. Devices
-/// without a serial (Security Key series) count too: OpenSSH picks the FIDO
-/// device by credential, so with one device present the requested one is the
-/// only candidate.
-fn check_single_yubikey(serial: &str) -> Result<()> {
+/// The requested YubiKey must be connected. Other keys may be present: a
+/// FIDO credential only works on the authenticator that created it, and
+/// OpenSSH signs on the device that holds the handle file's credential, which
+/// `preflight` has already matched to the expected CA.
+fn check_yubikey_present(serial: &str) -> Result<()> {
     let ykman = env::var_os("SSH_CA_YKMAN").unwrap_or_else(|| OsString::from("ykman"));
     let out = Command::new(&ykman)
         .arg("list")
@@ -129,15 +129,19 @@ fn check_single_yubikey(serial: &str) -> Result<()> {
         line.rsplit_once("Serial: ")
             .map(|(_, s)| s.trim().to_string())
     };
-    match devices.as_slice() {
-        [] => bail!("YubiKey {serial} is not connected"),
-        [only] if serial_of(only).as_deref() == Some(serial) => Ok(()),
-        [only] => bail!("YubiKey {serial} is not connected (found: {only})"),
-        _ => bail!(
-            "several keys connected ({}); leave only YubiKey {serial} plugged in",
-            devices.join("; ")
-        ),
+    if devices
+        .iter()
+        .any(|d| serial_of(d).as_deref() == Some(serial))
+    {
+        return Ok(());
     }
+    if devices.is_empty() {
+        bail!("YubiKey {serial} is not connected");
+    }
+    bail!(
+        "YubiKey {serial} is not connected (found: {})",
+        devices.join("; ")
+    )
 }
 
 /// What the certificate must contain.
