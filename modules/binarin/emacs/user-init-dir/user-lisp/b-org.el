@@ -301,7 +301,7 @@ With \\[universal-argument] \\[universal-argument] (C-u C-u): edit the full s-ex
 
 (setf org-agenda-files
       (when (file-exists-p "~/org")
-	(cl-loop for file in '("personal.org" "refile.org" "ference.org" "maybe.org" "caldav.org" "booking.org")
+	(cl-loop for file in '("personal.org" "refile.org" "ference.org" "maybe.org" "caldav.org" "swan-lake.org")
 		 for full = (file-name-concat "~/org" file)
 		 if (file-exists-p full)
 		 collect full)))
