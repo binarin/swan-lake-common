@@ -50,7 +50,7 @@ impl Signer {
                 path,
                 yubikey_serial: Some(serial),
             } => format!(
-                "key file {} on YubiKey serial {serial} (must be the only YubiKey connected)",
+                "key file {} on YubiKey serial {serial} (must be the only key ykman lists)",
                 path.display()
             ),
         }
@@ -104,38 +104,38 @@ impl Signer {
     }
 }
 
-/// `ykman list --serials` must report exactly the requested serial. OpenSSH
-/// picks the FIDO device by credential, so with one YubiKey present the
-/// requested device is the only candidate.
+/// `ykman list` must show exactly one device, the requested serial. Devices
+/// without a serial (Security Key series) count too: OpenSSH picks the FIDO
+/// device by credential, so with one device present the requested one is the
+/// only candidate.
 fn check_single_yubikey(serial: &str) -> Result<()> {
     let ykman = env::var_os("SSH_CA_YKMAN").unwrap_or_else(|| OsString::from("ykman"));
     let out = Command::new(&ykman)
-        .args(["list", "--serials"])
+        .arg("list")
         .output()
         .with_context(|| format!("cannot run {}", ykman.to_string_lossy()))?;
     if !out.status.success() {
         bail!(
-            "ykman list --serials failed: {}",
+            "ykman list failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
-    let serials: Vec<String> = String::from_utf8_lossy(&out.stdout)
+    let devices: Vec<String> = String::from_utf8_lossy(&out.stdout)
         .lines()
         .map(|l| l.trim().to_string())
         .filter(|l| !l.is_empty())
         .collect();
-    match serials.as_slice() {
-        [only] if only == serial => Ok(()),
+    let serial_of = |line: &str| {
+        line.rsplit_once("Serial: ")
+            .map(|(_, s)| s.trim().to_string())
+    };
+    match devices.as_slice() {
         [] => bail!("YubiKey {serial} is not connected"),
-        _ if !serials.iter().any(|s| s == serial) => {
-            bail!(
-                "YubiKey {serial} is not connected (found: {})",
-                serials.join(", ")
-            )
-        }
+        [only] if serial_of(only).as_deref() == Some(serial) => Ok(()),
+        [only] => bail!("YubiKey {serial} is not connected (found: {only})"),
         _ => bail!(
-            "several YubiKeys connected ({}); leave only {serial} plugged in",
-            serials.join(", ")
+            "several keys connected ({}); leave only YubiKey {serial} plugged in",
+            devices.join("; ")
         ),
     }
 }

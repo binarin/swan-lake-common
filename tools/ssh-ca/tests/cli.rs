@@ -664,3 +664,57 @@ fn staging_requires_runtime_dir() {
     assert!(stderr(&o).contains("XDG_RUNTIME_DIR is not set"));
     assert!(!f.cert().exists());
 }
+
+#[test]
+fn yubikey_serial_must_be_the_only_device() {
+    let f = Fixture::new();
+    let subject = f.path("subject.pub");
+    let ca = f.path("ca");
+    let ykman = f.path("ykman");
+    let cases = [
+        (
+            "YubiKey 5 NFC (5.2.7) [OTP+FIDO+CCID] Serial: 123",
+            true,
+            "",
+        ),
+        ("", false, "is not connected"),
+        (
+            "YubiKey 5 NFC (5.2.7) [OTP+FIDO+CCID] Serial: 1234",
+            false,
+            "is not connected (found",
+        ),
+        (
+            "YubiKey 5 NFC (5.2.7) [OTP+FIDO+CCID] Serial: 123\nSecurity Key NFC (5.7.1) [FIDO]",
+            false,
+            "several keys connected",
+        ),
+    ];
+    for (listing, ok, want) in cases {
+        fs::write(&ykman, format!("#!/bin/sh\ncat <<'X'\n{listing}\nX\n")).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&ykman, fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = fs::remove_file(f.cert());
+        let o = Command::new(env!("CARGO_BIN_EXE_ssh-ca"))
+            .args([
+                "sign",
+                subject.to_str().unwrap(),
+                "--ca",
+                "test-ca",
+                "--ca-key",
+                ca.to_str().unwrap(),
+                "--yubikey-serial",
+                "123",
+                "--principal",
+                "x",
+                "--yes",
+            ])
+            .env("SSH_CA_REGISTRY", f.path("registry.json"))
+            .env("SSH_CA_YKMAN", &ykman)
+            .env("XDG_RUNTIME_DIR", &f.runtime)
+            .output()
+            .unwrap();
+        assert_eq!(o.status.success(), ok, "{listing}: {}", stderr(&o));
+        assert!(stderr(&o).contains(want), "{listing}: {}", stderr(&o));
+        assert_eq!(f.cert().exists(), ok);
+    }
+}

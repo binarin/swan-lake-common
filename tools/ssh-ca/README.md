@@ -37,9 +37,10 @@ custom or legacy server policy.
 - `--plan` prints the plan and exits without touching a device, agent or file.
   Otherwise the plan is shown and must be confirmed (`--yes` for automation).
 - The CA is identified by registry id. `--ca-key` must hold that public key;
-  `--ca-agent` must list it. `--yubikey-serial` requires that exactly that
-  YubiKey is connected (via `ykman list --serials`); OpenSSH then selects the
-  FIDO device by credential. An agent cannot prove which device holds a key, so
+  `--ca-agent` must list it. `--yubikey-serial` requires that `ykman list`
+  shows exactly one key, with that serial (keys without a serial, such as the
+  Security Key series, count too); OpenSSH then selects the FIDO device by
+  credential. Keys without a serial can only be chosen by their handle file. An agent cannot prove which device holds a key, so
   serial selection is only available with `--ca-key`. There is no fallback to
   another key, agent or device.
 - The returned certificate is checked against the plan (type, CA, subject,
