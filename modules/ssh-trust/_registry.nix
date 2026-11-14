@@ -8,7 +8,7 @@
 
   keys = {
     hsm-tz = {
-      description = "Trezor SSH identity (formerly trezor-root-pve, root@pve)";
+      description = "Trezor, trezor-agent identity root@pve (formerly trezor-root-pve)";
       publicKey = "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBAAHsiCVekjyoPDPOGPJFJ5z9FQUfSmThnGWHABNfjz0APf/qcdHHy+Yj2bG0ICcDbBrE10MJiQjrnYRlKUGvAE=";
       trust = {
         login = true;
@@ -17,7 +17,7 @@
     };
 
     hsm-tz-ca = {
-      description = "Trezor SSH identity (formerly trezor-trusted-user-ca)";
+      description = "Trezor, trezor-agent identity trusted-user-ca (formerly trezor-trusted-user-ca)";
       publicKey = "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBKx4e7PnTrPabkbTwYVsCum+j/Fxgs46NR2ltvgqmUnsJyxVm42rhoqNBp9+1D2Xt0WxikWUBXpe5liSPZzFleo=";
       trust = {
         login = true;
