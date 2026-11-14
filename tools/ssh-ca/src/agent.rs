@@ -10,6 +10,7 @@ use ssh_agent_lib::proto::{
     PublicCredential, RemoveIdentity,
 };
 use ssh_key::private::Ed25519Keypair;
+use ssh_key::public::KeyData;
 use ssh_key::{Algorithm, Certificate};
 
 fn connect(socket: &Path) -> Result<Client<UnixStream>> {
@@ -30,16 +31,43 @@ pub fn probe(socket: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Same signed certificate; the comment is not part of it.
+fn same_cert(a: &Certificate, b: &Certificate) -> bool {
+    a.signature() == b.signature() && a.public_key() == b.public_key()
+}
+
 fn holds(client: &mut Client<UnixStream>, cert: &Certificate) -> Result<bool> {
     Ok(client
         .request_identities()
         .context("agent did not list its identities")?
         .iter()
-        // Compare the signed content; the comment is not part of it.
-        .any(|i| {
-            matches!(&i.credential, PublicCredential::Cert(c)
-            if c.signature() == cert.signature() && c.public_key() == cert.public_key())
-        }))
+        .any(|i| matches!(&i.credential, PublicCredential::Cert(c) if same_cert(c, cert))))
+}
+
+/// Remove every certificate identity signed by `ca` except `keep`. Plain
+/// keys and certificates from other CAs are left alone. Returns the key ids
+/// of the removed certificates.
+pub fn remove_superseded(socket: &Path, ca: &KeyData, keep: &Certificate) -> Result<Vec<String>> {
+    let mut client = connect(socket)?;
+    let identities = client
+        .request_identities()
+        .context("agent did not list its identities")?;
+    let mut removed = Vec::new();
+    for identity in identities {
+        let PublicCredential::Cert(cert) = &identity.credential else {
+            continue;
+        };
+        if cert.signature_key() != ca || same_cert(cert, keep) {
+            continue;
+        }
+        client
+            .remove_identity(RemoveIdentity {
+                credential: identity.credential.clone(),
+            })
+            .with_context(|| format!("cannot remove superseded certificate `{}`", cert.key_id()))?;
+        removed.push(cert.key_id().to_string());
+    }
+    Ok(removed)
 }
 
 /// Add `cert` with its private key, deleted by the agent after `lifetime`

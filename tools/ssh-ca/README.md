@@ -50,7 +50,10 @@ custom or legacy server policy.
 - `session` requires an existing destination agent (`--agent`, default
   `$SSH_AUTH_SOCK`) and adds the identity with an explicit lifetime, at most the
   certificate validity (default one week). The private key is never written to
-  a file. The CA agent and the destination agent are separate options.
+  a file. The CA agent and the destination agent are separate options. Once the
+  new identity is in, older certificates signed by the same CA are removed from
+  that agent (plain keys and other CAs' certificates stay); `--keep-existing`
+  keeps them.
 - Public inputs and the certificate are staged in a private directory under
   `$XDG_RUNTIME_DIR`, removed (best effort) on normal exit, failure and Ctrl-C. A crash or
   SIGKILL can leave that public material behind until the runtime directory is

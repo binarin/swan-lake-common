@@ -56,6 +56,11 @@ enum Command {
         /// certificate validity, which is also the default.
         #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
         agent_lifetime: Option<u64>,
+
+        /// Keep older certificates from the same CA in the agent. By default
+        /// they are removed once the new identity is installed.
+        #[arg(long)]
+        keep_existing: bool,
     },
 
     /// Certify an existing public key and write the certificate next to it.
@@ -203,6 +208,7 @@ enum Mode {
     Session {
         agent: PathBuf,
         lifetime: u64,
+        keep_existing: bool,
     },
     Sign {
         subject: PublicKey,
@@ -352,6 +358,7 @@ fn build_plan(common: &Common, mode_args: ModeArgs) -> Result<Plan> {
         ModeArgs::Session {
             agent,
             agent_lifetime,
+            keep_existing,
         } => {
             let Some(agent) = agent else {
                 bail!(
@@ -369,7 +376,14 @@ fn build_plan(common: &Common, mode_args: ModeArgs) -> Result<Plan> {
             if Some(&agent) == common.ca_agent.as_ref() {
                 notes.push("the destination agent is also the CA agent".to_string());
             }
-            (Mode::Session { agent, lifetime }, None)
+            (
+                Mode::Session {
+                    agent,
+                    lifetime,
+                    keep_existing,
+                },
+                None,
+            )
         }
         ModeArgs::Sign {
             public_key,
@@ -424,6 +438,7 @@ enum ModeArgs {
     Session {
         agent: Option<PathBuf>,
         agent_lifetime: Option<u64>,
+        keep_existing: bool,
     },
     Sign {
         public_key: PathBuf,
@@ -513,9 +528,22 @@ fn render(plan: &Plan, subject_fp: Option<&str>) -> String {
     );
     let _ = writeln!(w, "Key id:      {}", r.key_id);
     match &plan.mode {
-        Mode::Session { agent, lifetime } => {
+        Mode::Session {
+            agent,
+            lifetime,
+            keep_existing,
+        } => {
             let _ = writeln!(w, "Agent:       {}", agent.display());
             let _ = writeln!(w, "Agent TTL:   {}", format_duration(*lifetime));
+            let _ = writeln!(
+                w,
+                "Replaces:    {}",
+                if *keep_existing {
+                    "nothing (--keep-existing)"
+                } else {
+                    "older certificates from this CA in the agent, after the new one is added"
+                }
+            );
         }
         Mode::Sign { output, force, .. } => {
             let _ = writeln!(
@@ -555,11 +583,13 @@ fn run(cli: Cli) -> Result<()> {
             common,
             agent,
             agent_lifetime,
+            keep_existing,
         } => (
             common,
             ModeArgs::Session {
                 agent,
                 agent_lifetime,
+                keep_existing,
             },
         ),
         Command::Sign {
@@ -634,7 +664,11 @@ fn run(cli: Cli) -> Result<()> {
             f.write_all((cert.to_openssh()? + "\n").as_bytes())?;
             eprintln!("Wrote {}", output.display());
         }
-        Mode::Session { agent, lifetime } => {
+        Mode::Session {
+            agent,
+            lifetime,
+            keep_existing,
+        } => {
             let remaining = request.valid_before.saturating_sub(now());
             let ttl = (*lifetime).min(remaining);
             let ttl = u32::try_from(ttl).context("agent lifetime too large")?;
@@ -646,6 +680,18 @@ fn run(cli: Cli) -> Result<()> {
                 format_duration(u64::from(ttl)),
                 format_utc(request.valid_before)
             );
+            if !*keep_existing {
+                match agent::remove_superseded(agent, shown.ca.public_key.key_data(), &cert) {
+                    Ok(removed) => {
+                        for id in &removed {
+                            eprintln!("Removed older certificate from {}: {id}", shown.ca.id);
+                        }
+                    }
+                    Err(e) => eprintln!(
+                        "ssh-ca: warning: the new identity is installed, but older certificates were not all removed: {e:#}"
+                    ),
+                }
+            }
         }
     }
     drop(staging);

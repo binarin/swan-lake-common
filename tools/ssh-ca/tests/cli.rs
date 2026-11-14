@@ -724,3 +724,72 @@ fn yubikey_serial_must_be_connected() {
         assert_eq!(f.cert().exists(), ok);
     }
 }
+
+#[test]
+fn session_replaces_older_certificates_from_the_same_ca() {
+    let f = Fixture::new();
+    let ca_agent = Agent::start(f.dir.path(), "ca.sock");
+    ca_agent.add(&f.path("ca"));
+    ca_agent.add(&f.path("ca2"));
+    let dest = Agent::start(f.dir.path(), "dest.sock");
+    // A plain key in the destination agent must survive.
+    dest.add(&f.path("other"));
+    let session = |ca: &str, extra: &[&str]| {
+        let mut args = vec![
+            "session",
+            "--ca",
+            ca,
+            "--ca-agent",
+            ca_agent.socket.to_str().unwrap(),
+            "--agent",
+            dest.socket.to_str().unwrap(),
+            "--principal",
+            "x",
+            "--yes",
+        ];
+        args.extend_from_slice(extra);
+        let o = f.run(&args);
+        assert!(o.status.success(), "{}", stderr(&o));
+        o
+    };
+    let certs = || -> Vec<String> {
+        dest.list()
+            .lines()
+            .filter(|l| l.contains("-cert-v01@openssh.com "))
+            .map(|l| l.split_whitespace().nth(1).unwrap().to_string())
+            .collect()
+    };
+
+    session("test-ca", &[]);
+    let first = certs();
+    assert_eq!(first.len(), 1);
+    // Another CA's certificate is not superseded.
+    session("test-ca2", &[]);
+    assert_eq!(certs().len(), 2);
+
+    let o = session("test-ca", &[]);
+    assert!(
+        stderr(&o).contains("Removed older certificate from test-ca"),
+        "{}",
+        stderr(&o)
+    );
+    let now = certs();
+    assert_eq!(now.len(), 2, "{now:?}");
+    assert!(
+        !now.contains(&first[0]),
+        "old test-ca certificate still present"
+    );
+
+    session("test-ca", &["--keep-existing"]);
+    assert_eq!(certs().len(), 3);
+    assert!(
+        dest.list().contains(
+            &fs::read_to_string(f.path("other.pub"))
+                .unwrap()
+                .split_whitespace()
+                .nth(1)
+                .unwrap()
+                .to_string()
+        )
+    );
+}
