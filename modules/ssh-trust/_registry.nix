@@ -105,5 +105,11 @@
       publicKey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEh4s6QbLJMwYzLpC1r0OZVl6gthLSe2k/fgM66DHGGz";
       comment = "termux-tab-s9-2025-12-20";
     };
+
+    herdr-mobile-tablet = {
+      description = "Herdr mobile software key on the tablet";
+      publicKey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICWlTSuZdDENn1xzbYA9HjWeehliL1jlN99fLvuLZYnm";
+      comment = "herdr-mobile-tablet";
+    };
   };
 }
