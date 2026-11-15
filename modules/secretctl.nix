@@ -21,9 +21,22 @@
         };
         cargoLock.lockFile = src + "/Cargo.lock";
         nativeBuildInputs = [ pkgs.makeWrapper ];
-        nativeCheckInputs = [ pkgs.git ];
+        # The integration tests drive real sops, age and age-keygen with
+        # throwaway age identities; PGP is only exercised at the policy level.
+        nativeCheckInputs = [
+          pkgs.git
+          pkgs.sops
+          pkgs.age
+        ];
+        # Prefixed, not replaced: gpg, gpg-agent and age plugins (for example
+        # age-plugin-yubikey) still come from the caller's PATH.
         postInstall = ''
-          wrapProgram "$out/bin/secretctl" --prefix PATH : ${lib.makeBinPath [ pkgs.git ]}
+          wrapProgram "$out/bin/secretctl" --prefix PATH : ${
+            lib.makeBinPath [
+              pkgs.git
+              pkgs.sops
+            ]
+          }
         '';
         meta = {
           description = "Recipient-policy driven sops encryption for a secrets tree";

@@ -51,7 +51,7 @@ impl Fixture {
     }
     fn bad(&self, reason: &str) {
         let out = self.preview();
-        assert!(!out.status.success(), "unexpected success: {}", text(&out));
+        assert_eq!(out.status.code(), Some(2), "expected error: {}", text(&out));
         assert!(out.stdout.is_empty(), "partial output: {}", text(&out));
         assert!(
             String::from_utf8_lossy(&out.stderr).contains(reason),
@@ -84,8 +84,10 @@ fn text(o: &Output) -> String {
         String::from_utf8_lossy(&o.stderr)
     )
 }
+/// A listing without errors: 0 when nothing is pending, 1 when `--dry-run`
+/// found pending actions (every candidate in these fixtures is plaintext).
 fn good(o: Output) -> String {
-    assert!(o.status.success(), "{}", text(&o));
+    assert!(matches!(o.status.code(), Some(0 | 1)), "{}", text(&o));
     String::from_utf8(o.stdout).unwrap()
 }
 
@@ -154,10 +156,7 @@ fn discovery_inherits_deduplicates_and_excludes_only_agreed_files() {
     f.put("secrets/values/nested/c.PUBLIC", b"included");
     f.put("secrets/values/unused.age-key", b"not a declaration");
     let output = good(f.preview());
-    assert!(output.starts_with("DISCOVERY ONLY:"));
-    assert!(
-        output.contains("ciphertext classification and reconciliation checks are not implemented")
-    );
+    assert!(output.contains("secrets/values/nested/a.plain: encrypt\n"));
     assert!(!output.contains("b.public"));
     assert!(!output.contains("unused"));
     assert!(output.contains("a.plain"));
@@ -180,8 +179,11 @@ fn discovery_inherits_deduplicates_and_excludes_only_agreed_files() {
 #[test]
 fn targeting_and_git_environment_isolation() {
     let f = Fixture::new();
-    assert!(!f.run(&["encrypt"]).status.success());
-    assert!(!f.run(&["encrypt", "--dry-run"]).status.success());
+    for args in [&["encrypt"][..], &["encrypt", "--dry-run"]] {
+        let out = f.run(args);
+        assert_eq!(out.status.code(), Some(2), "{}", text(&out));
+        assert!(text(&out).contains("implicit target"), "{}", text(&out));
+    }
     assert!(
         !f.run(&["encrypt", "--dry-run", "secrets/values/z"])
             .status
@@ -427,7 +429,7 @@ fn linked_worktree() {
         &["worktree", "add", "-qb", "test", worktree.to_str().unwrap()],
     );
     fs::create_dir_all(worktree.join("secrets/values")).unwrap();
-    fs::write(worktree.join("secrets/values/data"), b"do not read").unwrap();
+    fs::write(worktree.join("secrets/values/data"), b"plaintext").unwrap();
     fs::write(
         worktree.join("secrets/key.pgp-key"),
         b"0123456789012345678901234567890123456789",
@@ -447,14 +449,10 @@ fn linked_worktree() {
     );
 }
 #[test]
-fn candidates_are_never_opened_and_backends_are_not_run() {
+fn dry_run_never_runs_backends_or_prints_contents() {
     let f = Fixture::new();
     let candidate = f.0.join("secrets/values/z");
-    fs::set_permissions(&candidate, fs::Permissions::from_mode(0o0)).unwrap();
-    assert!(
-        fs::File::open(&candidate).is_err(),
-        "run this test as an unprivileged user to prove absence of candidate reads"
-    );
+    f.put("secrets/values/z", b"plaintext-canary\0\xff");
     let shell = std::env::split_paths(&std::env::var_os("PATH").unwrap())
         .map(|p| p.join("sh"))
         .find(|p| p.is_file())
@@ -482,25 +480,35 @@ fn candidates_are_never_opened_and_backends_are_not_run() {
         encode("age1test", &[3; 12]).as_bytes(),
     );
     f.link("../keys/plugin.age-key", "secrets/values/plugin.age-key");
-    let output = good(
-        f.command()
-            .env("PATH", path)
-            .env("SECRETCTL_BACKEND_LOG", f.0.join("backend-invoked"))
-            .env("GNUPGHOME", f.0.join("private-must-not-exist"))
-            .env("SOPS_AGE_KEY_FILE", f.0.join("private-must-not-exist"))
-            .args(["encrypt", "--dry-run", "secrets/values"])
-            .output()
-            .unwrap(),
-    );
+    let out = f
+        .command()
+        .env("PATH", path)
+        .env("SECRETCTL_BACKEND_LOG", f.0.join("backend-invoked"))
+        .env("GNUPGHOME", f.0.join("private-must-not-exist"))
+        .env("SOPS_AGE_KEY_FILE", f.0.join("private-must-not-exist"))
+        .args(["encrypt", "--dry-run", "secrets/values"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(!text(&out).contains("plaintext-canary"), "{}", text(&out));
+    let output = String::from_utf8(out.stdout).unwrap();
+    assert!(output.contains("secrets/values/z: encrypt\n"), "{output}");
     assert!(!f.0.join("backend-invoked").exists());
     assert_eq!(
         before.modified().unwrap(),
         fs::metadata(&candidate).unwrap().modified().unwrap()
     );
-    fs::set_permissions(&candidate, fs::Permissions::from_mode(0o600)).unwrap();
-    assert_eq!(fs::read(&candidate).unwrap(), b"arbitrary\0\xff");
+    assert_eq!(fs::read(&candidate).unwrap(), b"plaintext-canary\0\xff");
     f.put("secrets/values/z", b"completely different data");
     assert_eq!(output, good(f.preview()));
+    // Classification reads candidates, so an unreadable one fails closed.
+    fs::set_permissions(&candidate, fs::Permissions::from_mode(0o0)).unwrap();
+    assert!(
+        fs::File::open(&candidate).is_err(),
+        "run this test as an unprivileged user to prove unreadable candidates fail closed"
+    );
+    f.bad("secrets/values/z: Permission denied");
+    fs::set_permissions(&candidate, fs::Permissions::from_mode(0o600)).unwrap();
 }
 
 fn non_utf8_supported(result: std::io::Result<()>) -> std::io::Result<bool> {
