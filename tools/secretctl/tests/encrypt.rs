@@ -199,7 +199,8 @@ fn snapshot(path: &Path) -> (Vec<u8>, SystemTime) {
     )
 }
 /// Puts a `sops` spy first on PATH: it appends its arguments to `sops.log`,
-/// its SOPS_* environment to `sops.env` and exits with `$SPY_EXIT`.
+/// its SOPS_* environment to `sops.env`, evaluates `$SPY_HOOK` (if set) and
+/// exits with `$SPY_EXIT`.
 fn spy_path(f: &Fixture) -> std::ffi::OsString {
     let path = std::env::var_os("PATH").unwrap();
     let shell = std::env::split_paths(&path)
@@ -211,7 +212,7 @@ fn spy_path(f: &Fixture) -> std::ffi::OsString {
     f.put(
         "bin/sops",
         format!(
-            "#!{}\nprintf '%s\\n' \"$*\" >> '{}'\nenv | grep '^SOPS_' | sort >> '{}'\nexit \"$SPY_EXIT\"\n",
+            "#!{}\nprintf '%s\\n' \"$*\" >> '{}'\nenv | grep '^SOPS_' | sort >> '{}'\neval \"${{SPY_HOOK:-}}\"\nexit \"$SPY_EXIT\"\n",
             shell.display(),
             log.display(),
             env.display()
@@ -365,6 +366,30 @@ fn malformed_sops_json_is_an_error_and_nothing_is_modified() {
             "unsupported master key type `sops.kms`",
         ),
         (
+            format!(
+                r#"{{"data":"x","sops":{{"mac":"m","age":{age},"gcp_kms":[{{"resource_id":"x"}}]}}}}"#
+            ),
+            "unsupported master key type `sops.gcp_kms`",
+        ),
+        (
+            format!(
+                r#"{{"data":"x","sops":{{"mac":"m","age":{age},"hckms":[{{"key_id":"x"}}]}}}}"#
+            ),
+            "unsupported master key type `sops.hckms`",
+        ),
+        (
+            format!(
+                r#"{{"data":"x","sops":{{"mac":"m","age":{age},"azure_kv":[{{"vault_url":"x"}}]}}}}"#
+            ),
+            "unsupported master key type `sops.azure_kv`",
+        ),
+        (
+            format!(
+                r#"{{"data":"x","sops":{{"mac":"m","age":{age},"hc_vault":[{{"vault_address":"x"}}]}}}}"#
+            ),
+            "unsupported master key type `sops.hc_vault`",
+        ),
+        (
             format!(r#"{{"data":"x","sops":{{"mac":"m","key_groups":[{{"age":{age}}}]}}}}"#),
             "unsupported master key type `sops.key_groups`",
         ),
@@ -410,6 +435,27 @@ fn malformed_sops_json_is_an_error_and_nothing_is_modified() {
     assert!(listing.contains("secrets/values/z-sops: ok\n"), "{listing}");
     assert!(
         listing.contains("secrets/values/z-json: encrypt\n"),
+        "{listing}"
+    );
+}
+
+#[test]
+fn ssh_recipient_stored_under_age_is_policy_drift() {
+    let f = Fixture::new();
+    let a = f.age_key("a");
+    f.grant("values", "a");
+    // sops keeps age-ssh recipients in `sops.age` like native ones.
+    let ssh = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHnCbvAb3Fg5p6Lz3XKvA1nQ8QYfP7Ck1nYp0r1nYd3G";
+    f.put(
+        "secrets/values/secret",
+        format!(
+            r#"{{"data":"x","sops":{{"mac":"m","age":[{{"recipient":"{a}"}},{{"recipient":"{ssh}"}}]}}}}"#
+        )
+        .as_bytes(),
+    );
+    let listing = status(&f.dry_run("a"), 1);
+    assert!(
+        listing.contains(&format!("secrets/values/secret: rotate -age:{ssh}\n")),
         "{listing}"
     );
 }
@@ -557,4 +603,80 @@ fn sops_arguments_environment_and_first_failure() {
             root.display()
         )
     );
+}
+
+#[test]
+fn files_changed_after_classification_are_not_passed_to_sops() {
+    let f = Fixture::new();
+    let a = f.age_key("a");
+    let b = f.age_key("b");
+    f.grant("values", "a");
+    let path = spy_path(&f);
+    let sops_for = |recipients: &[&str]| {
+        let age: Vec<String> = recipients
+            .iter()
+            .map(|r| format!(r#"{{"recipient":"{r}"}}"#))
+            .collect();
+        format!(
+            r#"{{"data":"x","sops":{{"mac":"m","age":[{}]}}}}"#,
+            age.join(",")
+        )
+    };
+    // The spy plays a sops that encrypts `a-plaintext` correctly while
+    // something else concurrently rewrites the second candidate.
+    f.put("ready-a", sops_for(&[&a]).as_bytes());
+    for (second, initial, replacement, now) in [
+        (
+            "b-plaintext",
+            PLAINTEXT.to_vec(),
+            sops_for(&[&a]),
+            "ok".to_owned(),
+        ),
+        (
+            "b-sops",
+            sops_for(&[&a, &b]).into_bytes(),
+            sops_for(&[&b]),
+            format!("rotate +age:{a} -age:{b}"),
+        ),
+    ] {
+        f.put("secrets/values/a-plaintext", PLAINTEXT);
+        f.put(&format!("secrets/values/{second}"), &initial);
+        f.put("replacement", replacement.as_bytes());
+        let out = f
+            .command("a")
+            .env("PATH", &path)
+            .env("SPY_EXIT", "0")
+            .env(
+                "SPY_HOOK",
+                format!(
+                    "cp '{}' '{}'; cp '{}' '{}'",
+                    f.p("ready-a").display(),
+                    f.p("secrets/values/a-plaintext").display(),
+                    f.p("replacement").display(),
+                    f.p(&format!("secrets/values/{second}")).display(),
+                ),
+            )
+            .arg("secrets/values")
+            .output()
+            .unwrap();
+        status(&out, 2);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains(&format!(
+                "secrets/values/{second}: changed since classification (now: {now}); \
+                 stopped after 1 of 2 action(s), sops was not run for it"
+            )),
+            "{}",
+            text(&out)
+        );
+        let log = fs::read_to_string(f.p("sops.log")).unwrap();
+        assert_eq!(log.lines().count(), 1, "{log}");
+        assert!(log.ends_with("/values/a-plaintext\n"), "{log}");
+        assert_eq!(
+            fs::read(f.p(&format!("secrets/values/{second}"))).unwrap(),
+            replacement.as_bytes()
+        );
+        fs::remove_file(f.p("sops.log")).unwrap();
+        fs::remove_file(f.p(&format!("secrets/values/{second}"))).unwrap();
+    }
 }

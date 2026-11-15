@@ -177,6 +177,48 @@ fn discovery_inherits_deduplicates_and_excludes_only_agreed_files() {
     assert_eq!(output, good(f.preview()));
 }
 #[test]
+fn regular_marker_named_files_under_values_warn_but_do_not_fail() {
+    let f = Fixture::new();
+    let warning = "regular file with a marker name is ignored as a recipient; \
+                   a marker must be a symlink to the key file";
+    // Regular key files outside values/ are marker targets, not mistakes,
+    // even when the walk covers them.
+    for target in ["secrets/values", "secrets"] {
+        let out = f.run(&["encrypt", "--dry-run", target]);
+        good(out.clone());
+        assert!(
+            !String::from_utf8_lossy(&out.stderr).contains("warning"),
+            "{}",
+            text(&out)
+        );
+    }
+    f.put(
+        "secrets/values/nested/copied.pgp-key",
+        b"0123456789012345678901234567890123456789\n",
+    );
+    f.put("secrets/values/nested/copied.age-key", b"not a link");
+    f.put("secrets/values/nested/secret", b"plain");
+    let out = f.preview();
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    let stdout = String::from_utf8(out.stdout.clone()).unwrap();
+    assert!(stdout.contains("secrets/values/nested/secret: encrypt\n  pgp:ABCDEF"));
+    assert!(!stdout.contains("0123456789012345678901234567890123456789"));
+    assert!(!stdout.contains("copied"));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    for name in ["copied.age-key", "copied.pgp-key"] {
+        assert!(
+            stderr.contains(&format!(
+                "secretctl: warning: {}: {warning}",
+                fs::canonicalize(f.0.join("secrets/values/nested"))
+                    .unwrap()
+                    .join(name)
+                    .display()
+            )),
+            "{stderr}"
+        );
+    }
+}
+#[test]
 fn targeting_and_git_environment_isolation() {
     let f = Fixture::new();
     for args in [&["encrypt"][..], &["encrypt", "--dry-run"]] {

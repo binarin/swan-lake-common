@@ -66,7 +66,10 @@ const SOPS_ENV_KEPT: [&str; 7] = [
     "SOPS_DECRYPTION_ORDER",
 ];
 /// Master-key kinds that the recipient policy cannot express; a sops file using
-/// any of them is rejected rather than silently re-keyed.
+/// any of them is rejected rather than silently re-keyed. Together with `age`
+/// and `pgp` these are all master-key fields of the sops 3.13 metadata block.
+/// SSH keys have no field of their own: sops stores them as age recipients
+/// (`ssh-ed25519 ...`) under `age`, where they show up as policy drift.
 const UNSUPPORTED_MASTER_KEYS: [&str; 6] = [
     "kms",
     "gcp_kms",
@@ -311,6 +314,13 @@ fn walk(
             boundary(&path)?;
             walk(root, &path, &recipients, output)?;
         } else if meta.is_file() {
+            if marker(&path).is_some() && path.starts_with(root.join("values")) {
+                eprintln!(
+                    "secretctl: warning: {}: regular file with a marker name is ignored \
+                     as a recipient; a marker must be a symlink to the key file",
+                    path.display()
+                );
+            }
             if marker(&path).is_some()
                 || path
                     .file_name()
@@ -336,6 +346,7 @@ fn walk(
 /// is what `sops rotate --rm-*` must be given.
 type Recipients = BTreeMap<String, String>;
 
+#[derive(PartialEq)]
 enum Action {
     Encrypt,
     Rotate {
@@ -625,6 +636,17 @@ fn run() -> Result<u8> {
         let Some(mut command) = sops_command(candidate) else {
             continue;
         };
+        // The file may have changed since classification (e.g. it was
+        // encrypted or re-keyed by another process); running the planned sops
+        // command on different content could double-encrypt or mis-rotate it.
+        let current = plan(&candidate.path, &candidate.policy)?;
+        if current != candidate.action {
+            bail!(
+                "{display}: changed since classification (now: {}); stopped after \
+                 {applied} of {pending} action(s), sops was not run for it",
+                current.describe()
+            );
+        }
         std::io::Write::flush(&mut std::io::stdout())?;
         let status = command
             .status()
