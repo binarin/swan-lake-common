@@ -111,5 +111,11 @@
       publicKey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICWlTSuZdDENn1xzbYA9HjWeehliL1jlN99fLvuLZYnm";
       comment = "herdr-mobile-tablet";
     };
+
+    herdr-mobile-pixel = {
+      description = "Herdr mobile software key on the Pixel phone";
+      publicKey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBtaDal6eLn9/vQEvGvr2viq5GfIwvptjQ1oUnaVm2WV";
+      comment = "herdr-mobile";
+    };
   };
 }
