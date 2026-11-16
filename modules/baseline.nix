@@ -11,6 +11,7 @@ in
     key = "swan-lake-common.modules.flake.default";
     imports = [
       commonSelf.flakeModules.configured-pkgs
+      commonSelf.flakeModules.common-workflow
       inputs.flake-parts.flakeModules.flakeModules
     ];
   };
