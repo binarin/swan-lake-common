@@ -135,7 +135,8 @@ accepts the currently promoted revision. The selected revision is frozen before
 locking so subsequent ref movement cannot change the target. Original input
 files must be clean and unchanged during the operation. A disposable copy is
 locked first; unexpected unrelated lock churn (any node outside the finalized
-input's dependency closure, including the other common input) or same-revision
+input's dependency closure, or any change to the resolved graph of the other
+common input, including dependencies the two share) or same-revision
 dependency/hash changes abort before replacement. No network/write failure before replacement
 changes originals. Replacement prepares both files first and rolls back a
 partial write on caught failure/interruption. It is **not** a crash-atomic

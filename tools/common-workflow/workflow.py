@@ -265,6 +265,15 @@ def validate_conversion(old, new, name="common"):
     for key, node in old["nodes"].items():
         if key not in reachable and node != new["nodes"].get(key):
             raise ValueError(f"unexpected unrelated lock churn: {key}")
+    # The closure above may share nodes with the other common input; its fully
+    # resolved graph (sources included) must survive unchanged as well.
+    for other in INPUTS:
+        # The root node itself is compared above, so other exists in both locks.
+        if other != name and other in old["nodes"][old["root"]].get("inputs", {}):
+            before_graph = graph(old, resolve(old, old["nodes"][old["root"]]["inputs"][other]))
+            after_graph = graph(new, resolve(new, new["nodes"][new["root"]]["inputs"][other]))
+            if before_graph != after_graph:
+                raise ValueError(f"unexpected lock churn: resolved graph of {other} changed")
     allowed = set(old["nodes"]) | {newkey}
     if same and set(new["nodes"]) - allowed:
         raise ValueError("unexpected new lock nodes")

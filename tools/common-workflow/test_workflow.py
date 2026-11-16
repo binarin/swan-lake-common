@@ -302,6 +302,22 @@ class Finalization(unittest.TestCase):
             with self.subTest(node=node), self.assertRaises(ValueError):
                 w.validate_conversion(old, new)
 
+    def test_shared_dependency_of_other_input(self):
+        def shared():
+            lock_ = add_next(lock(), w.ORIGINAL.copy())
+            lock_["nodes"]["next"]["inputs"]["dep"] = "dep"
+            del lock_["nodes"]["next-dep"]
+            return lock_
+        for name, key in [("common", "renamed"), ("common-next", "next")]:
+            with self.subTest(name=name):
+                old, new = shared(), shared()
+                new["nodes"][key]["locked"]["rev"] = "b" * 40
+                self.assertFalse(w.validate_conversion(old, new, name))
+                new["nodes"]["dep"]["locked"]["rev"] = "changed"
+                other = "common-next" if name == "common" else "common"
+                with self.assertRaisesRegex(ValueError, f"resolved graph of {other} changed"):
+                    w.validate_conversion(old, new, name)
+
     def test_dependency_declaration_churn(self):
         old, new = lock(), lock()
         new["nodes"]["dep"]["original"] = {"type": "path", "path": "/tmp/other"}
