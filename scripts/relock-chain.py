@@ -9,8 +9,8 @@ For every repository the script:
    continue if the checkout is dirty, on another branch, or ahead of remote;
 2. relocks the upstream pin with ``nix flake update <input>`` (zwanenzang is
    the chain source, so it is only refreshed);
-3. verifies the result with ``nix flake check --no-build`` (``--no-check``
-   skips this);
+3. with ``--check``, verifies the result with ``nix flake check --no-build``
+   (off by default: evaluating every consumer at once needs a lot of memory);
 4. commits flake.lock, pushes master, and fast-forwards/freezes the
    promotion branch (common's ``swan-lake-current``);
 5. waits for the GitHub push mirror to serve the promoted revision, then
@@ -437,10 +437,9 @@ def main(argv: list[str] | None = None) -> int:
         help="override a checkout path (repeatable: zwanenzang, common, swan-lake, nixos-config)",
     )
     parser.add_argument(
-        "--no-check",
-        dest="check",
-        action="store_false",
-        help="skip nix flake check --no-build",
+        "--check",
+        action="store_true",
+        help="verify each relock with nix flake check --no-build (memory-hungry)",
     )
     parser.add_argument(
         "--timeout",
@@ -459,7 +458,6 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="print the plan without fetching or changing anything",
     )
-    parser.set_defaults(check=True)
     opts = parser.parse_args(argv)
 
     base = Path(opts.base).expanduser().resolve() if opts.base else Path(__file__).resolve().parents[1].parent

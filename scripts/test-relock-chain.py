@@ -140,7 +140,6 @@ def main():
         argv = [
             "--base",
             str(base),
-            "--no-check",
             "--timeout",
             "10",
             "--interval",
