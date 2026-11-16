@@ -3,15 +3,17 @@ use std::{
     env,
     ffi::{CString, OsStr, OsString},
     fs,
-    io::{BufRead, BufReader, ErrorKind},
+    io::{BufRead, BufReader, ErrorKind, Read},
     os::unix::{
         ffi::OsStrExt,
         fs::{DirBuilderExt, symlink},
+        process::CommandExt,
     },
     path::{Component, Path, PathBuf},
-    process::{Command, ExitCode, Output},
+    process::{Child, Command, ExitCode, Output, Stdio},
     sync::atomic::{AtomicI32, Ordering},
-    time::{SystemTime, UNIX_EPOCH},
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Result, anyhow, bail};
@@ -857,14 +859,77 @@ fn is_tmpfs(path: &Path) -> Result<bool> {
     Ok(stat.f_type == libc::TMPFS_MAGIC)
 }
 
-/// Runs `command` to completion (stdout and stderr are captured unless the
-/// caller set them); failure or a caught signal is an error.
-fn run_checked(command: &mut Command, what: &str) -> Result<Output> {
+/// Kills the process group of `child` (started with `process_group(0)`) and
+/// reaps `child`.
+fn kill_group(child: &mut Child) {
+    // SAFETY: kill only sends a signal. `child` is not reaped yet, so its pid,
+    // which is also its process group id, cannot have been reused.
+    unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
+    let _ = child.wait();
+}
+type Drain = thread::JoinHandle<std::io::Result<Vec<u8>>>;
+fn drain(mut pipe: impl Read + Send + 'static) -> Drain {
+    thread::spawn(move || {
+        let mut bytes = Vec::new();
+        pipe.read_to_end(&mut bytes).map(|_| bytes)
+    })
+}
+/// How often `run_checked` looks at `CAUGHT_SIGNAL` while a child runs.
+const INTERRUPT_POLL: Duration = Duration::from_millis(20);
+/// Runs `command` with stdin closed, `stdout` as given and stderr captured;
+/// failure or a caught signal is an error. The child gets its own process
+/// group: on a caught signal the whole group (the child and helpers it
+/// started, such as gpg or age plugins) is killed and the child reaped, so
+/// cleanup never waits for a blocked child.
+fn run_checked(command: &mut Command, stdout: Stdio, what: &str) -> Result<Output> {
     check_interrupt()?;
-    let output = command
-        .output()
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(stdout)
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
         .map_err(|e| anyhow!("cannot run {what}: {e}"))?;
+    // Drained on threads, so that a child filling a pipe cannot block.
+    let stdout = child.stdout.take().map(drain);
+    let stderr = child.stderr.take().map(drain);
+    let status = loop {
+        if CAUGHT_SIGNAL.load(Ordering::SeqCst) != 0 {
+            kill_group(&mut child);
+            check_interrupt()?;
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => thread::sleep(INTERRUPT_POLL),
+            Err(e) => {
+                kill_group(&mut child);
+                bail!("cannot wait for {what}: {e}");
+            }
+        }
+    };
+    // A helper that outlived the child may still hold a pipe open.
+    while ![&stdout, &stderr]
+        .into_iter()
+        .flatten()
+        .all(|r| r.is_finished())
+    {
+        check_interrupt()?;
+        thread::sleep(INTERRUPT_POLL);
+    }
     check_interrupt()?;
+    let collect = |reader: Option<Drain>| {
+        reader.map_or(Ok(Vec::new()), |reader| {
+            reader
+                .join()
+                .map_err(|_| anyhow!("{what}: output reader panicked"))?
+                .map_err(|e| anyhow!("{what}: {e}"))
+        })
+    };
+    let output = Output {
+        status,
+        stdout: collect(stdout)?,
+        stderr: collect(stderr)?,
+    };
     if !output.status.success() {
         bail!(
             "{what} failed ({}): {}",
@@ -1013,10 +1078,12 @@ fn generate_keys(staging: &Staging, name: &str) -> Result<MachineKeys> {
     let generated = (|| {
         run_checked(
             Command::new("age-keygen").arg("-o").arg(&identity),
+            Stdio::piped(),
             "age-keygen",
         )?;
         let output = run_checked(
             Command::new("age-keygen").arg("-y").arg(&identity),
+            Stdio::piped(),
             "age-keygen -y",
         )?;
         run_checked(
@@ -1024,8 +1091,8 @@ fn generate_keys(staging: &Staging, name: &str) -> Result<MachineKeys> {
                 .args(["-q", "-t", "ed25519", "-N", "", "-C"])
                 .arg(format!("root@{name}"))
                 .arg("-f")
-                .arg(&host_key)
-                .stdin(std::process::Stdio::null()),
+                .arg(&host_key),
+            Stdio::piped(),
             "ssh-keygen",
         )?;
         Ok::<_, anyhow::Error>(output.stdout)
@@ -1132,7 +1199,8 @@ fn write_encrypted(
         let stdout = file.try_clone().map_err(|e| error(temporary, e))?;
         // The staged path is absolute, so it cannot be mistaken for an option.
         run_checked(
-            sops().args(args).arg(plaintext).stdout(stdout),
+            sops().args(args).arg(plaintext),
+            stdout.into(),
             &format!("sops for {}", path.display()),
         )?;
         if plan(temporary, policy)? != Action::UpToDate {
@@ -1183,6 +1251,7 @@ fn write_machine(
         git(root)
             .args(["add", "--intent-to-add", "--"])
             .args(files.all()),
+        Stdio::piped(),
         "git add --intent-to-add",
     )?;
     Ok(())
@@ -1214,6 +1283,7 @@ fn machine_add(cwd: &Path, root: Option<PathBuf>, name: &str) -> Result<u8> {
         git(&root)
             .args(["ls-files", "--cached", "-z", "--"])
             .args(files.all()),
+        Stdio::piped(),
         "git ls-files",
     )?;
     let indexed: BTreeSet<PathBuf> = indexed

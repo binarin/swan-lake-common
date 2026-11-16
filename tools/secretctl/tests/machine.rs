@@ -10,6 +10,8 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
     sync::atomic::{AtomicUsize, Ordering},
+    thread,
+    time::{Duration, Instant},
 };
 
 use serde_json::Value;
@@ -298,8 +300,8 @@ fn spy(f: &Fixture, name: &str, script: &str) -> OsString {
     std::env::join_paths(std::iter::once(f.p("bin")).chain(std::env::split_paths(&path))).unwrap()
 }
 /// A `sops` that logs its arguments to `sops.log` and, on call number `at`,
-/// sends `signal` (if not empty) to secretctl and fails.
-fn sops_spy(f: &Fixture, at: usize, signal: &str) -> OsString {
+/// sends `signal` (if not empty) to secretctl and then runs `then`.
+fn sops_spy(f: &Fixture, at: usize, signal: &str, then: &str) -> OsString {
     let log = f.p("sops.log");
     spy(
         f,
@@ -308,12 +310,17 @@ fn sops_spy(f: &Fixture, at: usize, signal: &str) -> OsString {
             "printf '%s\\n' \"$*\" >> '{log}'\n\
              if [ \"$(wc -l < '{log}')\" -eq {at} ]; then\n\
              [ -z '{signal}' ] || kill -s '{signal}' \"$PPID\"\n\
-             exit 1\n\
+             {then}\n\
              fi\n\
              exec \"$REAL\" \"$@\"\n",
             log = log.display()
         ),
     )
+}
+/// Whether `pid` is a running (not exited or zombie) process.
+fn alive(pid: &str) -> bool {
+    fs::read_to_string(format!("/proc/{}/stat", pid.trim()))
+        .is_ok_and(|stat| !stat.rsplit_once(") ").unwrap().1.starts_with('Z'))
 }
 /// Staged plaintext paths that secretctl passed to sops (the last argument).
 fn staged_paths(f: &Fixture) -> Vec<PathBuf> {
@@ -523,7 +530,7 @@ fn failed_or_interrupted_runs_roll_back_and_a_retry_succeeds() {
         (2, "INT", "interrupted by signal 2"),
         (2, "HUP", "interrupted by signal 1"),
     ] {
-        let path = sops_spy(&f, at, signal);
+        let path = sops_spy(&f, at, signal, "exit 1");
         let out = f.add_with_path("m", Some(&path));
         let stderr = refused(out, reason);
         assert!(
@@ -558,10 +565,58 @@ fn failed_or_interrupted_runs_roll_back_and_a_retry_succeeds() {
 }
 
 #[test]
+fn interrupt_stops_a_blocked_child_and_its_helpers() {
+    let (f, _, _) = Fixture::new();
+    let tree = f.tree();
+    let git_status = f.status();
+    let (spy_pid, helper_pid) = (f.p("bin/spy.pid"), f.p("bin/helper.pid"));
+    for at in [1, 2] {
+        // The spy signals secretctl, then stays blocked on a helper process.
+        let path = sops_spy(
+            &f,
+            at,
+            "TERM",
+            &format!(
+                "echo $$ > '{}'\nsleep 60 &\necho $! > '{}'\nwait\nexit 1",
+                spy_pid.display(),
+                helper_pid.display()
+            ),
+        );
+        let started = Instant::now();
+        let out = f.add_with_path("m", Some(&path));
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "waited for the child"
+        );
+        let stderr = refused(out, "interrupted by signal 15");
+        assert!(
+            stderr.contains("this run's changes were undone"),
+            "{stderr}"
+        );
+        assert_eq!(f.tree(), tree, "{at}");
+        assert_eq!(f.status(), git_status);
+        for staged in staged_paths(&f) {
+            assert!(!staged.parent().unwrap().exists(), "{}", staged.display());
+        }
+        for pid in [&spy_pid, &helper_pid] {
+            let pid = fs::read_to_string(pid).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while alive(&pid) && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(20));
+            }
+            assert!(!alive(&pid), "process {} survived", pid.trim());
+        }
+        fs::remove_file(f.p("sops.log")).unwrap();
+    }
+    fs::remove_file(f.p("bin/sops")).unwrap();
+    status(&f.add("m"), 0);
+}
+
+#[test]
 fn killed_run_leaves_no_plaintext_in_the_tree() {
     for at in [1, 2] {
         let (f, _, _) = Fixture::new();
-        let path = sops_spy(&f, at, "KILL");
+        let path = sops_spy(&f, at, "KILL", "exit 1");
         let out = f.add_with_path("m", Some(&path));
         assert_eq!(out.status.code(), None, "{}", text(&out));
         assert_no_plaintext(&f);
