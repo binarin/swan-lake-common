@@ -80,9 +80,9 @@ Creates exactly these files below the secrets root:
   values/machines/<name>/openssh/ssh_host_ed25519_key  sops binary SSH host key
   values/roots/<name>.private                          sops binary age identity
 
-Keys are generated in a private /dev/shm directory (tmpfs required, active swap
-refused, core dumps disabled); only ciphertext and public files reach the tree,
-each written atomically. Recipients come only from the marker policy, as for
+Keys are generated in a private /dev/shm directory (tmpfs required, core dumps
+disabled); only ciphertext and public files reach the tree, each written
+atomically. Recipients come only from the marker policy, as for
 `encrypt`. Refuses if any of the files already exists. The new files are
 recorded with `git add --intent-to-add`; no content is staged or committed.
 If a step fails or the run is interrupted (SIGINT, SIGTERM, SIGHUP), the files,
@@ -1031,11 +1031,6 @@ impl Staging {
         let shm = Path::new("/dev/shm");
         if !is_tmpfs(shm)? {
             bail!("/dev/shm must be memory-backed tmpfs");
-        }
-        // tmpfs can swap; refuse active swap rather than risk a plaintext disk copy.
-        let swaps = fs::read_to_string("/proc/swaps").map_err(|e| anyhow!("/proc/swaps: {e}"))?;
-        if swaps.lines().count() != 1 {
-            bail!("disable swap before generating machine keys");
         }
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
