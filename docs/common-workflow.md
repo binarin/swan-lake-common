@@ -6,7 +6,8 @@ Common stages changes on Forgejo master; the human promotes a master revision
 by advancing `swan-lake-current`. Forgejo push-mirrors to GitHub. Consumers
 commit `github:binarin/swan-lake-common/swan-lake-current` and a revision lock.
 A paired consumer MR may temporarily reference the common Forgejo feature
-branch, but must restore the canonical declaration before merge.
+branch, but must restore the canonical declaration before merge. A consumer may
+also carry one experiment input, `common-next` (see below).
 
 These tools support local iteration, CI policy and finalization. They never
 merge, promote, trigger mirror writes, commit or push. Inventory, extraction and
@@ -22,6 +23,7 @@ with-common --common /path/to/common -- nix flake check
 with-common --common /path/to/common --dirty -- nix build .#some-package
 with-common -- nixos-rebuild build --flake .#host
 with-common -- deploy .#host -- --show-trace
+with-common --common /path/to/common --input common-next -- nixos-rebuild build --flake .#host
 ```
 
 The default common checkout is `swan-lake-common` beside the consumer **Git
@@ -29,7 +31,8 @@ root**, even when called from a subdirectory. Worktrees usually need `--common`.
 Normal mode uses `git+file:` (Git-tracked files); `--dirty` uses `path:` (including
 untracked files). Both can include modified tracked files. Neither mode changes
 consumer flake files. Nix flags include `--no-write-lock-file`. Root inputs that
-follow `common/*` follow the override too. The wrapper replaces itself with the
+follow `common/*` follow the override too. `--input common-next` overrides the
+experiment input instead of `common`. The wrapper replaces itself with the
 command, preserving cwd, argument boundaries, exit status and signals.
 
 Supported command forms are exactly those above (not arbitrary `nix run`, sudo
@@ -61,6 +64,51 @@ combine it deliberately rather than deleting it. The hook checks every commit;
 use `SKIP=common-pin-policy git commit ...` deliberately for temporary paired
 pins. CI policy cannot be skipped that way.
 
+## Experiments: `common-next`
+
+`common-next` is an optional second common input of a consumer flake. It may
+point at any ref or revision of the swan-lake-common repository, typically an
+unmerged Forgejo MR branch:
+
+```nix
+common-next.url = "git+https://forgejo.lynx-lizard.ts.net/binarin/swan-lake-common?ref=BRANCH";
+```
+
+Each consumer has at most one `common-next`, so it runs one experiment at a
+time. Machines opt in explicitly by building from `inputs.common-next` instead of
+`inputs.common`; which machines opt in is not policed. When no experiment is
+running, `common-next` declares the canonical
+`github:binarin/swan-lake-common/swan-lake-current`, and opted-in machines act as
+a canary of current.
+
+Unlike a temporary paired pin, `common-next` may stay on consumer master. Its
+policy (`check-common-pin`):
+
+- `common` must still be exactly canonical.
+- `common-next`, if declared, must be a plain `url` (no `follows` or other
+  attributes) that names the swan-lake-common repository:
+  `github:binarin/swan-lake-common[/REF-OR-REV]` (optionally `?ref=`/`?rev=`), or
+  `git+https://` on `forgejo.lynx-lizard.ts.net/binarin/swan-lake-common` or
+  `github.com/binarin/swan-lake-common`, with or without `.git`, optionally
+  `?ref=`/`?rev=`. Other hosts, owners, repositories, schemes (`git+ssh`,
+  `git+file`, `path`, tarballs, registry ids) and options (`dir`, `shallow`,
+  `submodules`, `host`, ...) are rejected. The declaration is parsed by Nix and
+  must equal the lock's `original`; the locked source must be the same
+  repository with a full revision and SHA256 NAR hash.
+- Whether `common-next`'s locked revision is based on (equal to or a descendant
+  of) the locked `common` revision is reported on stderr, never enforced:
+  `check-common-pin: common-next REV is based on common REV`, `... is NOT based
+  on common ...`, or `cannot determine whether ...: REASON` when the history
+  cannot be fetched (offline, unknown revision). The check fetches only the
+  commit history of both revisions from `common-next`'s repository.
+
+Root inputs may follow `common-next/...`; they are refreshed together with it.
+To end an experiment after the common MR is merged and promoted, finalize it
+like a temporary pin with `--input common-next` (below). Abandoning an
+experiment is the same rewrite without merging:
+`finalize-common --input common-next --allow-newer` locks the currently promoted
+revision instead of waiting for the tested one.
+
 ## Finalization
 
 Commit flake.nix/flake.lock first; unrelated dirty files may remain. Then:
@@ -69,14 +117,27 @@ Commit flake.nix/flake.lock first; unrelated dirty files may remain. Then:
 finalize-common --root /absolute/consumer/root --timeout 300
 # Only if the human promoted a later revision than the tested common head:
 finalize-common --root /absolute/consumer/root --allow-newer
+# Return the experiment input to canonical current after promotion:
+finalize-common --root /absolute/consumer/root --input common-next
 ```
+
+The same commands are available as flake apps in consumers that import
+common's `flakeModules.default`, e.g.
+`nix run .#finalize-common -- --root "$PWD" --input common-next`.
+
+`--input common` (the default) requires the temporary Forgejo branch URL;
+`--input common-next` accepts any non-canonical `common-next` declaration that
+passes the policy above. In both cases the tested revision is the input's
+locked revision, and the input is rewritten to the canonical URL.
 
 The default polls GitHub for the tested revision; `--allow-newer` explicitly
 accepts the currently promoted revision. The selected revision is frozen before
 locking so subsequent ref movement cannot change the target. Original input
 files must be clean and unchanged during the operation. A disposable copy is
-locked first; unexpected unrelated lock churn or same-revision dependency/hash
-changes abort before replacement. No network/write failure before replacement
+locked first; unexpected unrelated lock churn (any node outside the finalized
+input's dependency closure, or any change to the resolved graph of the other
+common input, including dependencies the two share) or same-revision
+dependency/hash changes abort before replacement. No network/write failure before replacement
 changes originals. Replacement prepares both files first and rolls back a
 partial write on caught failure/interruption. It is **not** a crash-atomic
 multi-file transaction: do not run concurrent writers, and inspect files after
@@ -96,4 +157,12 @@ full update already covers common; swan-lake uses manual updates for now.
 
 `nix flake check` builds the package and runs stdlib fixture tests. Run
 `nix develop -c python3 tools/common-workflow/integration.py` for disposable,
-real-Nix override and declaration tests without network or activation.
+real-Nix override and declaration tests (including `common-next` parsing,
+policy and `with-common --input common-next`) without network or activation.
+
+## Consumer flake apps
+
+Common's `flakeModules.default` adds `apps.check-common-pin` and
+`apps.finalize-common` to the importing consumer. Their attributes are module
+defaults, so a consumer that defines an app of the same name keeps its own.
+`with-common` is a devshell command and is not exported as a consumer app.
