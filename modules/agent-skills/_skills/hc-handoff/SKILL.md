@@ -52,7 +52,8 @@ python3 <absolute-skill-directory>/scripts/handoff.py
 ```
 
 The helper forks the conversation with `pi --fork`, prints the created
-terminal/tab/space IDs, then registers and verifies the tab. Labels alone
+terminal/tab/space IDs, then registers and verifies the tab and the
+agent's startup. Labels alone
 do not create a tab: both terminal labels and the layout entry are required.
 The app observes the document update and shows the new tab in the caller's
 space; this does not require switching the user's focus.
@@ -74,10 +75,16 @@ Never start another server/window to work around a failed handoff.
 1. Confirm the layout entry points to the created terminal in the intended
    space. Inspect `hc get <terminal> --json`: the desktop labels must match,
    `parent` must be null and `die_with_parent` false.
-2. Use `hc wait <terminal> --timeout 120`, then
-   `hc read <terminal> --lines 40` on the execution host. Startup idle is not
-   proof the task ran: verify the delivered message and the agent's response
-   or active investigation. A timeout is not permission to duplicate it.
+2. The helper then checks startup itself: it polls `hc get` until the agent
+   is working (or has finished a turn), for up to 60 seconds, and prints
+   `hc read <terminal> --lines 40`. Verify the delivered message and the
+   agent's response or active investigation in that output. A working agent
+   is success: do not wait for its turn to end, and do not use
+   `hc wait <terminal>` here, which blocks until the whole first turn is
+   over. To recheck a launched terminal, run the helper with
+   `--verify <terminal>`. If it reports `Startup NOT confirmed` (still idle,
+   error or exited), inspect the output; that is not permission to
+   duplicate it.
 3. Tell the human the tab name. If visibility remains uncertain, distinguish
    verified core topology from confirmation that the desktop rendered it.
 
