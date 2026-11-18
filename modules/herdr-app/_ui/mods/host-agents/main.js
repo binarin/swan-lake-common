@@ -1,5 +1,6 @@
 // host-agents: Herdr's agents list (cloned from `agents` 0.1.14) with a colored
 // [alias] of the machine each agent runs on, before its name (see host tags below).
+// An agent with background runs (see below) shows a marker after its name.
 // Unread: right-click an agent (or `host-agents.toggle-unread` on the focused
 // one) to keep it in Done after you've looked at it, at the end of Done. It's
 // read again when you leave it and come back, or when it starts working.
@@ -14,7 +15,7 @@ import { View, div, image, svg } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
 import { agents, terminals, panes, focused, spaces, run, theme, shared, setShared, setAgentOrder, openOverlay, closeOverlay, props, window, layout, hc, readTextFile, appHome, nextCommand, notify } from "herdr";
 
-// ---- host tags: the same block in host-spaces and host-agents; keep them in sync ----
+// ---- host tags: the same block in host-spaces, host-picker and host-agents; keep them in sync ----
 // A colored [alias] for the machine a space or agent runs on, read from
 // <app home>/host-tags.json (re-read every 3 s, so edits show at once):
 //   { "hosts": { "local": { "alias": "local", "color": "ansi2" }, "claude-nixos-config": "cnc" } }
@@ -80,6 +81,43 @@ class HostTags {
   }
 }
 // ---- end host tags ----
+
+// ---- background runs: the same block in host-tabs and host-agents; keep them in sync ----
+// Work a program reports beside its own status, as OSC 7501 records in
+// terminals(): pi-subagents sends one per async run (`subagents/<run>`) and per
+// workflow step (`subagents/<run>.<step>`), while pi's own status goes idle as
+// soon as its turn ends. Herdr ignores records; here they only draw a marker,
+// and no status, alert or seen state changes.
+// (One copy per mod: a mod can't import a file outside its own folder.)
+const RUN_RANK = { working: 1, blocked: 2 };
+
+// The working or blocked runs of these terminals: { state, count }, blocked
+// winning, or null when there are none. A workflow's steps count as one run.
+function backgroundRuns(list) {
+  const runs = new Map();
+  for (const term of list) {
+    for (const [id, r] of Object.entries(term?.records ?? {})) {
+      const rank = RUN_RANK[r?.state];
+      if (!rank) continue;
+      const run = `${term.address}\u0000${id.replace(/\.[^/]*$/, "")}`;
+      runs.set(run, Math.max(runs.get(run) ?? 0, rank));
+    }
+  }
+  if (!runs.size) return null;
+  const blocked = [...runs.values()].filter((r) => r === RUN_RANK.blocked).length;
+  return { state: blocked ? "blocked" : "working", count: runs.size, blocked };
+}
+
+// A layers glyph in the working (or blocked) color, with the count from two runs up.
+function backgroundEl(t, runs, id) {
+  const n = runs.count;
+  const tip = `${n} background run${n === 1 ? "" : "s"}` + (runs.blocked ? `, ${runs.blocked} waiting for a reply` : "");
+  return h_flex().id(id).flex_none().gap(2).items_center().text_size(10.5).font_semibold().text_color(t[runs.state] ?? t.dim)
+    .tooltip(tip)
+    .child(svg("mods/workspace-chrome/layers.svg").size(12).flex_none())
+    .when(n > 1, (el) => el.child(String(n)));
+}
+// ---- end background runs ----
 
 
 function find(node, id) {
@@ -346,6 +384,7 @@ export default class Agents extends View {
   subRow(t, s, shown, compact) {
     const k = s.t;
     const st = kidStatus(k, this.listed);
+    const runs = backgroundRuns([k]);
     const pic = icon(k.program, 14, t.foreground);
     const on = k.address === shown;
     return h_flex()
@@ -366,6 +405,7 @@ export default class Agents extends View {
         .when(l === "└" || l === "├", el => el.border_b(1.5).rounded_bl(6))))
       .when(Boolean(pic), el => el.child(div().mr(8).child(pic)))
       .child(div().flex_1().truncate().text_color(on ? t.foreground : t.muted).child(k.name || k.template || k.program?.name || k.address))
+      .when(Boolean(runs), (el) => el.child(div().mr(6).child(backgroundEl(t, runs, `sub-runs-${k.address}`))))
       .child(this.status(t, { status: st }, compact));
   }
 
@@ -389,6 +429,7 @@ export default class Agents extends View {
     const raw = agents();
     this.listed = new Map(raw.map((a) => [a.address, a.status]));
     const all = terminals();
+    const byAddress = new Map(all.map((x) => [x.address, x]));
     this.migratePins(all);
     const shown = focused()?.agent;
     const now = Date.now();
@@ -487,6 +528,7 @@ export default class Agents extends View {
       }
       const when = this.since(a);
       const idle = a.status === "idle" && !a.focused;
+      const runs = backgroundRuns([byAddress.get(a.address)]);
       const isPinned = a.pinned;
       const pin = div()
         .id(`pin-${a.address}`)
@@ -539,7 +581,8 @@ export default class Agents extends View {
         .child(h_flex().flex_1().min_w(0).gap(5).items_center()
           .child(this.tags.el(t, machine))
           .child(div().min_w(0).max_w(full && more ? 120 : 200).truncate().text_color(idle ? t.muted : t.foreground).child(name))
-          .when(full && Boolean(more), el => el.child(div().flex_1().min_w(0).truncate().text_color(t.dim).child(`\u00b7 ${more}`))))
+          .when(full && Boolean(more), el => el.child(div().flex_1().min_w(0).truncate().text_color(t.dim).child(`\u00b7 ${more}`)))
+          .when(Boolean(runs), el => el.child(backgroundEl(t, runs, `runs-${a.address}`))))
         .when(subs.length > 0, el => el.child(fold(a, subs)))
         .when(this.hovered === a.address, el => el.child(pin))
         .when(this.hovered !== a.address && Boolean(when), el => el.child(div().flex_none().text_size(11).text_color(t.dim).child(duration(now - when))))

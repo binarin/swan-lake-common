@@ -76,6 +76,23 @@ let
     };
   };
   uiFiles = withUi.config.home.file;
+
+  # A block copied into several mods (a mod can't import outside its folder),
+  # between "// ---- <name>" and "// ---- end <name> ----": exactly once in
+  # each, and the same everywhere.
+  sharedBlock =
+    name: mods:
+    let
+      blockOf =
+        m:
+        let
+          parts = lib.splitString "// ---- ${name}" (builtins.readFile (./_ui/mods + "/${m}/main.js"));
+          rest = lib.splitString "// ---- end ${name} ----" (lib.last parts);
+        in
+        if lib.length parts == 2 && lib.length rest == 2 then lib.head rest else null;
+      blocks = map blockOf mods;
+    in
+    lib.all (b: b != null && b == lib.head blocks) blocks;
   withUiCheckout = hm {
     home.localCheckoutLinks.checkouts.common = "/home/tester/common";
     programs.herdr-app.ui = {
@@ -152,6 +169,15 @@ assert expect (
 assert expect (
   !(plain.config.home.file ? ".config/herdrs/sl/host-tags.json")
 ) "no ui unless enabled";
+assert expect (sharedBlock "host tags" [
+  "host-spaces"
+  "host-picker"
+  "host-agents"
+]) "the host tags block is the same in every mod that has it";
+assert expect (sharedBlock "background runs" [
+  "host-tabs"
+  "host-agents"
+]) "the background runs block is the same in every mod that has it";
 pkgs.runCommand "herdr-app-instances" { nativeBuildInputs = [ pkgs.patch ]; } ''
   ${lib.optionalString needsLinkedAssetsFix ''
     # Apply against the pinned release, not a newer reference checkout. Only

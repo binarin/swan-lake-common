@@ -14,7 +14,7 @@ import { View, div, svg, image } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input } from "gpui-base";
 import { agents, spaces, panes, terminals, focused, run, theme, settings, shared, props, closeOverlay, hc, readTextFile, appHome } from "herdr";
 
-// ---- host tags: the same block in host-spaces and host-agents; keep them in sync ----
+// ---- host tags: the same block in host-spaces, host-picker and host-agents; keep them in sync ----
 // A colored [alias] for the machine a space or agent runs on, read from
 // <app home>/host-tags.json (re-read every 3 s, so edits show at once):
 //   { "hosts": { "local": { "alias": "local", "color": "ansi2" }, "claude-nixos-config": "cnc" } }

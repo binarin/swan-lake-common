@@ -1,9 +1,10 @@
 // host-tabs: Herdr's tab bar (cloned from `tabs` 0.1.14). While the C-o prefix
 // popup is open (shared "tmux-prefix.open"), each tab shows the number C-o 1..9, 0
-// selects it.
+// selects it. A tab whose terminals report background runs (see below) shows a
+// marker after its name.
 import { View, div, svg, image } from "gpui-kit";
 import { h_flex } from "gpui-base";
-import { spaces, panes, run, openOverlay, theme, window, shared, layout, settings } from "herdr";
+import { spaces, panes, terminals, run, openOverlay, theme, window, shared, layout, settings } from "herdr";
 
 function find(node, id) {
   if (node?.id === id) return node;
@@ -13,6 +14,43 @@ function find(node, id) {
   }
   return null;
 }
+
+// ---- background runs: the same block in host-tabs and host-agents; keep them in sync ----
+// Work a program reports beside its own status, as OSC 7501 records in
+// terminals(): pi-subagents sends one per async run (`subagents/<run>`) and per
+// workflow step (`subagents/<run>.<step>`), while pi's own status goes idle as
+// soon as its turn ends. Herdr ignores records; here they only draw a marker,
+// and no status, alert or seen state changes.
+// (One copy per mod: a mod can't import a file outside its own folder.)
+const RUN_RANK = { working: 1, blocked: 2 };
+
+// The working or blocked runs of these terminals: { state, count }, blocked
+// winning, or null when there are none. A workflow's steps count as one run.
+function backgroundRuns(list) {
+  const runs = new Map();
+  for (const term of list) {
+    for (const [id, r] of Object.entries(term?.records ?? {})) {
+      const rank = RUN_RANK[r?.state];
+      if (!rank) continue;
+      const run = `${term.address}\u0000${id.replace(/\.[^/]*$/, "")}`;
+      runs.set(run, Math.max(runs.get(run) ?? 0, rank));
+    }
+  }
+  if (!runs.size) return null;
+  const blocked = [...runs.values()].filter((r) => r === RUN_RANK.blocked).length;
+  return { state: blocked ? "blocked" : "working", count: runs.size, blocked };
+}
+
+// A layers glyph in the working (or blocked) color, with the count from two runs up.
+function backgroundEl(t, runs, id) {
+  const n = runs.count;
+  const tip = `${n} background run${n === 1 ? "" : "s"}` + (runs.blocked ? `, ${runs.blocked} waiting for a reply` : "");
+  return h_flex().id(id).flex_none().gap(2).items_center().text_size(10.5).font_semibold().text_color(t[runs.state] ?? t.dim)
+    .tooltip(tip)
+    .child(svg("mods/workspace-chrome/layers.svg").size(12).flex_none())
+    .when(n > 1, (el) => el.child(String(n)));
+}
+// ---- end background runs ----
 
 export default class Tabs extends View {
   init() {
@@ -54,10 +92,13 @@ export default class Tabs extends View {
     const shown = space?.tabs ?? [];
     const numbered = Boolean(shared("tmux-prefix.open"));
     const stop = (_e, cx) => cx.stop_propagation();
+    const byAddress = new Map(terminals().map((x) => [x.address, x]));
+    const allPanes = panes();
     const button = (id, label, action) => div().id(id).size(26).flex_none().flex().items_center().justify_center().rounded(6).text_color(t.dim).hover(s => s.bg(t.hover).text_color(t.foreground))
       .on_mouse_down("left", stop).on_click(action).child(label);
     const item = (c, i) => {
-      const program = panes().find(p => p.tab === c.id && p.program?.agent)?.program ?? panes().find(p => p.tab === c.id)?.program;
+      const program = allPanes.find(p => p.tab === c.id && p.program?.agent)?.program ?? allPanes.find(p => p.tab === c.id)?.program;
+      const runs = backgroundRuns(allPanes.filter(p => p.tab === c.id && p.terminal).map(p => byAddress.get(p.terminal)));
       const name = /^tb\d+$/.test(c.name) ? program?.name ?? "Terminal" : c.name;
       return h_flex().id(`tab-${c.id}`).h(29).px(10).gap(7).rounded(7).items_center().flex_none().text_size(12.8)
         .border(1).border_color(c.active ? t.border : t.chrome).bg(c.active ? t.raised : t.chrome).text_color(c.active ? t.foreground : t.muted)
@@ -73,6 +114,7 @@ export default class Tabs extends View {
           .text_size(10.5).font_bold().text_color(t.accent_foreground).child(String((i + 1) % 10))))
         .when(Boolean(program?.icon), el => el.child(program.tint ? svg(program.icon).size(14).text_color(t.muted) : image(program.icon).size(14)))
         .child(div().max_w(170).truncate().child(c.zoomed ? `${name} Z` : name))
+        .when(Boolean(runs), el => el.child(backgroundEl(t, runs, `runs-${c.id}`)))
         .when(c.status === "working", el => el.child(svg("mods/workspace-chrome/spinner.svg").size(12).flex_none().text_color(t.working).spin(900)))
         .when(c.status === "blocked" || c.status === "done", el => el.child(div().size(6).rounded(3).bg(t[c.status])))
         .when(c.active, el => el.child(div().id(`close-${c.id}`).text_color(t.dim).on_mouse_down("left", stop).on_click((_e, cx) => { cx.stop_propagation(); run("tab.close", { id: c.id }); }).child(svg("mods/pane/close.svg").size(12))));
