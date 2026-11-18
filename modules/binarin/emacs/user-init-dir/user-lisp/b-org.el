@@ -31,6 +31,9 @@
 	;; zwanenzang tickets: an agent works on it / it awaits my review.
 	(sequence "AGNT(a!)" "REVW(r!)" "|")))
 
+;; A parent cannot be marked done while a child heading is still open.
+(setf org-enforce-todo-dependencies t)
+
 (b/with-zenburn
   (setf org-todo-keyword-faces
 	`(("TODO" . ,zenburn-red)
