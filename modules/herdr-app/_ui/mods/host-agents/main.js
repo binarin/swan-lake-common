@@ -82,7 +82,7 @@ class HostTags {
 }
 // ---- end host tags ----
 
-// ---- background runs: the same block in host-tabs and host-agents; keep them in sync ----
+// ---- background runs: the same block in host-tabs, host-agents and host-spaces; keep them in sync ----
 // Work a program reports beside its own status, as OSC 7501 records in
 // terminals(): pi-subagents sends one per async run (`subagents/<run>`) and per
 // workflow step (`subagents/<run>.<step>`), while pi's own status goes idle as

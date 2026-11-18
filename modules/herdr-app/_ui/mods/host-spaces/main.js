@@ -8,11 +8,12 @@
 // Workspace spaces: stable colored avatars, worktrees under their checkout,
 // grouped by machine when more than one is known. After a space's name, the repo
 // its first terminal is in now, only where unusual: branch, ahead/behind. Agent state lives in the agents list, not here. Click to
-// switch, right-click for its menu, drag to reorder.
+// switch, right-click for its menu, drag to reorder. In the overview, a tab whose
+// terminals report background runs (see below) shows a marker after its name.
 
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
-import { spaces, machines, panes, agents, run, openOverlay, exec, hc, theme, shared, setShared, watchFolder, window, layout, readTextFile, appHome, nextCommand, props, closeOverlay } from "herdr";
+import { spaces, machines, panes, agents, terminals, run, openOverlay, exec, hc, theme, shared, setShared, watchFolder, window, layout, readTextFile, appHome, nextCommand, props, closeOverlay } from "herdr";
 
 // ---- host tags: the same block in host-spaces, host-picker and host-agents; keep them in sync ----
 // A colored [alias] for the machine a space or agent runs on, read from
@@ -80,6 +81,43 @@ class HostTags {
   }
 }
 // ---- end host tags ----
+
+// ---- background runs: the same block in host-tabs, host-agents and host-spaces; keep them in sync ----
+// Work a program reports beside its own status, as OSC 7501 records in
+// terminals(): pi-subagents sends one per async run (`subagents/<run>`) and per
+// workflow step (`subagents/<run>.<step>`), while pi's own status goes idle as
+// soon as its turn ends. Herdr ignores records; here they only draw a marker,
+// and no status, alert or seen state changes.
+// (One copy per mod: a mod can't import a file outside its own folder.)
+const RUN_RANK = { working: 1, blocked: 2 };
+
+// The working or blocked runs of these terminals: { state, count }, blocked
+// winning, or null when there are none. A workflow's steps count as one run.
+function backgroundRuns(list) {
+  const runs = new Map();
+  for (const term of list) {
+    for (const [id, r] of Object.entries(term?.records ?? {})) {
+      const rank = RUN_RANK[r?.state];
+      if (!rank) continue;
+      const run = `${term.address}\u0000${id.replace(/\.[^/]*$/, "")}`;
+      runs.set(run, Math.max(runs.get(run) ?? 0, rank));
+    }
+  }
+  if (!runs.size) return null;
+  const blocked = [...runs.values()].filter((r) => r === RUN_RANK.blocked).length;
+  return { state: blocked ? "blocked" : "working", count: runs.size, blocked };
+}
+
+// A layers glyph in the working (or blocked) color, with the count from two runs up.
+function backgroundEl(t, runs, id) {
+  const n = runs.count;
+  const tip = `${n} background run${n === 1 ? "" : "s"}` + (runs.blocked ? `, ${runs.blocked} waiting for a reply` : "");
+  return h_flex().id(id).flex_none().gap(2).items_center().text_size(10.5).font_semibold().text_color(t[runs.state] ?? t.dim)
+    .tooltip(tip)
+    .child(svg("mods/workspace-chrome/layers.svg").size(12).flex_none())
+    .when(n > 1, (el) => el.child(String(n)));
+}
+// ---- end background runs ----
 
 
 function find(node, id) {
@@ -500,7 +538,8 @@ export default class Spaces extends View {
     const overview = !collapsed && Boolean(shared(OVERVIEW));
     const ps = overview ? panes() : [];
     const ags = overview ? agents() : [];
-    const draw = (r) => (collapsed ? [this.compact(r, t)] : [this.row(r, t), ...(overview ? this.tabRows(r, t, ps, ags) : [])]);
+    const byAddress = new Map(overview ? terminals().map((x) => [x.address, x]) : []);
+    const draw = (r) => (collapsed ? [this.compact(r, t)] : [this.row(r, t), ...(overview ? this.tabRows(r, t, ps, ags, byAddress) : [])]);
     const remote = [...new Set([...rows.map(r => r.w.machine).filter(Boolean), ...this.machines.map(m => m.name), ...Object.keys(this.reconnecting)])].sort();
     const loading = m => {
       const layout = machines().find(k => k.name === m)?.layout;
@@ -646,13 +685,14 @@ export default class Spaces extends View {
   }
 
   // The overview's rows under a space: one per tab.
-  tabRows({ w, tree }, t, ps, ags) {
+  tabRows({ w, tree }, t, ps, ags, byAddress) {
     return (w.tabs ?? []).map((tab, i) => {
       const mine = ags.filter((a) => a.tab === tab.id);
       const tabPanes = ps.filter((p) => p.tab === tab.id);
       const lead = tabPanes.find((p) => p.program?.agent) ?? tabPanes.find((p) => p.focused) ?? tabPanes[0];
       const here = w.active && tab.active;
       const st = tab.status;
+      const runs = backgroundRuns(tabPanes.filter((p) => p.terminal).map((p) => byAddress.get(p.terminal)));
       const mark = st === "working" ? svg("mods/workspace-chrome/spinner.svg").size(10).flex_none().text_color(t.working).spin(900)
         : st === "blocked" || st === "done" ? div().size(7).mx(1.5).flex_none().rounded(4).bg(t[st])
         : st === "idle" ? div().size(7).mx(1.5).flex_none().rounded(4).border(1.5).border_color(t.idle ?? t.dim)
@@ -679,6 +719,7 @@ export default class Spaces extends View {
           .text_color(here ? t.foreground : st === "blocked" ? t.blocked : t.muted)
           .when(here, (el) => el.font_semibold())
           .child(tabName(tab, lead) + (tab.zoomed ? "  Z" : "")))
+        .when(Boolean(runs), (el) => el.child(backgroundEl(t, runs, `space-tab-runs-${tab.id}`)))
         .child(div().flex_1())
         .when(st === "blocked", (el) => el.child(div().flex_none().px(5).h(16).rounded(4).bg(t.blocked + "26").text_size(10).font_semibold().text_color(t.blocked).flex().items_center().child("Needs you")))
         .children(mine.slice(0, 3).map(agentChip))
