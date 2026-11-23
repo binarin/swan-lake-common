@@ -5,7 +5,44 @@ import json
 import os
 import socket
 import subprocess
+import sys
+import time
 import uuid
+
+STARTUP_TIMEOUT = 60
+
+
+def verify_startup(terminal):
+    """Poll until the agent has started its first turn, then show its screen.
+
+    Never waits for the turn to end: a working agent is the success case.
+    """
+    deadline = time.monotonic() + STARTUP_TIMEOUT
+    while True:
+        info = json.loads(subprocess.check_output(
+            ['hc', 'get', terminal, '--json']))
+        state = (info.get('status') or {}).get('state')
+        started = (info.get('turn') or 0) > 0 or state in ('working', 'done',
+                                                       'blocked')
+        if info['state'] != 'live' or started or state == 'error':
+            break
+        if time.monotonic() > deadline:
+            break
+        time.sleep(1)
+    print(subprocess.check_output(
+        ['hc', 'read', terminal, '--lines', '40'], text=True), flush=True)
+    summary = 'terminal=%s state=%s status=%s turn=%s' % (
+        terminal, info['state'], state, info.get('turn'))
+    if info['state'] == 'live' and started:
+        print('Startup confirmed:', summary, flush=True)
+        return 0
+    print('Startup NOT confirmed:', summary, '- inspect it; do not launch'
+          ' a duplicate', flush=True)
+    return 3
+
+
+if len(sys.argv) == 3 and sys.argv[1] == '--verify':
+    sys.exit(verify_startup(sys.argv[2]))
 
 name = os.environ['HANDOFF_NAME']
 directory = os.environ['HANDOFF_DIR']
@@ -80,3 +117,4 @@ layout = rpc('doc.get', {'name': 'herdr-app'})
 space = next(s for s in layout['value']['spaces'] if s['id'] == space_id)
 assert next(t for t in space['tabs'] if t['id'] == tab_id) == new_tab
 print('Verified desktop tab:', name, terminal, flush=True)
+sys.exit(verify_startup(terminal))

@@ -177,6 +177,7 @@ assert expect (sharedBlock "host tags" [
 assert expect (sharedBlock "background runs" [
   "host-tabs"
   "host-agents"
+  "host-spaces"
 ]) "the background runs block is the same in every mod that has it";
 pkgs.runCommand "herdr-app-instances" { nativeBuildInputs = [ pkgs.patch ]; } ''
   ${lib.optionalString needsLinkedAssetsFix ''
