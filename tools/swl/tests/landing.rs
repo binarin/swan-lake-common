@@ -17,7 +17,17 @@ use std::{
     thread,
 };
 
+/// Common pins zwanenzang's `current`, for nested (`lib/zwanenzang`) entries.
 const COMMON_FLAKE: &str = r#"{
+  inputs.zwanenzang.url = "git+file://@FORGE@/binarin/zwanenzang?ref=current";
+  outputs = { self, zwanenzang }: {
+    value = builtins.readFile ./value.txt;
+    zw = zwanenzang.value;
+  };
+}
+"#;
+
+const ZW_FLAKE: &str = r#"{
   outputs = { self }: {
     value = builtins.readFile ./value.txt;
   };
@@ -30,9 +40,10 @@ const COMMON_FLAKE: &str = r#"{
 const CONSUMER_FLAKE: &str = r#"{
   inputs.lib.url = "git+file://@FORGE@/binarin/swan-lake-common?ref=current";
   inputs.extra.url = "git+file://@FORGE@/binarin/swan-lake-common?ref=current";
-  outputs = { self, lib, extra }: {
+  outputs = { self, lib, extra, ... }: {
     value = builtins.readFile ./value.txt + "+" + lib.value;
     extra = extra.value;
+    zw = lib.zw;
   };
 }
 "#;
@@ -238,8 +249,15 @@ impl World {
         .unwrap();
 
         let seed = w.root.join("seed");
+        let zw_seed = seed.join("zwanenzang");
+        w.seed(&zw_seed, ZW_FLAKE, "z1");
+        w.git(&zw_seed, &["branch", "current"]);
+        w.bare("zwanenzang", &zw_seed);
         let common_seed = seed.join("swan-lake-common");
         w.seed(&common_seed, COMMON_FLAKE, "c1");
+        stdout(&w.nix(&common_seed, &["flake", "lock"]));
+        w.git(&common_seed, &["add", "flake.lock"]);
+        w.git(&common_seed, &["commit", "-qm", "lock"]);
         w.git(&common_seed, &["branch", "current"]);
         w.bare("swan-lake-common", &common_seed);
         let consumer_seed = seed.join("swan-lake");
@@ -615,6 +633,36 @@ fn check_gates_mrs_and_master() {
     )
     .unwrap();
     failed(&w.swl(&w.consumer, &mr, &[]), 1, "unknown field");
+
+    // An input new in flake.nix, not locked yet, is known by its URL.
+    let flake = fs::read_to_string(w.consumer.join("flake.nix")).unwrap();
+    let new_input = format!(
+        "  inputs.newin.url = \"git+file://{}/binarin/swan-lake-common?ref=current\";\n",
+        w.forge.display()
+    );
+    fs::write(
+        w.consumer.join("flake.nix"),
+        flake.replacen("{\n", &format!("{{\n{new_input}"), 1),
+    )
+    .unwrap();
+    fs::write(
+        w.consumer.join("swl.toml"),
+        "[inputs.newin]\nrepo = \"swan-lake-common\"\nmr = 1\n",
+    )
+    .unwrap();
+    w.git(&w.consumer, &["commit", "-qam", "declare newin"]);
+    stdout(&w.swl(&w.consumer, &mr, &[]));
+    fs::write(
+        w.consumer.join("swl.toml"),
+        "[inputs.newin]\nrepo = \"zwanenzang\"\nmr = 1\n",
+    )
+    .unwrap();
+    failed(
+        &w.swl(&w.consumer, &mr, &[]),
+        1,
+        "not the repo \"zwanenzang\"",
+    );
+    w.git(&w.consumer, &["reset", "-q", "--hard", "HEAD~1"]);
     w.git(&w.consumer, &["checkout", "swl.toml"]);
 
     // An MR must not change flake.lock.
@@ -703,15 +751,28 @@ fn finalize_relocks_landed_entries_in_one_commit() {
     );
     w.git(&w.consumer, &["checkout", "swl.toml"]);
 
-    // Promoted: one commit relocks lib and drops its entry.
-    w.git(&forge, &["update-ref", "refs/heads/current", &head]);
-    let out = stdout(&w.swl(&w.consumer, &["finalize"], &[]));
+    // Promoted while `--wait` polls: one commit relocks lib and drops its
+    // entry.
+    let out = thread::scope(|scope| {
+        scope.spawn(|| {
+            thread::sleep(std::time::Duration::from_secs(2));
+            w.git(&forge, &["update-ref", "refs/heads/current", &head]);
+        });
+        let wait = ["finalize", "--wait", "--timeout", "120", "--interval", "1"];
+        w.swl(&w.consumer, &wait, &[])
+    });
+    let out = stdout(&out);
+    assert!(
+        out.contains("not promoted yet; checking again in 1s"),
+        "{out}"
+    );
     assert!(out.contains("lib (swan-lake-common#1): lands"), "{out}");
     assert!(
         out.contains("extra (swan-lake-common#2): stays: the MR is still open"),
         "{out}"
     );
     assert!(out.contains("1 entry remain"), "{out}");
+    assert!(out.contains("Keep this commit local"), "{out}");
     assert_eq!(w.git(&w.consumer, &["rev-parse", "HEAD~1"]), before);
     assert_eq!(
         w.git(&w.consumer, &["log", "-1", "--format=%s"]),
@@ -759,4 +820,144 @@ fn finalize_relocks_landed_entries_in_one_commit() {
     assert_eq!(lock["nodes"]["extra"]["locked"]["rev"], head.as_str());
     let out = stdout(&w.swl(&w.consumer, &["finalize"], &[]));
     assert!(out.contains("nothing to finalize"), "{out}");
+
+    // An empty swl.toml is not landed: it should be removed.
+    fs::write(w.consumer.join("swl.toml"), "").unwrap();
+    w.git(&w.consumer, &["add", "swl.toml"]);
+    w.git(&w.consumer, &["commit", "-qm", "empty manifest"]);
+    failed(&w.swl(&w.consumer, &["finalize"], &[]), 1, "has no entries");
+}
+
+#[test]
+fn publish_refuses_the_base_branch_and_lock_changes() {
+    let w = World::new("publish-refusals");
+    let ws = w.ws.display().to_string();
+    let publish = ["publish", "--workspace", &ws, "swan-lake"];
+    let forge_common = w.forge_repo("swan-lake-common");
+    let common_master = w.git(&forge_common, &["rev-parse", "master"]);
+    let consumer_master = w.git(&w.forge_repo("swan-lake"), &["rev-parse", "master"]);
+
+    // A shared checkout on its base branch, with a local commit.
+    w.git(&w.common, &["checkout", "-q", "master"]);
+    fs::write(w.common.join("value.txt"), "on master").unwrap();
+    w.git(&w.common, &["commit", "-qam", "on master"]);
+    failed(
+        &w.swl(&w.root, &publish, &[]),
+        2,
+        "master is the base branch",
+    );
+    w.git(&w.common, &["checkout", "-q", "feature"]);
+
+    // The consumer on its base branch, with a local commit.
+    w.git(&w.consumer, &["checkout", "-q", "master"]);
+    fs::write(w.consumer.join("value.txt"), "on master").unwrap();
+    w.git(&w.consumer, &["commit", "-qam", "on master"]);
+    failed(
+        &w.swl(&w.root, &publish, &[]),
+        2,
+        "master is the base branch",
+    );
+    w.git(&w.consumer, &["checkout", "-q", "feat"]);
+
+    // A consumer branch that changes flake.lock, such as a local partial
+    // finalize commit.
+    let lock = fs::read_to_string(w.consumer.join("flake.lock")).unwrap();
+    fs::write(
+        w.consumer.join("flake.lock"),
+        lock.replace("\"version\": 7", "\"version\":  7"),
+    )
+    .unwrap();
+    w.git(&w.consumer, &["commit", "-qam", "touch the lock"]);
+    failed(
+        &w.swl(&w.root, &publish, &[]),
+        2,
+        "must not change flake.lock",
+    );
+
+    // Nothing was pushed and no MR opened.
+    assert_eq!(
+        w.git(&forge_common, &["rev-parse", "master"]),
+        common_master
+    );
+    assert_eq!(
+        w.git(&w.forge_repo("swan-lake"), &["rev-parse", "master"]),
+        consumer_master
+    );
+    let branches = w.git(&forge_common, &["branch", "--format=%(refname:short)"]);
+    assert!(!branches.lines().any(|b| b == "feature"), "{branches}");
+    assert!(!w.fj_log().contains("pr create"), "{}", w.fj_log());
+}
+
+#[test]
+fn finalize_lands_a_nested_entry_through_its_parent() {
+    let w = World::new("nested");
+    let zw_forge = w.forge_repo("zwanenzang");
+    let common_forge = w.forge_repo("swan-lake-common");
+    fs::write(
+        w.consumer.join("swl.toml"),
+        "[inputs.\"lib/zwanenzang\"]\nrepo = \"zwanenzang\"\nmr = 1\n",
+    )
+    .unwrap();
+    w.git(&w.consumer, &["add", "swl.toml"]);
+    w.git(&w.consumer, &["commit", "-qm", "swl: manifest"]);
+
+    // The zwanenzang MR, merged and promoted in zwanenzang.
+    let zw = w.root.join("zw-work");
+    w.git(
+        &w.root,
+        &["clone", "-q", &zw_forge.display().to_string(), "zw-work"],
+    );
+    fs::write(zw.join("value.txt"), "z2").unwrap();
+    w.git(&zw, &["commit", "-qam", "zw: z2"]);
+    let z2 = w.git(&zw, &["rev-parse", "HEAD"]);
+    w.git(
+        &zw,
+        &["push", "-q", "origin", "HEAD:master", "HEAD:current"],
+    );
+    w.api.set("zwanenzang", 1, "open", &z2, None);
+    let mr = ["check", "--event", "mr", "--base", "origin/master"];
+    stdout(&w.swl(&w.consumer, &mr, &[]));
+    w.api.set("zwanenzang", 1, "merged", &z2, Some(&z2));
+
+    // Common has not bumped it yet: nothing lands.
+    let out = w.swl(&w.consumer, &["finalize"], &[]);
+    failed(&out, 1, "promotion or the mirror is pending");
+
+    // Common bumps and promotes it: the consumer relocks lib.
+    let common = w.root.join("common-work");
+    w.git(
+        &w.root,
+        &[
+            "clone",
+            "-q",
+            &common_forge.display().to_string(),
+            "common-work",
+        ],
+    );
+    stdout(&w.nix(&common, &["flake", "update", "zwanenzang"]));
+    w.git(&common, &["commit", "-qam", "zwanenzang: bump"]);
+    w.git(
+        &common,
+        &["push", "-q", "origin", "HEAD:master", "HEAD:current"],
+    );
+    let out = stdout(&w.swl(&w.consumer, &["finalize"], &[]));
+    assert!(
+        out.contains("lib/zwanenzang (zwanenzang#1): lands"),
+        "{out}"
+    );
+    assert!(!w.consumer.join("swl.toml").exists());
+    let lock: serde_json::Value =
+        serde_json::from_slice(&fs::read(w.consumer.join("flake.lock")).unwrap()).unwrap();
+    let lib_zw = lock["nodes"]["lib"]["inputs"]["zwanenzang"]
+        .as_str()
+        .unwrap();
+    assert_eq!(lock["nodes"][lib_zw]["locked"]["rev"], z2.as_str());
+    let mut c = Command::new("nix");
+    w.env(&mut c, &w.base_path);
+    let out = c
+        .current_dir(&w.consumer)
+        .args(["eval", "--raw", ".#zw"])
+        .output()
+        .unwrap();
+    assert_eq!(stdout(&out), "z2");
 }

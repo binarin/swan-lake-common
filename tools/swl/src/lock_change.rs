@@ -313,6 +313,21 @@ mod tests {
         assert!(verify(&old, &new, &common()).is_err());
     }
 
+    /// workflow.py's `test_resolved_follows_graph` accepts a same-revision
+    /// relock that swaps a direct edge for an equivalent follows. Here
+    /// follows edges are compared as paths, so that is rejected: stricter,
+    /// and nix does not rewrite edges like that when relocking an input.
+    #[test]
+    fn same_revision_follows_swap_is_rejected() {
+        let (mut old, mut new) = (lock(), lock());
+        old["nodes"]["root"]["inputs"]["dep"] = json!("dep");
+        new["nodes"]["root"]["inputs"]["dep"] = json!("dep");
+        verify(&old, &new, &common()).unwrap();
+        new["nodes"]["renamed"]["inputs"]["dep"] = json!(["dep"]);
+        let e = verify(&old, &new, &common()).unwrap_err().to_string();
+        assert!(e.contains("same revision changed"), "{e}");
+    }
+
     #[test]
     fn resolves_paths() {
         let l = lock();
