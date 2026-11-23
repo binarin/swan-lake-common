@@ -1,0 +1,394 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 6d480a7..89bb198 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,5 +1,9 @@
+ # Changelog
+ 
++## UNRELEASED
++
++- **Fix: tools added or removed during a turn reach Claude Code in that turn** — When a tool registers or unregisters tools (or an MCP server) while it runs, the waiting Claude Code query is replaced by one that resumes the session and serves the current tools, instead of keeping the old set until the next prompt.
++
+ ## 0.11.0 — 2026-11-06
+ 
+ - **Breaking: AskClaude moved to its own package** — Run `pi install npm:pi-claude-bridge-askclaude` if you want to keep using the AskClaude tool.
+diff --git a/src/index.ts b/src/index.ts
+index 54806b4..38d41ac 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -32,7 +32,7 @@ import { nonSystemMessages, toBridgeContext } from "./transcript.js";
+ import { forgetSessionCwd, rememberSessionCwd, rememberSummarySession, sessionCwdFor, summarySessionFor } from "./session-cwd.js";
+ import { updateUsage, type SdkUsage } from "./usage.js";
+ import { rateLimitResponse } from "./rate-limit.js";
+-import { BRIDGE_VERSION, packageVersion, setTraceNotifier, traceAssertReady, traceEvent, traceId, traceInput, traceQueryStart, traceSignalId, traceSnapshot, traceStrict } from "./cache-trace.js";
++import { BRIDGE_VERSION, digest, packageVersion, setTraceNotifier, traceAssertReady, traceEvent, traceId, traceInput, traceQueryStart, traceSignalId, traceSnapshot, traceStrict } from "./cache-trace.js";
+ import { DEBUG, debug, makeCliDebugOptions, moduleInstanceId } from "./debug.js";
+ import { CC_CHILD_ENV, ccChildEnv, CLAUDE_MD_EXCLUDES, errorMessage, REASONING_TO_EFFORT, resultErrorText } from "./cc-child.js";
+ 
+@@ -808,6 +808,14 @@ function resolveMcpTools(context: Context): {
+ 	return { mcpTools, customToolNameToSdk, customToolNameToPi };
+ }
+ 
++/** What Claude Code sees of a tool set through tools/list, independent of order and of
++ *  object identity, so re-registering an identical tool does not count as a change. */
++function toolsFingerprint(tools: readonly Tool[]): string {
++	return digest([...tools]
++		.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
++		.map((tool) => [tool.name, tool.description, tool.parameters]));
++}
++
+ // Creates an MCP server that bridges pi tools to the SDK. Each tool handler
+ // blocks on a Promise until pi delivers the tool result via streamSimple.
+ // Handlers receive their toolCallId from Claude's tools/call _meta, so results
+@@ -1586,6 +1594,12 @@ const CONTINUE_AFTER_RESUME_PROMPT =
+ 	"[Your session was interrupted and resumed. What precedes this ends with the tool result "
+ 	+ "you were waiting for. Continue the task from there.]";
+ 
++/** The prompt a tool result is opened with when the tool set changed while the query
++ *  waited on it, so the turn goes on in a fresh query that serves the new tools. */
++const CONTINUE_AFTER_TOOLS_CHANGED_PROMPT =
++	"[Your available tools changed while you were waiting for a tool result. What precedes this "
++	+ "ends with that result. Continue the task from there.]";
++
+ /** Drop a Claude Code query parked at a tool boundary whose conversation pi has
+  *  since rewritten (/compact, tree navigation).
+  *
+@@ -1694,6 +1708,24 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
+ 		activeQuery = activeQueryContexts.size > 0;
+ 	}
+ 
++	// A tool can register or unregister tools (or an MCP server) while it runs. The parked
++	// query's MCP server was built from the old set and Claude Code does not re-list it, so
++	// the new tools would stay out of reach until the next prompt. Discard the query the
++	// same way and let this result carry the turn into a fresh query serving pi's tools.
++	const toolsChangedUnderQuery = Boolean(resultCtx && toolsFingerprint(context.tools ?? []) !== resultCtx.servedToolsFingerprint);
++	if (resultCtx && toolsChangedUnderQuery) {
++		const current = (context.tools ?? []).map((tool) => tool.name);
++		const served = resultCtx.servedToolNames;
++		const added = current.filter((name) => !served.includes(name));
++		const removed = served.filter((name) => !current.includes(name));
++		traceEvent("route", { callId: traceCallId, route: "discard-tools-changed", queryId: resultCtx.traceQueryId, added, removed });
++		debug(`provider: tool set changed under a parked query (added=${added.join(",") || "-"} removed=${removed.join(",") || "-"}); continuing in a fresh query`);
++		try { discardRewrittenQuery(resultCtx); }
++		catch (error) { return failBeforeQuery(error); }
++		resultCtx = undefined;
++		activeQuery = activeQueryContexts.size > 0;
++	}
++
+ 	const isReentrantUserQuery = activeQuery && lastMsgRole === "user" && allResults.length === 0;
+ 	if (isReentrantUserQuery) {
+ 		debug(`provider: active query user-only call treated as reentrant fresh query, ctx.msgs=${context.messages.length}`);
+@@ -1731,7 +1763,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
+ 	// falls through to the fresh-query path, which resumes the CC session and
+ 	// delivers it.
+ 	const lastMsg = context.messages[context.messages.length - 1];
+-	const unparkedToolResult = lastMsg?.role === "toolResult" && !rewrittenUnderQuery;
++	const unparkedToolResult = lastMsg?.role === "toolResult" && !rewrittenUnderQuery && !toolsChangedUnderQuery;
+ 	if (unparkedToolResult && options?.signal?.aborted) {
+ 		debug(`provider: orphaned tool result after abort, emitting end_turn`);
+ 		traceEvent("route", { callId: traceCallId, route: "orphan-after-abort" });
+@@ -1795,6 +1827,8 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
+ 	}
+ 
+ 	queryCtx.piSessionId = options?.sessionId ?? null;
++	queryCtx.servedToolsFingerprint = toolsFingerprint(mcpTools);
++	queryCtx.servedToolNames = mcpTools.map((tool) => tool.name);
+ 	queryCtx.resetTurnState(model);
+ 	claimCurrentPiStream(stream, "fresh-query", queryCtx, options);
+ 	activeQueryContexts.add(queryCtx);
+@@ -1835,6 +1869,10 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
+ 			promptText = CONTINUE_AFTER_REWRITE_PROMPT;
+ 			debug(`provider: continuing the turn after a rewritten history, ${context.messages.length} msgs rebuilt`);
+ 		}
++		if (toolsChangedUnderQuery && !promptText && !promptBlocks) {
++			promptText = CONTINUE_AFTER_TOOLS_CHANGED_PROMPT;
++			debug(`provider: continuing the turn under a changed tool set, ${context.messages.length} msgs`);
++		}
+ 		if (unparkedToolResult && !promptText && !promptBlocks) {
+ 			promptText = CONTINUE_AFTER_RESUME_PROMPT;
+ 			debug(`provider: resuming the turn at a tool result with no parked query, ${context.messages.length} msgs`);
+diff --git a/src/query-state.ts b/src/query-state.ts
+index 47526f5..c7447ab 100644
+--- a/src/query-state.ts
++++ b/src/query-state.ts
+@@ -105,6 +105,11 @@ export class QueryContext {
+ 	 *  the way a module flag does.
+ 	 */
+ 	historyStale = false;
++	/** Content fingerprint (toolsFingerprint in index.ts) and names of the tools this
++	 *  query's MCP server serves. Fixed for the query's life: a tool result arriving
++	 *  under a different tool set moves the turn to a fresh query instead. */
++	servedToolsFingerprint: string | null = null;
++	servedToolNames: string[] = [];
+ 
+ 	// Per-turn (reset together)
+ 	turnOutput: AssistantMessage | null = null;
+diff --git a/tests/unit-midturn-tool-changes.mjs b/tests/unit-midturn-tool-changes.mjs
+new file mode 100644
+index 0000000..72bc9b9
+--- /dev/null
++++ b/tests/unit-midturn-tool-changes.mjs
+@@ -0,0 +1,263 @@
++/**
++ * A tool set that changes while a query is parked at a tool boundary.
++ *
++ * A pi tool's execute can register or unregister tools (or a whole MCP server).
++ * The parked query's MCP server was built from the tool set the query started
++ * with, so delivering the result into it would leave the new tools out of reach
++ * until the next user message. These drive the provider end to end with a fake
++ * SDK query and pin the route: a changed set discards the parked query and the
++ * result carries the turn into a fresh query serving pi's current tools; an
++ * unchanged set (including an identical re-registration) keeps the parked query.
++ */
++import { describe, it, beforeEach, afterEach } from "node:test";
++import assert from "node:assert/strict";
++import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
++
++const mod = await import("../src/index.js");
++const trace = await import("../src/cache-trace.js");
++const { setQuery, resetSharedSession, activeQueryContexts, discardRewrittenQuery } = mod.__test;
++const handlers = new Map();
++let providerConfig;
++mod.default({
++	on: (event, handler) => handlers.set(event, handler),
++	registerProvider: (_name, config) => { providerConfig = config; },
++});
++const streamSimple = providerConfig.streamSimple;
++const model = providerConfig.models[0];
++
++const schema = (prop) => ({ type: "object", properties: { [prop]: { type: "string" } }, required: [prop] });
++const toolA = { name: "a", description: "Tool a", parameters: schema("path") };
++const toolB = { name: "b", description: "Tool b", parameters: schema("query") };
++
++const ev = (event) => ({ type: "stream_event", event });
++const init = () => ({ type: "system", subtype: "init" });
++const toolUse = (id, name) => [
++	ev({ type: "message_start", message: { id: `msg_${id}`, usage: {} } }),
++	ev({ type: "content_block_start", index: 0, content_block: { type: "tool_use", id, name: `mcp__custom-tools__${name}`, input: {} } }),
++	ev({ type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: "{}" } }),
++	ev({ type: "content_block_stop", index: 0 }),
++	ev({ type: "message_delta", delta: { stop_reason: "tool_use" }, usage: {} }),
++	ev({ type: "message_stop" }),
++];
++const text = (t) => [
++	ev({ type: "message_start", message: { id: `msg_text_${t}`, usage: {} } }),
++	ev({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }),
++	ev({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: t } }),
++	ev({ type: "content_block_stop", index: 0 }),
++	ev({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: {} }),
++	ev({ type: "message_stop" }),
++];
++const result = (t) => ({ type: "result", subtype: "success", is_error: false, result: t });
++
++let clock = 0;
++const system = (fields) => ({ role: "system", content: "", ...fields, timestamp: clock++ });
++const user = (t) => ({ role: "user", content: t, timestamp: clock++ });
++const toolResult = (id, name) => ({ role: "toolResult", toolCallId: id, toolName: name, content: [{ type: "text", text: `${name} output` }], isError: false, timestamp: clock++ });
++const replyText = (message) => message.content.filter((b) => b.type === "text").map((b) => b.text).join("");
++
++/** Connects to the in-process MCP server the bridge handed the SDK, the way the SDK does. */
++async function connectMcp(server) {
++	const pending = new Map();
++	const transport = { start: async () => {}, close: async () => {}, send: async (msg) => pending.get(msg.id)?.(msg) };
++	await server.instance.connect(transport);
++	let nextId = 0;
++	const request = (method, params) => new Promise((resolve) => {
++		const id = ++nextId;
++		pending.set(id, resolve);
++		transport.onmessage({ jsonrpc: "2.0", id, method, params });
++	});
++	await request("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "test", version: "1.0.0" } });
++	transport.onmessage({ jsonrpc: "2.0", method: "notifications/initialized" });
++	return {
++		listTools: async () => (await request("tools/list", {})).result.tools.map((tool) => tool.name),
++		callTool: async (name, toolUseId) =>
++			(await request("tools/call", { name, arguments: {}, _meta: { "claudecode/toolUseId": toolUseId } })).result,
++	};
++}
++
++const calls = [];
++const scripts = [];
++let traceDir;
++
++beforeEach(() => {
++	resetSharedSession();
++	activeQueryContexts.clear();
++	calls.length = 0;
++	scripts.length = 0;
++	traceDir = mkdtempSync(join(tmpdir(), "midturn-tools-trace-"));
++	process.env.CLAUDE_BRIDGE_TRACE_DIR = traceDir;
++	trace.resetTraceForTests();
++	setQuery(({ prompt, options }) => {
++		const script = scripts.shift();
++		if (!script) throw new Error("no fake script queued");
++		const call = { label: script.label, resume: options.resume, closed: false };
++		calls.push(call);
++		let onClose;
++		const killed = new Promise((r) => { onClose = r; });
++		const gen = (async function* () {
++			const server = options.mcpServers?.["custom-tools"];
++			call.mcp = server ? await connectMcp(server) : null;
++			call.served = call.mcp ? await call.mcp.listTools() : [];
++			const first = (await prompt[Symbol.asyncIterator]().next()).value;
++			call.prompt = first.message.content[0].text;
++			const sessionId = options.sessionId ?? options.resume;
++			for (const step of script.steps) {
++				if (call.closed) return;
++				if (typeof step === "function") { await step(killed, call); continue; }
++				if (step.type === "system" && step.subtype === "init") {
++					yield { ...step, session_id: sessionId };
++					yield { ...first, isReplay: true, session_id: sessionId };
++				} else yield step;
++			}
++		})();
++		gen.interrupt = async () => {};
++		gen.close = () => { call.closed = true; onClose(); };
++		return gen;
++	});
++});
++
++afterEach(() => {
++	// Ends the queries a test left parked, so no fake script outlives its test.
++	for (const c of [...activeQueryContexts]) discardRewrittenQuery(c);
++	setQuery(null);
++	delete process.env.CLAUDE_BRIDGE_TRACE_DIR;
++	trace.resetTraceForTests();
++	rmSync(traceDir, { recursive: true, force: true });
++});
++
++const sessionFile = (ccSessionId) => {
++	const projects = join(process.env.CLAUDE_CONFIG_DIR, "projects");
++	const dir = readdirSync(projects).find((d) => readdirSync(join(projects, d)).includes(`${ccSessionId}.jsonl`));
++	return readFileSync(join(projects, dir, `${ccSessionId}.jsonl`), "utf8");
++};
++
++const routes = () => {
++	const run = readdirSync(traceDir).find((d) => d.startsWith("run-"));
++	return readFileSync(join(traceDir, run, "events.jsonl"), "utf8").split("\n").filter(Boolean)
++		.map((line) => JSON.parse(line)).filter((e) => e.type === "route");
++};
++
++/** Parks a query on a call to `a` that CC makes through the MCP server, the way Claude
++ *  Code does after the tool_use message, then answers "done" once the result arrives. */
++function parkOnA(sid, history, signal, id = "toolu_a") {
++	scripts.push({ label: "parked", steps: [
++		init(), ...toolUse(id, "a"),
++		async (killed, call) => { call.handlerResult = await Promise.race([call.mcp.callTool("a", id), killed]); },
++		...text("done"), result("done"),
++	] });
++	return streamSimple(model, { messages: history }, { sessionId: sid, signal }).result();
++}
++
++describe("tool set changed under a parked query", () => {
++	it("tool added mid-turn: the result continues in a fresh query that serves and forwards it", async () => {
++		const opening = [system({ content: "You are a test agent.", sections: { tools: "Tools: [a]" }, toolsAdded: [toolA] }), user("enable b, then call b")];
++		handlers.get("before_agent_start")({ systemPrompt: "You are a test agent.\n\nTools: [a]", systemPromptOptions: {} });
++		const parked = await parkOnA("pi-add", opening);
++		assert.equal(parked.stopReason, "toolUse");
++		assert.deepEqual(calls[0].served, ["a"]);
++
++		// a's execute registered b; pi re-renders the prompt at the next turn boundary
++		// and appends the delta after the result. Unlike the parked route, the fresh
++		// query resolves the prompt capture, which turn_start re-keyed to the new prompt.
++		handlers.get("turn_start")({}, { getSystemPrompt: () => "You are a test agent.\n\nTools: [a, b]" });
++		scripts.push({ label: "fresh", steps: [init(), ...toolUse("toolu_b", "b"), (killed) => killed] });
++		const history = [...opening, parked, toolResult("toolu_a", "a"), system({ sections: { tools: "Tools: [a, b]" }, toolsAdded: [toolB] })];
++		const reply = await streamSimple(model, { messages: history }, { sessionId: "pi-add" }).result();
++
++		assert.equal(calls.length, 2, "the parked query cannot serve b, so a fresh query takes the turn");
++		assert.equal(calls[0].closed, true, "the parked query was discarded");
++		assert.notEqual(calls[0].handlerResult?.content?.[0]?.text, "a output", "the discarded query never got the result");
++		assert.deepEqual(calls[1].served.sort(), ["a", "b"]);
++		assert.match(calls[1].prompt, /available tools changed/);
++		assert.match(sessionFile(calls[1].resume), /a output/, "the fresh query resumes a Claude Code session that ends with a's result");
++		assert.equal(reply.stopReason, "toolUse");
++		assert.deepEqual(reply.content.filter((b) => b.type === "toolCall").map((b) => b.name), ["b"], "CC's call to b reaches pi as pi's tool b");
++		const route = routes().find((r) => r.route === "discard-tools-changed");
++		assert.ok(route, "traced as discard-tools-changed");
++		assert.deepEqual([route.added, route.removed], [["b"], []]);
++	});
++
++	it("tool removed mid-turn: the fresh query no longer serves it", async () => {
++		const opening = [system({ toolsAdded: [toolA, toolB] }), user("drop b")];
++		const parked = await parkOnA("pi-remove", opening);
++		assert.deepEqual(calls[0].served.sort(), ["a", "b"]);
++
++		scripts.push({ label: "fresh", steps: [init(), ...text("b is gone"), result("b is gone")] });
++		const history = [...opening, parked, toolResult("toolu_a", "a"), system({ toolsRemoved: [{ name: "b" }] })];
++		const reply = await streamSimple(model, { messages: history }, { sessionId: "pi-remove" }).result();
++
++		assert.equal(calls.length, 2);
++		assert.deepEqual(calls[1].served, ["a"]);
++		assert.equal(replyText(reply), "b is gone");
++		const route = routes().find((r) => r.route === "discard-tools-changed");
++		assert.deepEqual([route.added, route.removed], [[], ["b"]]);
++	});
++
++	it("a changed definition under the same name also moves the turn", async () => {
++		const opening = [system({ toolsAdded: [toolA, toolB] }), user("upgrade b")];
++		const parked = await parkOnA("pi-redefine", opening);
++
++		scripts.push({ label: "fresh", steps: [init(), ...text("ok"), result("ok")] });
++		const redefined = { ...toolB, parameters: schema("pattern") };
++		const history = [...opening, parked, toolResult("toolu_a", "a"), system({ toolsRemoved: [{ name: "b" }], toolsAdded: [redefined] })];
++		await streamSimple(model, { messages: history }, { sessionId: "pi-redefine" }).result();
++
++		assert.equal(calls.length, 2, "Claude Code would otherwise call b with the old schema");
++	});
++
++	for (const [label, delta] of [
++		["no change", null],
++		["an identical re-registration", system({ toolsRemoved: [{ name: "a" }], toolsAdded: [{ ...toolA, parameters: schema("path") }] })],
++	]) {
++		it(`${label}: the result goes to the parked query`, async () => {
++			const opening = [system({ toolsAdded: [toolA] }), user("read")];
++			const parked = await parkOnA("pi-same", opening);
++
++			const history = [...opening, parked, toolResult("toolu_a", "a"), ...(delta ? [delta] : [])];
++			const reply = await streamSimple(model, { messages: history }, { sessionId: "pi-same" }).result();
++
++			assert.equal(calls.length, 1, "no discard, no resume");
++			assert.equal(calls[0].handlerResult.content[0].text, "a output", "the parked handler received pi's result");
++			assert.equal(replyText(reply), "done");
++			assert.deepEqual(routes().map((r) => r.route), ["tool-result"]);
++		});
++	}
++
++	it("a subagent's tool change discards only its own query, not the parent's", async () => {
++		// Subagents run their own pi sessions in this process, each with its own parked query.
++		const opening = [system({ toolsAdded: [toolA] }), user("delegate")];
++		const parent = await parkOnA("pi-parent", opening, undefined, "toolu_parent");
++		const sub = await parkOnA("pi-sub", opening, undefined, "toolu_sub");
++
++		scripts.push({ label: "sub-fresh", steps: [init(), ...text("sub done"), result("sub done")] });
++		const subHistory = [...opening, sub, toolResult("toolu_sub", "a"), system({ toolsAdded: [toolB] })];
++		assert.equal(replyText(await streamSimple(model, { messages: subHistory }, { sessionId: "pi-sub" }).result()), "sub done");
++		assert.deepEqual([calls[0].closed, calls[1].closed], [false, true]);
++
++		const parentHistory = [...opening, parent, toolResult("toolu_parent", "a")];
++		assert.equal(replyText(await streamSimple(model, { messages: parentHistory }, { sessionId: "pi-parent" }).result()), "done");
++		assert.equal(calls.length, 3, "the parent's result went to its own parked query");
++		assert.equal(calls[0].handlerResult.content[0].text, "a output");
++	});
++
++	it("an aborted signal with changed tools is not dropped as an orphaned result", async () => {
++		const opening = [system({ toolsAdded: [toolA] }), user("enable b")];
++		const parked = await parkOnA("pi-aborted", opening);
++
++		const controller = new AbortController();
++		controller.abort();
++		scripts.push({ label: "fresh", steps: [init(), ...text("never"), result("never")] });
++		const history = [...opening, parked, toolResult("toolu_a", "a"), system({ toolsAdded: [toolB] })];
++		const reply = await streamSimple(model, { messages: history }, { sessionId: "pi-aborted", signal: controller.signal }).result();
++
++		const taken = routes().map((r) => r.route);
++		assert.ok(taken.includes("discard-tools-changed"));
++		assert.ok(!taken.includes("orphan-after-abort"),
++			"the orphan branch would end the turn as a clean, empty stop with the parked query already gone");
++		assert.equal(calls.length, 2, "the result went on to a fresh query, as after a rewrite");
++		assert.deepEqual(calls[1].served.sort(), ["a", "b"]);
++		assert.equal(reply.stopReason, "aborted", "the fresh query honours the abort instead of reporting a finished turn");
++	});
++});

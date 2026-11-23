@@ -19,6 +19,11 @@ let
         hash = "sha256-94VxD3FND+fHwTlYmZvUKyp5X3BqMKoJifCawGCIZFk=";
       };
 
+      # Tools a Pi tool registers or unregisters mid-turn (registerTool,
+      # registerMcpServer) otherwise stay invisible to Claude Code until the
+      # next user message. Local until it lands upstream (SL-0053).
+      patches = [ ./pi-claude-bridge-midturn-tools.patch ];
+
       nodejs = nodejs_24;
       npmDepsHash = "sha256-nS1KZnHHwTVV7B32tc7B7ZYssoPbKLo9GcXZr2Shot8=";
       npmFlags = [ "--legacy-peer-deps" ];
