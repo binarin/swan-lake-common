@@ -12,6 +12,7 @@ mod manifest;
 mod nix;
 mod nix_args;
 mod pin_policy;
+mod publish;
 mod shim;
 mod status;
 mod tempdir;
@@ -23,7 +24,13 @@ use std::{ffi::OsString, path::PathBuf, process::ExitCode, time::Duration};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
-use crate::{check::Event, config::Config, forge::AnonApi, shim::Tool, workspace::Workspace};
+use crate::{
+    check::Event,
+    config::Config,
+    forge::{AnonApi, Fj},
+    shim::Tool,
+    workspace::Workspace,
+};
 
 #[derive(Parser)]
 #[command(
@@ -57,6 +64,14 @@ enum Commands {
     },
     /// Show the shared checkouts against the revs the workspace's flakes lock
     Status {
+        /// Workspace directory [default: current directory]
+        #[arg(long, value_name = "DIR")]
+        workspace: Option<PathBuf>,
+    },
+    /// Push a consumer's changed shared checkouts and the consumer, open their MRs, and record them in swl.toml
+    Publish {
+        /// The consumer checkout, e.g. swan-lake
+        consumer: String,
         /// Workspace directory [default: current directory]
         #[arg(long, value_name = "DIR")]
         workspace: Option<PathBuf>,
@@ -178,6 +193,14 @@ fn run(cli: Cli) -> Result<ExitCode> {
         Commands::Status { workspace } => {
             let config = Config::load(config_flag)?;
             status::run(&Workspace::scan(&workspace_dir(workspace)?)?, &config)?;
+        }
+        Commands::Publish {
+            consumer,
+            workspace,
+        } => {
+            let config = Config::load(config_flag)?;
+            let ws = Workspace::scan(&workspace_dir(workspace)?)?;
+            publish::run(&ws, &config, &consumer, &Fj)?;
         }
         Commands::Finalize {
             dir,

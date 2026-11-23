@@ -119,6 +119,14 @@ impl Config {
         })
     }
 
+    /// The repo's base revision, also for repos not in the config.
+    pub fn base_for(&self, repo: &str) -> &str {
+        self.repos
+            .get(repo)
+            .map(RepoConfig::base)
+            .unwrap_or(DEFAULT_BASE)
+    }
+
     /// Whether `url` (a flake URL, as built by [`crate::lock::Node::urls`]) names `repo`.
     pub fn url_names_repo(&self, url: &str, repo: &str) -> bool {
         let url = normalize_url(url);

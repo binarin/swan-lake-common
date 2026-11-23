@@ -1,5 +1,6 @@
-//! The forge (Forgejo): MR state through the anonymous REST API; swl has no
-//! token configuration.
+//! The forge (Forgejo): MR state through the anonymous REST API, and MR
+//! creation through the `fj` CLI, which holds the owner's login. swl itself
+//! has no token configuration.
 
 use std::{
     env,
@@ -184,6 +185,103 @@ impl PrReader for AnonApi {
     }
 }
 
+/// Finds and opens MRs for `swl publish`.
+pub trait PrPublisher {
+    /// The open MR whose head is `branch`, if any.
+    fn find_open(&self, repo: &str, branch: &str) -> Result<Option<u64>>;
+    /// Opens an MR and returns its number. A `WIP: ` title prefix makes it a
+    /// draft on Forgejo.
+    fn create(&self, repo: &str, base: &str, head: &str, title: &str, body: &str) -> Result<u64>;
+}
+
+/// The `fj` CLI from PATH, logged in to the forge. Its output is text, so
+/// this parses fj 0.7's English messages.
+pub struct Fj;
+
+impl Fj {
+    fn run(&self, args: &[&str]) -> Result<String> {
+        let out = Command::new("fj")
+            .arg("-H")
+            .arg(FORGE_HOST)
+            .args(args)
+            .stdin(Stdio::null())
+            .output()
+            .context("running fj (the Forgejo CLI) from PATH")?;
+        if !out.status.success() {
+            bail!(
+                "fj {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+}
+
+/// MR numbers in `fj pr search` output: lines `#N: title (by user)`.
+pub fn parse_fj_search(text: &str) -> Vec<u64> {
+    text.lines()
+        .filter_map(|l| l.trim().strip_prefix('#')?.split_once(':')?.0.parse().ok())
+        .collect()
+}
+
+/// The head branch in `fj pr view` output: the line ``From `head` into `base` ``.
+pub fn parse_fj_view_head(text: &str) -> Option<String> {
+    text.lines().find_map(|l| {
+        let rest = l.trim().strip_prefix("From `")?;
+        let (head, rest) = rest.split_once('`')?;
+        rest.trim_start()
+            .starts_with("into ")
+            .then(|| head.to_string())
+    })
+}
+
+/// The number in `fj pr create` output: `created pull request #N: title`.
+pub fn parse_fj_created(text: &str) -> Option<u64> {
+    let rest = text.split("pull request #").nth(1)?;
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
+impl PrPublisher for Fj {
+    fn find_open(&self, repo: &str, branch: &str) -> Result<Option<u64>> {
+        let slug = slug(repo);
+        let found = self.run(&["pr", "search", "--repo", &slug, "--state", "open"])?;
+        for n in parse_fj_search(&found) {
+            let view = self.run(&["pr", "view", &format!("{slug}#{n}")])?;
+            if parse_fj_view_head(&view).as_deref() == Some(branch) {
+                return Ok(Some(n));
+            }
+        }
+        Ok(None)
+    }
+
+    fn create(&self, repo: &str, base: &str, head: &str, title: &str, body: &str) -> Result<u64> {
+        let dir = crate::tempdir::TempDir::new("swl-publish")?;
+        let body_file = dir.path().join("body.md");
+        std::fs::write(&body_file, body)?;
+        let out = self.run(&[
+            "pr",
+            "create",
+            "--repo",
+            &slug(repo),
+            "--base",
+            base,
+            "--head",
+            head,
+            "--body-file",
+            &body_file.to_string_lossy(),
+            title,
+        ])?;
+        match parse_fj_created(&out) {
+            Some(n) => Ok(n),
+            None => self.find_open(repo, head)?.ok_or_else(|| {
+                anyhow!("fj pr create printed no MR number and none is found for {head}: {out}")
+            }),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,6 +312,26 @@ mod tests {
         );
         assert!(api(r#"{"number":2,"state":"weird","merged":false,"head":{"sha":"a"}}"#).is_err());
         assert!(api(r#"{"state":"open"}"#).is_err());
+    }
+
+    #[test]
+    fn fj_output() {
+        assert_eq!(
+            parse_fj_search(
+                "2 pull requests\n#41: devshell: watch (SL-0055) (by u)\n#7: x: y (by u)\n"
+            ),
+            [41, 7]
+        );
+        assert!(parse_fj_search("Page 1 out of 0 pages in total (0 pull requests)\n").is_empty());
+        let view =
+            "swl v0: x #24\nBy u — Open — +1 -0\nFrom `sl-0036-swl` into `master`\n\n> body\n";
+        assert_eq!(parse_fj_view_head(view).as_deref(), Some("sl-0036-swl"));
+        assert_eq!(parse_fj_view_head("From me\n"), None);
+        assert_eq!(
+            parse_fj_created("created pull request #25: WIP: swl: x\n"),
+            Some(25)
+        );
+        assert_eq!(parse_fj_created("nothing"), None);
     }
 
     #[test]
