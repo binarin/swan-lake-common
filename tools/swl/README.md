@@ -1,6 +1,6 @@
 # swl
 
-Cross-repo workspaces for Swan Lake (SL-0036), version 0. `swl` creates
+Cross-repo workspaces for Swan Lake, version 0. `swl` creates
 checkouts side by side, points the consumers' flake inputs at them with
 `--override-input … git+file://…`, and wraps `nix`, `nh` and `deploy` so that
 builds and deploys from the dev shell use the same overrides. It never writes a
@@ -58,7 +58,10 @@ swl shim nix --workspace <ws> -- ARGS…    # what the wrappers run
 The repos config is `--config FILE`, else `$SWL_CONFIG`, else
 `$XDG_CONFIG_HOME/swl/repos.toml` (`~/.config/swl/repos.toml`). A missing file
 at the default location means an empty config: the shim and `env` still work,
-but `ws add` needs the repos listed.
+but `ws add` needs the repos listed. A file named by `--config` or
+`$SWL_CONFIG` must exist. When `env` runs with one of them, the wrappers pass
+it on as `--config <absolute path>`, so the shim uses the same config as the
+`.envrc.local` files.
 
 ```toml
 # Optional. Flake URLs that name the repo {repo}; these are the defaults.
@@ -121,7 +124,8 @@ export SWAN_LAKE_OVERRIDES='common←swan-lake-common@common common/zwanenzang�
 ```
 
 Each wrapper is one `exec` of this `swl` by its absolute path, so the
-consumers' dev shells need no change:
+consumers' dev shells need no change (with `--config FILE` before `shim` when
+the config was chosen explicitly):
 
 ```sh
 #!/bin/sh
@@ -133,7 +137,7 @@ exec /nix/store/…-swl-0.1.0/bin/swl shim nix --workspace /ws -- "$@"
 
 The shim finds the real tool on `PATH`. It skips the workspace's `.swl/bin`
 and any other file that carries the generated marker. It prints nothing on
-stderr except when it refuses a call. Set `SWL_SHIM_LOG=FILE` to append one
+stderr except when it refuses a call (exit 1) or fails (`swl: …`, exit 2). Set `SWL_SHIM_LOG=FILE` to append one
 line per call: the tool, the action and the arguments.
 
 `nix`:
@@ -146,7 +150,7 @@ line per call: the tool, the action and the arguments.
 
   Everything else passes through unchanged.
 - Calls whose installables are all store paths pass through untouched. This
-  covers `/nix/store/…`, `…^out`, and `result` links into the store. So do
+  covers `/nix/store/…`, `…^out`, and `./result` links into the store. So do
   `--expr` and `--file` calls.
 - Overrides apply only when an installable is a local flake reference (`.`,
   a path, `path:` or `git+file:`) whose flake directory is a checkout of the
@@ -158,7 +162,9 @@ line per call: the tool, the action and the arguments.
   are.
 - While overrides apply, the shim refuses `nix flake lock`, `nix flake update`,
   `--commit-lock-file`, `--recreate-lock-file`, `--update-input` and
-  `--output-lock-file`. Outside the workspace these pass through.
+  `--output-lock-file`. Outside the workspace these pass through. Options are
+  read up to `--`, also after the installable of `nix run`, as Nix does;
+  only the positional words after it belong to the program.
 
 `nh` passes through, except that nh 4.4.2's lock-update flags are refused:
 `-u/--update`, `-U/--update-input`, `--recreate-lock-file` and

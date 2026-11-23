@@ -64,7 +64,9 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum WsCommands {
-    /// Add a worktree checkout: <consumer> or <repo>@<input>
+    // In `about`, not a doc comment, so that rustdoc does not read the
+    // placeholders as HTML tags.
+    #[command(about = "Add a worktree checkout: <consumer> or <repo>@<input>")]
     Add {
         name: String,
         /// Check out this branch, creating it at the repo's base if missing [default: detached at the base]
