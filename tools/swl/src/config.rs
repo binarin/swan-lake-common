@@ -26,6 +26,9 @@ pub struct Config {
     url_patterns: Option<Vec<String>>,
     #[serde(default)]
     repos: BTreeMap<String, RepoConfig>,
+    /// The file read and where its path came from; `None` for no file.
+    #[serde(skip)]
+    source: Option<(PathBuf, ConfigSource)>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -46,35 +49,59 @@ impl RepoConfig {
     }
 }
 
+/// Where the config path came from: only the default location may be
+/// missing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigSource {
+    Flag,
+    Env,
+    Default,
+}
+
 /// `--config`, else `$SWL_CONFIG`, else `$XDG_CONFIG_HOME/swl/repos.toml`
 /// (`~/.config/swl/repos.toml`).
-pub fn config_path(flag: Option<&Path>) -> Option<PathBuf> {
+pub fn config_path(flag: Option<&Path>) -> Option<(PathBuf, ConfigSource)> {
     if let Some(p) = flag {
-        return Some(p.to_path_buf());
+        return Some((p.to_path_buf(), ConfigSource::Flag));
     }
     if let Some(p) = env::var_os("SWL_CONFIG").filter(|p| !p.is_empty()) {
-        return Some(PathBuf::from(p));
+        return Some((PathBuf::from(p), ConfigSource::Env));
     }
     let base = env::var_os("XDG_CONFIG_HOME")
         .filter(|p| !p.is_empty())
         .map(PathBuf::from)
         .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
-    Some(base.join("swl/repos.toml"))
+    Some((base.join("swl/repos.toml"), ConfigSource::Default))
 }
 
 impl Config {
     /// Loads the config; a missing file at the default location is an empty
-    /// config, so the shim works without one.
+    /// config, so the shim works without one. A path given by `--config` or
+    /// `$SWL_CONFIG` must exist.
     pub fn load(flag: Option<&Path>) -> Result<Self> {
-        let Some(path) = config_path(flag) else {
+        let Some((path, source)) = config_path(flag) else {
             return Ok(Self::default());
         };
-        match fs::read_to_string(&path) {
-            Ok(text) => Self::parse(&text).with_context(|| format!("config {}", path.display())),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound && flag.is_none() => {
-                Ok(Self::default())
+        let path = std::path::absolute(&path).unwrap_or(path);
+        let mut config = match fs::read_to_string(&path) {
+            Ok(text) => Self::parse(&text).with_context(|| format!("config {}", path.display()))?,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound && source == ConfigSource::Default =>
+            {
+                Self::default()
             }
-            Err(e) => Err(e).with_context(|| format!("reading config {}", path.display())),
+            Err(e) => return Err(e).with_context(|| format!("reading config {}", path.display())),
+        };
+        config.source = Some((path, source));
+        Ok(config)
+    }
+
+    /// The absolute config path when it was chosen explicitly (`--config` or
+    /// `$SWL_CONFIG`), for the wrappers to pass on to the shim.
+    pub fn explicit_path(&self) -> Option<&Path> {
+        match &self.source {
+            Some((path, ConfigSource::Flag | ConfigSource::Env)) => Some(path),
+            _ => None,
         }
     }
 
@@ -84,11 +111,15 @@ impl Config {
 
     pub fn repo(&self, name: &str) -> Result<&RepoConfig> {
         self.repos.get(name).ok_or_else(|| {
-            anyhow!("repo {name:?} is not in the swl config (add a [repos.{name}] table)")
+            let read = match &self.source {
+                Some((path, _)) => path.display().to_string(),
+                None => "no config path".to_string(),
+            };
+            anyhow!("repo {name:?} is not in the swl config {read} (add a [repos.{name}] table)")
         })
     }
 
-    /// Whether `url` (a flake URL, as built by [`lock_node_urls`]) names `repo`.
+    /// Whether `url` (a flake URL, as built by [`crate::lock::Node::urls`]) names `repo`.
     pub fn url_names_repo(&self, url: &str, repo: &str) -> bool {
         let url = normalize_url(url);
         let patterns: Vec<&str> = match &self.url_patterns {
@@ -171,5 +202,22 @@ urls = ["git+https://example.org/zw-mirror"]
     #[test]
     fn unknown_keys_are_errors() {
         assert!(Config::parse("[repos.x]\nsource = \"/x\"\nbranch = \"m\"\n").is_err());
+    }
+
+    #[test]
+    fn an_explicit_config_must_exist_and_is_passed_on() {
+        let dir = env::temp_dir().join(format!("swl-config-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let missing = dir.join("missing.toml");
+        let err = Config::load(Some(&missing)).unwrap_err();
+        assert!(format!("{err:#}").contains("missing.toml"), "{err:#}");
+        let file = dir.join("repos.toml");
+        fs::write(&file, "[repos.zw]\nsource = \"/srv/zw\"\n").unwrap();
+        let config = Config::load(Some(&file)).unwrap();
+        assert_eq!(config.explicit_path(), Some(file.as_path()));
+        let err = config.repo("other").unwrap_err().to_string();
+        assert!(err.contains(&file.display().to_string()), "{err}");
+        assert_eq!(Config::default().explicit_path(), None);
+        fs::remove_dir_all(&dir).unwrap();
     }
 }
