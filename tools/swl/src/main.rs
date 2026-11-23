@@ -3,9 +3,11 @@ mod check;
 mod ci;
 mod config;
 mod env;
+mod finalize;
 mod forge;
 mod git;
 mod lock;
+mod lock_change;
 mod manifest;
 mod nix;
 mod nix_args;
@@ -16,7 +18,7 @@ mod tempdir;
 mod workspace;
 mod ws_add;
 
-use std::{ffi::OsString, path::PathBuf, process::ExitCode};
+use std::{ffi::OsString, path::PathBuf, process::ExitCode, time::Duration};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -58,6 +60,20 @@ enum Commands {
         /// Workspace directory [default: current directory]
         #[arg(long, value_name = "DIR")]
         workspace: Option<PathBuf>,
+    },
+    /// Commit, on the consumer's branch, the relock of the swl.toml entries that have landed
+    Finalize {
+        /// The consumer repo [default: current directory]
+        dir: Option<PathBuf>,
+        /// Wait until every merged entry is promoted (and mirrored), up to --timeout
+        #[arg(long)]
+        wait: bool,
+        /// Seconds to wait with --wait
+        #[arg(long, default_value_t = 300, value_name = "SECONDS")]
+        timeout: u64,
+        /// Seconds between checks with --wait
+        #[arg(long, default_value_t = 10, value_name = "SECONDS")]
+        interval: u64,
     },
     /// CI gate: on an MR, flake.lock unchanged and swl.toml valid; on master, no swl.toml and the pin policy
     Check {
@@ -162,6 +178,18 @@ fn run(cli: Cli) -> Result<ExitCode> {
         Commands::Status { workspace } => {
             let config = Config::load(config_flag)?;
             status::run(&Workspace::scan(&workspace_dir(workspace)?)?, &config)?;
+        }
+        Commands::Finalize {
+            dir,
+            wait,
+            timeout,
+            interval,
+        } => {
+            let wait = wait.then(|| finalize::Wait {
+                timeout: Duration::from_secs(timeout),
+                interval: Duration::from_secs(interval),
+            });
+            return finalize::run(&workspace_dir(dir)?, wait, &AnonApi::from_env());
         }
         Commands::Check { dir, event, base } => {
             let config = Config::load(config_flag)?;

@@ -83,6 +83,58 @@ impl Manifest {
     pub fn is_empty(&self) -> bool {
         self.inputs.is_empty()
     }
+
+    /// The file contents, in a fixed form: a header comment, then the tables
+    /// sorted by input path.
+    pub fn render(&self) -> String {
+        let mut s = String::from(
+            "# Pending shared-repo MRs for this branch, written by `swl publish`.\n\
+             # `swl finalize` removes the entries that have landed; master has no swl.toml.\n",
+        );
+        for (path, e) in &self.inputs {
+            s.push_str(&format!(
+                "\n[inputs.{}]\nrepo = {}\nmr = {}\n",
+                toml_key(path),
+                toml_string(&e.repo),
+                e.mr
+            ));
+        }
+        s
+    }
+
+    /// Writes the manifest, or removes the file when it is empty. Returns
+    /// whether the file changed.
+    pub fn write(&self, root: &Path) -> Result<bool> {
+        let path = root.join(MANIFEST_FILE);
+        if self.is_empty() {
+            return match fs::remove_file(&path) {
+                Ok(()) => Ok(true),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Err(e) => Err(e).with_context(|| format!("removing {}", path.display())),
+            };
+        }
+        let text = self.render();
+        if fs::read_to_string(&path).is_ok_and(|old| old == text) {
+            return Ok(false);
+        }
+        fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
+        Ok(true)
+    }
+}
+
+fn toml_string(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+fn toml_key(k: &str) -> String {
+    if !k.is_empty()
+        && k.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        k.to_string()
+    } else {
+        toml_string(k)
+    }
 }
 
 #[cfg(test)]
@@ -111,10 +163,6 @@ mr = 7
         );
         assert_eq!(m.inputs["common/zwanenzang"].mr, 7);
         assert_eq!(Manifest::parse("").unwrap(), Manifest::default());
-        let dir = std::env::temp_dir().join(format!("swl-manifest-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        assert_eq!(Manifest::read(&dir).unwrap(), None);
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -134,5 +182,30 @@ mr = 7
         ] {
             assert!(Manifest::parse(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn render_round_trips_and_quotes_nested_paths() {
+        let m = Manifest::parse(TEXT).unwrap();
+        let text = m.render();
+        assert!(text.contains("\n[inputs.common]\nrepo = \"swan-lake-common\"\nmr = 24\n"));
+        assert!(text.contains("\n[inputs.\"common/zwanenzang\"]\nrepo = \"zwanenzang\"\nmr = 7\n"));
+        assert_eq!(Manifest::parse(&text).unwrap(), m);
+    }
+
+    #[test]
+    fn write_and_remove() {
+        let dir = std::env::temp_dir().join(format!("swl-manifest-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        assert_eq!(Manifest::read(&dir).unwrap(), None);
+        let mut m = Manifest::parse(TEXT).unwrap();
+        assert!(m.write(&dir).unwrap());
+        assert!(!m.write(&dir).unwrap());
+        assert_eq!(Manifest::read(&dir).unwrap(), Some(m.clone()));
+        m.inputs.clear();
+        assert!(m.write(&dir).unwrap());
+        assert!(!dir.join(MANIFEST_FILE).exists());
+        assert!(!m.write(&dir).unwrap());
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

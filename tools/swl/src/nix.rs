@@ -1,5 +1,5 @@
 //! Calls to the real `nix` (never a swl wrapper): evaluating a flake's input
-//! declarations and parsing flake references.
+//! declarations, parsing flake references, and relocking.
 
 use std::{
     collections::BTreeMap,
@@ -78,5 +78,23 @@ impl Nix {
             serde_json::to_string(url)?
         ))
         .with_context(|| format!("parsing the flake reference {url:?}"))
+    }
+
+    /// `nix flake update INPUTS --flake ROOT`, writing the new lock to
+    /// `output` instead of the flake's `flake.lock`. `--refresh` so that a
+    /// moved branch, such as a fresh promotion, is seen.
+    pub fn update_to(&self, root: &Path, inputs: &[String], output: &Path) -> Result<()> {
+        let root_s = root.to_string_lossy();
+        let output_s = output.to_string_lossy();
+        let mut args = vec!["flake", "update"];
+        args.extend(inputs.iter().map(String::as_str));
+        args.extend([
+            "--flake",
+            &root_s,
+            "--output-lock-file",
+            &output_s,
+            "--refresh",
+        ]);
+        self.run(&args).map(drop)
     }
 }
