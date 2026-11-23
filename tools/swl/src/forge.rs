@@ -20,6 +20,9 @@ pub const FORGE_OWNER: &str = "binarin";
 
 /// Overrides the API base, `https://<host>/api/v1`, e.g. for tests.
 pub const API_ENV: &str = "SWL_FORGE_API";
+/// Overrides the git base that CI fetches `refs/pull/N/head` from,
+/// `https://<host>`; the repo URL is `<base>/<owner>/<repo>`.
+pub const GIT_ENV: &str = "SWL_FORGE_GIT";
 
 pub fn api_base() -> String {
     env::var(API_ENV)
@@ -28,9 +31,26 @@ pub fn api_base() -> String {
         .unwrap_or_else(|| format!("https://{FORGE_HOST}/api/v1"))
 }
 
+pub fn git_base() -> String {
+    env::var(GIT_ENV)
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| format!("https://{FORGE_HOST}"))
+}
+
 /// `owner/repo` on the forge.
 pub fn slug(repo: &str) -> String {
     format!("{FORGE_OWNER}/{repo}")
+}
+
+/// The flake URL CI overrides an input with: the MR's head ref, pinned to
+/// the head commit so that the whole job builds one revision.
+pub fn pull_head_url(repo: &str, number: u64, head_sha: &str) -> String {
+    format!(
+        "git+{}/{}?ref=refs/pull/{number}/head&rev={head_sha}",
+        git_base().trim_end_matches('/'),
+        slug(repo)
+    )
 }
 
 /// What the API says about an MR.
@@ -194,5 +214,16 @@ mod tests {
         );
         assert!(api(r#"{"number":2,"state":"weird","merged":false,"head":{"sha":"a"}}"#).is_err());
         assert!(api(r#"{"state":"open"}"#).is_err());
+    }
+
+    #[test]
+    fn pull_head_urls() {
+        // The default applies only without SWL_FORGE_GIT.
+        if env::var_os(GIT_ENV).is_none() {
+            assert_eq!(
+                pull_head_url("swan-lake-common", 24, "72f1eec"),
+                "git+https://forgejo.lynx-lizard.ts.net/binarin/swan-lake-common?ref=refs/pull/24/head&rev=72f1eec"
+            );
+        }
     }
 }

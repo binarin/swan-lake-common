@@ -14,6 +14,7 @@ use anyhow::{Context, Result, anyhow};
 use clap::ValueEnum;
 
 use crate::{
+    ci::CI_MARKER,
     config::Config,
     env::GENERATED_MARKER,
     nix_args::{InstallablesCall, NixCall, classify_nix, nh_lock_flag},
@@ -100,6 +101,26 @@ pub fn run(
         Tool::Deploy => Action::Pass,
     };
     finish(tool, &real, action, &args, &text)
+}
+
+/// The `nix` wrapper of `swl ci env`: the fixed `overrides` for the flake
+/// in `flake_dir` only, with the same classification and refusals as the
+/// workspace shim. The real nix is the first on PATH without a swl marker.
+pub fn run_ci(flake_dir: &Path, overrides: OverrideArgs, args: Vec<OsString>) -> Result<ExitCode> {
+    let real = find_real_tool("nix", None)?;
+    let flake_dir = flake_dir
+        .canonicalize()
+        .with_context(|| format!("flake {}", flake_dir.display()))?;
+    let text = args_text(&args);
+    let cwd = env::current_dir().context("current directory")?;
+    let action = nix_action(&text, &cwd, &|dirs| {
+        Ok(if dirs.contains(&flake_dir) {
+            overrides.clone()
+        } else {
+            Vec::new()
+        })
+    })?;
+    finish(Tool::Nix, &real, action, &args, &text)
 }
 
 fn args_text(args: &[OsString]) -> Vec<String> {
@@ -349,8 +370,10 @@ fn is_swl_wrapper(path: &Path) -> bool {
     let n = fs::File::open(path)
         .and_then(|mut f| f.read(&mut head))
         .unwrap_or(0);
-    let marker = GENERATED_MARKER.as_bytes();
-    head[..n].windows(marker.len()).any(|w| w == marker)
+    [GENERATED_MARKER, CI_MARKER].iter().any(|marker| {
+        let marker = marker.as_bytes();
+        head[..n].windows(marker.len()).any(|w| w == marker)
+    })
 }
 
 fn log_call(tool: Tool, action: &Action, args: &[String]) {

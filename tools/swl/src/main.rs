@@ -1,5 +1,6 @@
 mod ancestry;
 mod check;
+mod ci;
 mod config;
 mod env;
 mod forge;
@@ -69,12 +70,37 @@ enum Commands {
         #[arg(long, value_name = "REV")]
         base: Option<String>,
     },
+    /// Commands for CI jobs
+    Ci {
+        #[command(subcommand)]
+        command: CiCommands,
+    },
     /// Run the real tool with the workspace's overrides and guards (used by the wrappers)
     Shim {
         tool: Tool,
         #[arg(long, value_name = "DIR")]
         workspace: PathBuf,
         /// Arguments for the tool
+        #[arg(last = true, allow_hyphen_values = true)]
+        args: Vec<OsString>,
+    },
+}
+
+#[derive(Subcommand)]
+enum CiCommands {
+    /// Put a nix wrapper on $GITHUB_PATH that overrides the swl.toml inputs with the MRs' heads
+    Env {
+        /// The repo CI checked out [default: current directory]
+        dir: Option<PathBuf>,
+    },
+    /// What the wrapper of `ci env` runs
+    #[command(hide = true)]
+    Shim {
+        #[arg(long, value_name = "DIR")]
+        flake: PathBuf,
+        #[arg(long = "override", num_args = 2, value_names = ["INPUT", "URL"])]
+        overrides: Vec<String>,
+        /// Arguments for nix
         #[arg(last = true, allow_hyphen_values = true)]
         args: Vec<OsString>,
     },
@@ -94,6 +120,12 @@ enum WsCommands {
         #[arg(long, value_name = "DIR")]
         workspace: Option<PathBuf>,
     },
+}
+
+fn current_exe() -> Result<PathBuf> {
+    std::env::current_exe()
+        .and_then(|p| p.canonicalize())
+        .context("locating the swl executable")
 }
 
 fn workspace_dir(flag: Option<PathBuf>) -> Result<PathBuf> {
@@ -125,10 +157,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
         Commands::Env { workspace, force } => {
             let config = Config::load(config_flag)?;
             let ws = Workspace::scan(&workspace_dir(workspace)?)?;
-            let swl = std::env::current_exe()
-                .and_then(|p| p.canonicalize())
-                .context("locating the swl executable")?;
-            env::run(&ws, &config, &swl, force)?;
+            env::run(&ws, &config, &current_exe()?, force)?;
         }
         Commands::Status { workspace } => {
             let config = Config::load(config_flag)?;
@@ -143,6 +172,25 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 &config,
                 &AnonApi::from_env(),
             );
+        }
+        Commands::Ci {
+            command: CiCommands::Env { dir },
+        } => {
+            return ci::run_env(&workspace_dir(dir)?, &AnonApi::from_env(), &current_exe()?);
+        }
+        Commands::Ci {
+            command:
+                CiCommands::Shim {
+                    flake,
+                    overrides,
+                    args,
+                },
+        } => {
+            let pairs = overrides
+                .chunks(2)
+                .map(|p| (p[0].clone(), p[1].clone()))
+                .collect();
+            return shim::run_ci(&flake, pairs, args);
         }
         Commands::Shim {
             tool,
