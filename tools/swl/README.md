@@ -1,12 +1,16 @@
 # swl
 
-Cross-repo workspaces for Swan Lake, version 0. `swl` creates
-checkouts side by side, points the consumers' flake inputs at them with
+Cross-repo workspaces for Swan Lake. `swl` creates checkouts side by side,
+points the consumers' flake inputs at them with
 `--override-input … git+file://…`, and wraps `nix`, `nh` and `deploy` so that
-builds and deploys from the dev shell use the same overrides. It never writes a
-`flake.lock`.
+builds and deploys from the dev shell use the same overrides. In a workspace
+it never writes a `flake.lock`.
 
-Manifests, `plan`, `land`, the CI lock check and MR state are not part of v0.
+A consumer branch that depends on unmerged shared-repo changes names their
+MRs in a manifest, `swl.toml`. `swl publish` pushes the work and writes the
+manifest, CI builds against the MRs' heads (`swl ci env`) and gates MRs and
+master (`swl check`), and `swl finalize` turns landed entries into a lock
+bump. `plan` and `land` (the lander) are not part of swl yet.
 
 ## Workspace layout
 
@@ -30,6 +34,10 @@ swl ws add swan-lake-common@common --branch sl-0036-x
 swl env                                   # .envrc.local per consumer, and the wrappers
 swl status                                # local state of the shared checkouts
 swl shim nix --workspace <ws> -- ARGS…    # what the wrappers run
+swl publish swan-lake                     # push, open MRs, write swl.toml
+swl check                                 # CI: the MR or master gate
+swl ci env                                # CI: nix wrapper with the MR overrides
+swl finalize [--wait]                     # landed entries -> one lock commit
 ```
 
 `ws add`, `env` and `status` use the current directory as the workspace unless
@@ -52,6 +60,9 @@ swl shim nix --workspace <ws> -- ARGS…    # what the wrappers run
   prints one line for each flake in the workspace that it overrides: the input
   path, the rev that flake's own `flake.lock` locks, and ahead/behind of HEAD
   against that rev. It uses local git only.
+
+`publish`, `check`, `ci env` and `finalize` are described under
+[Manifest and landing](#manifest-and-landing).
 
 ## Config
 
@@ -173,10 +184,210 @@ line per call: the tool, the action and the arguments.
 `deploy` passes through. Its nix calls go through the `nix` wrapper. A policy
 for deploying overrides to a real host is for later.
 
+## Manifest and landing
+
+### `swl.toml`
+
+A repo's branch lists the shared-repo MRs it depends on in `swl.toml` at its
+root, one table per input path:
+
+```toml
+[inputs.common]
+repo = "swan-lake-common"
+mr = 24
+
+[inputs."common/zwanenzang"]   # nested input paths are quoted
+repo = "zwanenzang"
+mr = 7
+```
+
+- An entry has exactly `repo` (the shared repo's name on the forge, owner
+  `binarin`) and `mr` (its pull request number). Unknown keys, a missing key,
+  a non-positive `mr` or a malformed input path are errors.
+- No branch names: an entry follows the MR, so it survives rebases and the
+  deletion of the branch on merge.
+- An absent file means nothing is pending. Master never has one.
+- `publish` and `finalize` rewrite the file in a fixed form: a header
+  comment, then the tables sorted by input path. Hand-added comments are
+  not kept.
+- The format and code are not specific to consumers; a shared repo such as
+  common can have a manifest for its own inputs (zwanenzang, the forks).
+
+Rules shared by all commands: an MR must not change `flake.lock` (CI
+enforces it); lock changes reach master only through `swl finalize` (for
+manifest entries) or by hand (routine bumps). A branch with entries is
+landed, not merged through the forge.
+
+### `swl publish [--workspace DIR] <consumer>`
+
+From a workspace, for the consumer checkout `<consumer>`:
+
+1. For each shared checkout that overrides one of the consumer's inputs and
+   whose HEAD differs from the rev the consumer locks: push its branch to
+   `origin`, fast-forward only. A HEAD already in the repo's base (config
+   `base`, default `origin/master`) is a lock bump, not an MR, and is skipped.
+2. Find the open MR whose head is that branch (`fj pr search` and
+   `fj pr view`), or open one as a draft (`fj pr create`, title `WIP: ` and
+   the first commit's subject, body the commit list), into the base branch.
+3. Write `mr = N` entries for its input paths into the consumer's
+   `swl.toml` and commit only that file on the consumer branch
+   (`swl: manifest for swan-lake-common#24`).
+4. Push the consumer branch and find or open its MR (not a draft; the body
+   lists the dependencies).
+
+Everything is checked before anything is pushed. Refused: a detached HEAD,
+uncommitted changes to tracked files, and a branch on `origin` that HEAD
+does not contain (swl never force-pushes; fetch and rebase or merge). So a
+manifest never names unpushed commits. Rerunning finds the existing MRs,
+leaves a current manifest alone and pushes only new commits. Entries are
+added or updated, never removed by `publish`.
+
+Forge access is only through `fj`, which must be on PATH and logged in
+(`fj auth`); swl has no token configuration. swl parses fj 0.7's English
+output, and passes `-H forgejo.lynx-lizard.ts.net`. The workspace's checkouts
+fetch nothing here; `ls-remote` reads the remote branch state. Fetch the base
+first if it may be stale.
+
+### `swl check [DIR] [--event mr|master] [--base REV]`
+
+The CI gate, in the repo at or above `DIR` (default: the current directory).
+Exit status 1 with one line per problem.
+
+- `--event` defaults from the Forgejo Actions environment:
+  `GITHUB_EVENT_NAME=pull_request` is `mr`; `push` with
+  `GITHUB_REF=refs/heads/master` is `master`; anything else needs `--event`.
+- On an MR:
+  - `flake.lock` at HEAD equals the one at the merge base of HEAD and the
+    base: `--base REV`, else `origin/$GITHUB_BASE_REF`, which `check`
+    fetches (`--unshallow` in a shallow checkout; `fetch-depth: 0` is
+    better).
+  - `swl.toml`, if present, parses, and for each entry: the input is that
+    repo (its lock node's URL by the config's URL patterns, or for a root
+    input not yet in the lock, its `flake.nix` URL), and the MR exists and is
+    open or merged (anonymous API).
+- On master:
+  - there is no `swl.toml`;
+  - the common pin policy, ported from `check-common-pin`: `common` is
+    exactly `github:binarin/swan-lake-common/swan-lake-current` in
+    `flake.nix` and canonical in the lock (full rev, SHA256 NAR hash, no extra
+    source options); every `common-next` or `common-next-<label>` input is a
+    plain URL at any ref or rev of swan-lake-common (GitHub or Forgejo),
+    matching its lock node. For each, an informational line says whether it
+    is based on the locked `common`; offline that is "cannot determine", not
+    a failure. A flake with neither `common` nor an experiment input skips
+    the policy.
+
+`check` reads `flake.nix` with `nix eval --impure` (no input is fetched) and
+uses the real `nix` on PATH, never a swl wrapper.
+
+### `swl ci env [DIR]`
+
+For a CI job, in the repo it checked out. For each manifest entry it asks
+the anonymous API for the MR's state:
+
+- open: override the input with the MR's head;
+- merged: the same, and a note that the entry can land;
+- closed without merging, no such MR, or the API unreachable: exit 1, and
+  nothing is written.
+
+It then writes a `nix` wrapper into a new directory under `$RUNNER_TEMP`
+(else the temp directory) and appends that directory to `$GITHUB_PATH`, so
+the job's later steps call it, whatever tool calls nix. Without
+`$GITHUB_PATH` it prints the `export PATH=…` line to use. The wrapper adds
+
+```
+--override-input common 'git+https://forgejo.lynx-lizard.ts.net/binarin/swan-lake-common?ref=refs/pull/24/head&rev=<head sha>'
+```
+
+pinned to the head the API reported, so the whole job builds one revision. It
+applies the shim's rules: only to the checked-out flake (`.`, a path, or
+`git+file:` of it), store-path calls untouched, `--no-write-lock-file`
+added, and the lock-writing commands and flags refused. Run `swl check`
+before `swl ci env`, or in another job: after it, `nix run .#swl` would
+evaluate the MR's common.
+
+A consumer's CI, sketched (the switch-over is a separate MR per consumer):
+
+```yaml
+jobs:
+  swl-check:
+    runs-on: native
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+      - run: nix run .#swl -- check
+  flake-check:
+    runs-on: native
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - run: nix run .#swl -- ci env
+      - run: nix flake check
+```
+
+`nix run .#swl` takes swl from the consumer's locked common, through
+common's `flakeModules.default` (or `flakeModules.swl` alone). A common MR
+that changes swl is therefore tested with the previous swl.
+
+### `swl finalize [DIR] [--wait [--timeout S] [--interval S]]`
+
+On the consumer's MR branch, after shared MRs have merged:
+
+1. For each entry, the MR state (anonymous API). Open, closed or unknown
+   entries stay.
+2. For merged entries, relock their root inputs with the real `nix flake
+   update <inputs> --refresh`, into a scratch lock. What the input's
+   `flake.nix` URL resolves to decides: for `common`, `swan-lake-current` on
+   GitHub, so the change must be promoted and mirrored. An entry is satisfied
+   when its MR's merge commit is in the history of the rev now locked at its
+   input path (asked of that source by a history-only fetch). A nested entry
+   (`common/zwanenzang`) is satisfied through its parent's relock.
+3. Only root inputs with a satisfied entry are relocked. The new lock may
+   differ from the old one only below those inputs: other nodes and root
+   edges, other inputs' graphs (shared nodes included) and new nodes are
+   checked, as finalize-common did, and the result must pass the pin policy.
+4. One commit on the current branch, of `flake.lock` and `swl.toml` only
+   (satisfied entries removed, the file deleted when empty):
+   `swl: land swan-lake-common#24 (common)`, with the old and new revs in the
+   body. Nothing is pushed.
+
+It refuses a detached HEAD and uncommitted changes to `flake.nix`,
+`flake.lock` or `swl.toml`. When nothing is satisfied it says why per entry,
+commits nothing and exits 1. `--wait` polls (default every 10 s, for up to
+300 s) while merged entries are not yet reachable, then finalizes what is.
+
+The landing procedure, after `finalize`:
+
+```sh
+git push origin HEAD:master          # fast-forward only: the MR must be based on current master
+git push origin --delete <branch>    # Forgejo marks the MR merged; stacked MRs restack
+```
+
+Master's CI then runs `swl check` on the result. When entries remain,
+`finalize` instead says to push the branch and run it again later.
+
+### Forge access
+
+`check`, `ci env` and `finalize` read MR state anonymously
+(`GET /api/v1/repos/binarin/<repo>/pulls/<n>`, through curl) and CI fetches
+`refs/pull/<n>/head` anonymously. So every repo named in a manifest must be
+public. Should one become private, give CI a dedicated read-only token as a
+secret, through nix `access-tokens` or a netrc for the fetch, and the same for
+the API; Forgejo's automatic Actions token is scoped to the job's own repo
+and is not enough. `publish` uses `fj` and its login.
+
+`SWL_FORGE_API` (default `https://forgejo.lynx-lizard.ts.net/api/v1`) and
+`SWL_FORGE_GIT` (default `https://forgejo.lynx-lizard.ts.net`, the base of
+the override URLs) redirect them, for tests.
+
 ## Limits
 
 - Only checkouts listed directly in the workspace count. An input that is in
-  `flake.nix` but not yet in the lock cannot be derived.
+  `flake.nix` but not yet in the lock cannot be derived by the workspace
+  shim; CI gets it from the manifest.
 - `git+file:` sees tracked files only. Use `git add -N` for new files.
 - Only `.nix` files and the lock of overridden checkouts are watched. After
   changing other sources (for example a Rust tool in common), run
@@ -192,3 +403,10 @@ for deploying overrides to a real host is for later.
 - nh's lock-flag refusal applies to any flake, not only to workspace ones.
 - Not verified: `nh os switch/boot/test` activation, `--build-host`,
   `--target-host`, and deploy-rs `--remote-build`.
+- `publish` parses fj's text output; a different fj version or output
+  language can break it. It opens MRs against the base branch only (no
+  stacked MRs).
+- `finalize`'s history fetch is cheap for swan-lake-common, but would fetch
+  the whole commit history of a large fork such as nixpkgs.
+- `finalize` relocks a root input as a whole: nested entries land when the
+  parent (common) has bumped and promoted them.
