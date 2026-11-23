@@ -98,7 +98,7 @@ pub fn usable_mr(
     let which = format!("{path}: {}#{}", entry.repo, entry.mr);
     match lookup {
         Err(e) => Err(format!("{which}: cannot read the MR state: {e:#}")),
-        Ok(None) => Err(format!("{which}: no such MR")),
+        Ok(None) => Err(format!("{which}: {}", crate::forge::NOT_FOUND)),
         Ok(Some(pr)) => match &pr.state {
             PrState::Open => Ok((pr, None)),
             PrState::Merged { .. } => {

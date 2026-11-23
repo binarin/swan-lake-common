@@ -116,6 +116,10 @@ impl PrInfo {
     }
 }
 
+/// What a 404 from the anonymous API means: Forgejo answers 404 for a
+/// private repo too.
+pub const NOT_FOUND: &str = "no such MR (or the repo is not public)";
+
 /// Reads MR state. `Ok(None)` is an MR that does not exist; an error is a
 /// forge that could not be asked.
 pub trait PrReader {

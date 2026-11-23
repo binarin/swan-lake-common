@@ -291,8 +291,8 @@ the anonymous API for the MR's state:
 
 - open: override the input with the MR's head;
 - merged: the same, and a note that the entry can land;
-- closed without merging, no such MR, or the API unreachable: exit 1, and
-  nothing is written.
+- closed without merging, no such MR (a 404, which a private repo gives
+  too), or the API unreachable: exit 1, and nothing is written.
 
 It then writes a `nix` wrapper into a new directory under `$RUNNER_TEMP`
 (else the temp directory) and appends that directory to `$GITHUB_PATH`, so
@@ -360,7 +360,8 @@ On the consumer's MR branch, after shared MRs have merged:
 
 It refuses a detached HEAD and uncommitted changes to `flake.nix`,
 `flake.lock` or `swl.toml`. When nothing is satisfied it says why per entry,
-commits nothing and exits 1. `--wait` polls (default every 10 s, for up to
+commits nothing and exits 1; so does a `swl.toml` without entries, which
+should be removed. `--wait` polls (default every 10 s, for up to
 300 s) while merged entries are not yet reachable, then finalizes what is.
 
 The landing procedure, after `finalize`:
@@ -370,8 +371,10 @@ git push origin HEAD:master          # fast-forward only: the MR must be based o
 git push origin --delete <branch>    # Forgejo marks the MR merged; stacked MRs restack
 ```
 
-Master's CI then runs `swl check` on the result. When entries remain,
-`finalize` instead says to push the branch and run it again later.
+Master's CI then runs `swl check` on the result. When entries remain, the
+commit (which changes `flake.lock`) must stay local: pushed to the MR branch
+it fails the MR's `swl check`. Rerun `finalize` once the rest has landed,
+then push to master; `swl publish` refuses to push it.
 
 ### Forge access
 

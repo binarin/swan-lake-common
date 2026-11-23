@@ -115,7 +115,7 @@ fn mr_statuses(manifest: &Manifest, api: &dyn PrReader) -> BTreeMap<String, Stat
         .map(|(path, Entry { repo, mr })| {
             let status = match api.pr(repo, *mr) {
                 Err(e) => Status::Pending(format!("cannot read the MR state: {e:#}")),
-                Ok(None) => Status::Pending("no such MR".into()),
+                Ok(None) => Status::Pending(crate::forge::NOT_FOUND.into()),
                 Ok(Some(pr)) => match pr.state {
                     PrState::Open => Status::Pending("the MR is still open".into()),
                     PrState::ClosedUnmerged => {
@@ -260,6 +260,12 @@ pub fn run(dir: &Path, wait: Option<Wait>, api: &dyn PrReader) -> Result<ExitCod
             "commit or discard the changes to flake.nix, flake.lock and {MANIFEST_FILE} first:\n{dirty}"
         );
     }
+    if manifest.is_empty() {
+        println!(
+            "swl finalize: {MANIFEST_FILE} has no entries; remove it (git rm {MANIFEST_FILE}) before landing"
+        );
+        return Ok(ExitCode::from(1));
+    }
     let nix = Nix::find()?;
     let old_bytes = fs::read(root.join("flake.lock")).context("reading flake.lock")?;
     let old: Value = serde_json::from_slice(&old_bytes).context("parsing flake.lock")?;
@@ -356,15 +362,12 @@ pub fn run(dir: &Path, wait: Option<Wait>, api: &dyn PrReader) -> Result<ExitCod
              git push origin --delete {branch}  # Forgejo marks the MR merged; stacked MRs restack"
         );
     } else {
+        let n = manifest.inputs.len();
         println!(
-            "{} entr{} remain in {MANIFEST_FILE}; push the branch (git push origin {branch}) and rerun \
-             swl finalize once they have landed",
-            manifest.inputs.len(),
-            if manifest.inputs.len() == 1 {
-                "y"
-            } else {
-                "ies"
-            }
+            "{n} entr{} remain in {MANIFEST_FILE}. Keep this commit local: pushed to the MR branch, \
+             it fails the MR's swl check, since an MR must not change flake.lock. Rerun swl \
+             finalize once the rest has landed, then push to master.",
+            if n == 1 { "y" } else { "ies" }
         );
     }
     Ok(ExitCode::SUCCESS)
