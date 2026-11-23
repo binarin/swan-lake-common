@@ -33,9 +33,22 @@ fn base_branch(base: &str) -> &str {
     base.strip_prefix("origin/").unwrap_or(base)
 }
 
+/// Brings the remote-tracking ref of an `origin/<branch>` base up to date, so
+/// that the "already in the base" checks see merged work.
+fn fetch_base(c: &Checkout, base: &str) -> Result<()> {
+    if let Some(branch) = base.strip_prefix("origin/") {
+        let refspec = format!("+refs/heads/{branch}:refs/remotes/origin/{branch}");
+        git(
+            &c.dir,
+            &["fetch", "--quiet", "--no-tags", "origin", &refspec],
+        )?;
+    }
+    Ok(())
+}
+
 /// The checkout's branch, refused when its state cannot be published as is:
-/// a detached HEAD, tracked changes, or a branch on origin that HEAD does not
-/// contain (no force-push, ever).
+/// a detached HEAD, the base branch itself, tracked changes, or a branch on
+/// origin that HEAD does not contain (no force-push, ever).
 fn publishable(c: &Checkout, base: &str) -> Result<Branch> {
     let dir = &c.dir;
     let Some(name) = git_ok(dir, &["symbolic-ref", "--quiet", "--short", "HEAD"]) else {
@@ -44,6 +57,13 @@ fn publishable(c: &Checkout, base: &str) -> Result<Branch> {
             c.name
         );
     };
+    if name == base_branch(base) {
+        bail!(
+            "{}: {name} is the base branch; check out a topic branch, swl publish does not push \
+             the base branch",
+            c.name
+        );
+    }
     let dirty = git(dir, &["status", "--porcelain", "--untracked-files=no"])?;
     if !dirty.is_empty() {
         bail!(
@@ -168,6 +188,7 @@ pub fn run(ws: &Workspace, config: &Config, consumer: &str, forge: &dyn PrPublis
             .as_ref()
             .expect("overrides come from shared checkouts");
         let base = config.base_for(repo);
+        fetch_base(checkout, base)?;
         let head = git(&checkout.dir, &["rev-parse", "HEAD"])?;
         if git_ok(&checkout.dir, &["merge-base", "--is-ancestor", &head, base]).is_some() {
             println!(
@@ -179,7 +200,11 @@ pub fn run(ws: &Workspace, config: &Config, consumer: &str, forge: &dyn PrPublis
         let branch = publishable(checkout, base)?;
         shared.push((checkout, repo.as_str(), paths, branch));
     }
+    fetch_base(target, config.base_for(consumer))?;
     publishable(target, config.base_for(consumer))?;
+    if let Some(e) = crate::check::lock_change(&target.dir, config.base_for(consumer))? {
+        bail!("{consumer}: {e}");
+    }
 
     let mut manifest = Manifest::read(&target.dir)?.unwrap_or_default();
     let mut depends = String::new();
@@ -198,7 +223,9 @@ pub fn run(ws: &Workspace, config: &Config, consumer: &str, forge: &dyn PrPublis
             );
         }
     }
-    if manifest.write(&target.dir)? {
+    // Only published entries are written; an existing file is otherwise left
+    // as it is.
+    if !shared.is_empty() && manifest.write(&target.dir)? {
         let names: Vec<String> = manifest
             .inputs
             .values()

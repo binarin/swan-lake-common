@@ -246,7 +246,8 @@ pub fn parse_fj_created(text: &str) -> Option<u64> {
 impl PrPublisher for Fj {
     fn find_open(&self, repo: &str, branch: &str) -> Result<Option<u64>> {
         let slug = slug(repo);
-        let found = self.run(&["pr", "search", "--repo", &slug, "--state", "open"])?;
+        // `--all`: fj shows 25 per page otherwise.
+        let found = self.run(&["pr", "search", "--repo", &slug, "--state", "open", "--all"])?;
         for n in parse_fj_search(&found) {
             let view = self.run(&["pr", "view", &format!("{slug}#{n}")])?;
             if parse_fj_view_head(&view).as_deref() == Some(branch) {

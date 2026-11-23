@@ -225,28 +225,32 @@ From a workspace, for the consumer checkout `<consumer>`:
 1. For each shared checkout that overrides one of the consumer's inputs and
    whose HEAD differs from the rev the consumer locks: push its branch to
    `origin`, fast-forward only. A HEAD already in the repo's base (config
-   `base`, default `origin/master`) is a lock bump, not an MR, and is skipped.
-2. Find the open MR whose head is that branch (`fj pr search` and
+   `base`, default `origin/master`, fetched first) is a lock bump or merged
+   work, not an MR, and is skipped.
+2. Find the open MR whose head is that branch (`fj pr search --all` and
    `fj pr view`), or open one as a draft (`fj pr create`, title `WIP: ` and
    the first commit's subject, body the commit list), into the base branch.
 3. Write `mr = N` entries for its input paths into the consumer's
    `swl.toml` and commit only that file on the consumer branch
-   (`swl: manifest for swan-lake-common#24`).
+   (`swl: manifest for swan-lake-common#24`). With nothing published, an
+   existing `swl.toml` is left as it is.
 4. Push the consumer branch and find or open its MR (not a draft; the body
    lists the dependencies).
 
 Everything is checked before anything is pushed. Refused: a detached HEAD,
-uncommitted changes to tracked files, and a branch on `origin` that HEAD
-does not contain (swl never force-pushes; fetch and rebase or merge). So a
+the base branch itself (publish from a topic branch), a consumer branch that
+changes `flake.lock`, uncommitted changes to tracked files, and a branch on
+`origin` that HEAD does not contain (swl never force-pushes; fetch and rebase or merge). So a
 manifest never names unpushed commits. Rerunning finds the existing MRs,
 leaves a current manifest alone and pushes only new commits. Entries are
 added or updated, never removed by `publish`.
 
 Forge access is only through `fj`, which must be on PATH and logged in
 (`fj auth`); swl has no token configuration. swl parses fj 0.7's English
-output, and passes `-H forgejo.lynx-lizard.ts.net`. The workspace's checkouts
-fetch nothing here; `ls-remote` reads the remote branch state. Fetch the base
-first if it may be stale.
+output, and passes `-H forgejo.lynx-lizard.ts.net`. `publish` fetches each
+checkout's base branch (an `origin/<branch>` base) and reads the remote
+branch state with `ls-remote`; it fetches nothing else. A squash-merged MR is
+not recognised as merged: its commits are not in the base.
 
 ### `swl check [DIR] [--event mr|master] [--base REV]`
 
