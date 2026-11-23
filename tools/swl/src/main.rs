@@ -1,10 +1,17 @@
+mod ancestry;
+mod check;
 mod config;
 mod env;
+mod forge;
 mod git;
 mod lock;
+mod manifest;
+mod nix;
 mod nix_args;
+mod pin_policy;
 mod shim;
 mod status;
+mod tempdir;
 mod workspace;
 mod ws_add;
 
@@ -13,13 +20,13 @@ use std::{ffi::OsString, path::PathBuf, process::ExitCode};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
-use crate::{config::Config, shim::Tool, workspace::Workspace};
+use crate::{check::Event, config::Config, forge::AnonApi, shim::Tool, workspace::Workspace};
 
 #[derive(Parser)]
 #[command(
     name = "swl",
     version,
-    about = "Swan Lake cross-repo workspaces: checkouts, input overrides and the nix/nh/deploy shims"
+    about = "Swan Lake cross-repo workspaces: checkouts, input overrides, the nix/nh/deploy shims, manifests and CI"
 )]
 struct Cli {
     /// Repos config [default: $SWL_CONFIG, else $XDG_CONFIG_HOME/swl/repos.toml]
@@ -50,6 +57,17 @@ enum Commands {
         /// Workspace directory [default: current directory]
         #[arg(long, value_name = "DIR")]
         workspace: Option<PathBuf>,
+    },
+    /// CI gate: on an MR, flake.lock unchanged and swl.toml valid; on master, no swl.toml and the pin policy
+    Check {
+        /// The repo [default: current directory]
+        dir: Option<PathBuf>,
+        /// [default: from GITHUB_EVENT_NAME and GITHUB_REF]
+        #[arg(long)]
+        event: Option<Event>,
+        /// Revision an MR is compared against [default: origin/$GITHUB_BASE_REF, fetched]
+        #[arg(long, value_name = "REV")]
+        base: Option<String>,
     },
     /// Run the real tool with the workspace's overrides and guards (used by the wrappers)
     Shim {
@@ -115,6 +133,16 @@ fn run(cli: Cli) -> Result<ExitCode> {
         Commands::Status { workspace } => {
             let config = Config::load(config_flag)?;
             status::run(&Workspace::scan(&workspace_dir(workspace)?)?, &config)?;
+        }
+        Commands::Check { dir, event, base } => {
+            let config = Config::load(config_flag)?;
+            return check::run(
+                &workspace_dir(dir)?,
+                event,
+                base.as_deref(),
+                &config,
+                &AnonApi::from_env(),
+            );
         }
         Commands::Shim {
             tool,

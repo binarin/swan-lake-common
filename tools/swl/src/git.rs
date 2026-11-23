@@ -3,7 +3,7 @@ use std::{path::Path, process::Command};
 use anyhow::{Context, Result, bail};
 
 /// The git binary: the package sets `SWL_GIT` at build time.
-const GIT: &str = match option_env!("SWL_GIT") {
+pub const GIT: &str = match option_env!("SWL_GIT") {
     Some(g) => g,
     None => "git",
 };

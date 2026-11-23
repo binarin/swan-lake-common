@@ -92,7 +92,9 @@ impl Node {
     }
 }
 
-fn attrs_url(attrs: &Value) -> Option<String> {
+/// A flake source in attribute form (a lock node's `original` or `locked`, or
+/// `builtins.parseFlakeRef` output) as a URL in the config's pattern forms.
+pub fn attrs_url(attrs: &Value) -> Option<String> {
     let s = |k: &str| attrs.get(k).and_then(Value::as_str);
     match s("type")? {
         t @ ("github" | "gitlab" | "sourcehut") => {
