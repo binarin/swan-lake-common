@@ -74,6 +74,9 @@ impl Action {
     }
 }
 
+/// `(input path, flake URL)` pairs for `--override-input`.
+pub type OverrideArgs = Vec<(String, String)>;
+
 pub fn run(
     tool: Tool,
     workspace: &Path,
@@ -81,14 +84,13 @@ pub fn run(
     args: Vec<OsString>,
 ) -> Result<ExitCode> {
     let wrapper_dir = workspace.join(crate::workspace::WRAPPER_DIR);
-    let real = find_real_tool(tool.name(), &wrapper_dir)?;
-    let text: Vec<String> = args
-        .iter()
-        .map(|a| a.to_string_lossy().into_owned())
-        .collect();
+    let real = find_real_tool(tool.name(), Some(&wrapper_dir))?;
+    let text = args_text(&args);
     let cwd = env::current_dir().context("current directory")?;
     let action = match tool {
-        Tool::Nix => nix_action(&text, &cwd, &|| load(workspace, config_flag))?,
+        Tool::Nix => nix_action(&text, &cwd, &|dirs| {
+            workspace_overrides(workspace, config_flag, dirs)
+        })?,
         Tool::Nh => match nh_lock_flag(&text) {
             Some(flag) => Action::Refuse(format!(
                 "nh {flag} updates flake inputs; in a swl workspace, lock changes are the lander's"
@@ -97,7 +99,23 @@ pub fn run(
         },
         Tool::Deploy => Action::Pass,
     };
-    log_call(tool, &action, &text);
+    finish(tool, &real, action, &args, &text)
+}
+
+fn args_text(args: &[OsString]) -> Vec<String> {
+    args.iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect()
+}
+
+fn finish(
+    tool: Tool,
+    real: &Path,
+    action: Action,
+    args: &[OsString],
+    text: &[String],
+) -> Result<ExitCode> {
+    log_call(tool, &action, text);
     match action {
         Action::Refuse(why) => {
             eprintln!(
@@ -112,9 +130,9 @@ pub fn run(
             let mut full: Vec<OsString> = args[..insert_at].to_vec();
             full.extend(extra.into_iter().map(OsString::from));
             full.extend(args[insert_at..].iter().cloned());
-            Err(exec(&real, &full))
+            Err(exec(real, &full))
         }
-        _ => Err(exec(&real, &args)),
+        _ => Err(exec(real, args)),
     }
 }
 
@@ -128,40 +146,49 @@ fn exec(real: &Path, args: &[OsString]) -> anyhow::Error {
     anyhow!(cmd.exec()).context(format!("running {}", real.display()))
 }
 
-fn load(workspace: &Path, config_flag: Option<&Path>) -> Result<(Workspace, Config)> {
-    Ok((Workspace::scan(workspace)?, Config::load(config_flag)?))
+/// The workspace overrides for the flakes in `dirs`; the workspace is read
+/// only here, so store-path calls stay cheap.
+fn workspace_overrides(
+    workspace: &Path,
+    config_flag: Option<&Path>,
+    dirs: &[PathBuf],
+) -> Result<OverrideArgs> {
+    let ws = Workspace::scan(workspace)?;
+    let config = Config::load(config_flag)?;
+    Ok(overrides_for_dirs(&ws, &config, dirs)?
+        .into_iter()
+        .map(|o| (o.input_path.clone(), o.url()))
+        .collect())
 }
 
-/// The decision for a `nix` call made in `cwd`. The workspace is loaded only
-/// when a flake installable needs it, so store-path calls stay cheap.
-fn nix_action(
-    args: &[String],
-    cwd: &Path,
-    load: &dyn Fn() -> Result<(Workspace, Config)>,
-) -> Result<Action> {
+/// Gives the overrides for the local flake directories an installable names.
+type OverridesFor<'a> = dyn Fn(&[PathBuf]) -> Result<OverrideArgs> + 'a;
+
+/// The decision for a `nix` call made in `cwd`. `overrides_for` is called
+/// only when a flake installable needs it.
+fn nix_action(args: &[String], cwd: &Path, overrides_for: &OverridesFor) -> Result<Action> {
     match classify_nix(args) {
         NixCall::Other => Ok(Action::Pass),
         NixCall::LockCommand { flake } => {
             let Some(dir) = flake_ref_dir(&flake, cwd) else {
                 return Ok(Action::NoOverrides);
             };
-            let (ws, config) = load()?;
-            if overrides_for_dirs(&ws, &config, &[dir])?.is_empty() {
+            if overrides_for(&[dir])?.is_empty() {
                 return Ok(Action::NoOverrides);
             }
             Ok(Action::Refuse(
-                "it writes flake.lock while workspace overrides apply; lock changes are the lander's"
+                "it writes flake.lock while swl overrides apply; lock changes are the lander's"
                     .into(),
             ))
         }
-        NixCall::Installables(call) => installables_action(call, cwd, load),
+        NixCall::Installables(call) => installables_action(call, cwd, overrides_for),
     }
 }
 
 fn installables_action(
     call: InstallablesCall,
     cwd: &Path,
-    load: &dyn Fn() -> Result<(Workspace, Config)>,
+    overrides_for: &OverridesFor,
 ) -> Result<Action> {
     if call.not_flake {
         return Ok(Action::Pass);
@@ -188,24 +215,19 @@ fn installables_action(
     if dirs.is_empty() {
         return Ok(Action::NoOverrides);
     }
-    let (ws, config) = load()?;
-    let overrides = overrides_for_dirs(&ws, &config, &dirs)?;
+    let overrides = overrides_for(&dirs)?;
     if overrides.is_empty() {
         return Ok(Action::NoOverrides);
     }
     if let Some(flag) = call.lock_writing_flags.first() {
         return Ok(Action::Refuse(format!(
-            "{flag} writes a lock file while workspace overrides apply; lock changes are the lander's"
+            "{flag} writes a lock file while swl overrides apply; lock changes are the lander's"
         )));
     }
     let mut extra = Vec::new();
-    for o in overrides {
-        if !call.given_overrides.contains(&o.input_path) {
-            extra.extend([
-                "--override-input".to_string(),
-                o.input_path.clone(),
-                o.url(),
-            ]);
+    for (input_path, url) in overrides {
+        if !call.given_overrides.contains(&input_path) {
+            extra.extend(["--override-input".to_string(), input_path, url]);
         }
     }
     if !call.no_write_lock_file {
@@ -295,15 +317,18 @@ fn flake_ref_dir(flake_ref: &str, cwd: &Path) -> Option<PathBuf> {
     find_flake_dir(&dir)
 }
 
-/// The first `name` on PATH that is neither in the workspace's wrapper
-/// directory nor another swl wrapper.
-fn find_real_tool(name: &str, wrapper_dir: &Path) -> Result<PathBuf> {
-    let wrapper_dir = wrapper_dir
-        .canonicalize()
-        .unwrap_or_else(|_| wrapper_dir.to_path_buf());
+/// The first `name` on PATH that is neither in `wrapper_dir` nor a swl
+/// wrapper: the real tool, for the shims and for the commands that must not
+/// go through them.
+pub fn find_real_tool(name: &str, wrapper_dir: Option<&Path>) -> Result<PathBuf> {
+    let wrapper_dir = wrapper_dir.map(|w| w.canonicalize().unwrap_or_else(|_| w.to_path_buf()));
     let path = env::var_os("PATH").unwrap_or_default();
     for dir in env::split_paths(&path) {
-        if dir.as_os_str().is_empty() || dir.canonicalize().is_ok_and(|d| d == wrapper_dir) {
+        if dir.as_os_str().is_empty()
+            || wrapper_dir
+                .as_ref()
+                .is_some_and(|w| dir.canonicalize().is_ok_and(|d| &d == w))
+        {
             continue;
         }
         let candidate = dir.join(name);
@@ -313,10 +338,10 @@ fn find_real_tool(name: &str, wrapper_dir: &Path) -> Result<PathBuf> {
             return Ok(candidate);
         }
     }
-    Err(anyhow!(
-        "no {name} on PATH outside {}",
-        wrapper_dir.display()
-    ))
+    Err(match wrapper_dir {
+        Some(w) => anyhow!("no {name} on PATH outside {}", w.display()),
+        None => anyhow!("no {name} on PATH besides swl wrappers"),
+    })
 }
 
 fn is_swl_wrapper(path: &Path) -> bool {
@@ -360,7 +385,7 @@ mod tests {
         s.split_whitespace().map(str::to_string).collect()
     }
 
-    fn no_workspace() -> Result<(Workspace, Config)> {
+    fn no_workspace(_: &[PathBuf]) -> Result<OverrideArgs> {
         panic!("the workspace must not be loaded for this call")
     }
 
