@@ -199,10 +199,10 @@ pub fn classify_nix(args: &[String]) -> NixCall {
             break;
         }
         if !word.starts_with('-') || word == "-" {
-            call.installables.push(word.to_string());
-            // `nix run INSTALLABLE ARGS...`: the rest belongs to the program.
-            if subcommand == "run" {
-                break;
+            // `nix run INSTALLABLE ARGS...`: later words belong to the
+            // program, but Nix still parses options among them until `--`.
+            if subcommand != "run" || call.installables.is_empty() {
+                call.installables.push(word.to_string());
             }
             j += 1;
             continue;
@@ -340,9 +340,13 @@ mod tests {
         let c = installables("run .#app -- --commit-lock-file");
         assert_eq!(c.installables, [".#app"]);
         assert!(c.lock_writing_flags.is_empty());
+        // Nix parses options after the program's words too, until `--`.
         let c = installables("run .#app arg --recreate-lock-file");
         assert_eq!(c.installables, [".#app"]);
-        assert!(c.lock_writing_flags.is_empty());
+        assert_eq!(c.lock_writing_flags, ["--recreate-lock-file"]);
+        let c = installables("run .#app arg --override-input common git+file:///ws/c x");
+        assert_eq!(c.installables, [".#app"]);
+        assert_eq!(c.given_overrides, ["common"]);
         let c = installables("shell .#a .#b --command nix flake lock");
         assert_eq!(c.installables, [".#a", ".#b"]);
         let c = installables("develop -s K V -k X . -c --commit-lock-file");
