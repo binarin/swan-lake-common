@@ -1,4 +1,12 @@
-{ ... }:
+{ self, lib, ... }:
+let
+  commonSelf = self;
+  mkApp = package: {
+    type = "app";
+    meta.description = "Swan Lake cross-repo workspaces, manifests and CI checks";
+    program = "${package}/bin/swl";
+  };
+in
 {
   perSystem =
     { pkgs, self', ... }:
@@ -42,6 +50,7 @@
           platforms = lib.platforms.linux;
         };
       };
+      apps.swl = mkApp self'.packages.swl;
       checks.swl = self'.packages.swl.overrideAttrs (old: {
         nativeCheckInputs = old.nativeCheckInputs ++ [
           pkgs.rustfmt
@@ -53,4 +62,15 @@
         '';
       });
     };
+
+  # Consumer-facing app, imported by flakeModules.default: `nix run .#swl --
+  # check` and `nix run .#swl -- ci env` in a consumer's CI, with the swl of
+  # the consumer's locked common. A default, so a consumer's own app of the
+  # same name wins.
+  flake.flakeModules.swl = { ... }: {
+    key = "swan-lake-common.modules.flake.swl";
+    perSystem = { system, ... }: {
+      apps.swl = lib.mapAttrsRecursive (_: lib.mkDefault) (mkApp commonSelf.packages.${system}.swl);
+    };
+  };
 }

@@ -12,6 +12,7 @@ in
     imports = [
       commonSelf.flakeModules.configured-pkgs
       commonSelf.flakeModules.common-workflow
+      commonSelf.flakeModules.swl
       inputs.flake-parts.flakeModules.flakeModules
     ];
   };

@@ -6,6 +6,7 @@
         pkgs.python3
         self'.packages.common-workflow
         self'.packages.secretctl
+        self'.packages.swl
       ];
     };
   };
