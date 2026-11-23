@@ -163,10 +163,11 @@ impl Chain {
     }
 
     /// A tool through the workspace wrappers, found on PATH like in the
-    /// dev shell.
+    /// dev shell. Without `SWL_CONFIG`: the wrappers carry the config.
     fn shimmed(&self, dir: &Path, tool: &str, args: &[&str]) -> Output {
         let mut c = Command::new(tool);
         self.env(&mut c, &self.shim_path);
+        c.env_remove("SWL_CONFIG");
         c.current_dir(dir).args(args).output().unwrap()
     }
 
@@ -289,10 +290,29 @@ fn three_level_chain_through_the_wrappers() {
         "{envrc}"
     );
     assert!(stdout(&t.swl(&["env"])).ends_with("(unchanged)"));
+    let config_arg = format!("--config {}/repos.toml shim", t.root.display());
     for tool in ["nix", "nh", "deploy"] {
         let w = fs::read_to_string(t.ws.join(".swl/bin").join(tool)).unwrap();
-        assert!(w.contains(&format!("shim {tool} --workspace")), "{w}");
+        assert!(
+            w.contains(&format!("{config_arg} {tool} --workspace")),
+            "{w}"
+        );
     }
+    // A missing $SWL_CONFIG is an error that names it.
+    let mut c = Command::new(env!("CARGO_BIN_EXE_swl"));
+    t.env(&mut c, &t.base_path);
+    let out = c
+        .env("SWL_CONFIG", t.root.join("nope.toml"))
+        .arg("status")
+        .current_dir(&t.ws)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("nope.toml"),
+        "{}",
+        text(&out)
+    );
 
     // Clean checkouts at the locked revs: the same result as the lock.
     let eval = ["eval", "--json", ".#info"];
@@ -441,6 +461,50 @@ fn three_level_chain_through_the_wrappers() {
         fs::read(common.join("flake.lock")).unwrap(),
     );
     assert!(lock_before == lock_after, "a flake.lock changed");
+
+    // Below the common override Nix uses the common checkout's lock: pin a
+    // newer zwanenzang there than the consumer locks.
+    let zw_src = t.src.join("zwanenzang");
+    fs::write(zw_src.join("value.txt"), "zw-3").unwrap();
+    t.git(&zw_src, &["commit", "-qam", "zw-3"]);
+    let zw_new = t.git(&zw_src, &["rev-parse", "--short", "HEAD"]);
+    stdout(&t.real_nix(&common, &["flake", "update", "zwanenzang"]));
+    let status = stdout(&t.swl(&["status"]));
+    for line in [
+        format!("  swan-lake: common/zwanenzang locked {zw_rev}, ahead 0, behind 0"),
+        format!("  swan-lake-common@common: zwanenzang locked {zw_new}, ahead 0, behind 1"),
+    ] {
+        assert!(
+            status.lines().any(|l| l == line),
+            "missing {line:?} in\n{status}"
+        );
+    }
+    // The zwanenzang checkout still wins while it is in the workspace.
+    assert_eq!(
+        t.info(&t.shimmed(&consumer, "nix", &eval))["value"],
+        "consumer-1+common-2+zw-2"
+    );
+
+    // Without it, a rerun of `env` drops its override and watch, and the
+    // zwanenzang below common comes from the common checkout's lock.
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(&zw_src)
+        .args(["worktree", "remove", "--force"])
+        .arg(&zw)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(
+        stdout(&t.swl(&["env"])),
+        "swan-lake: common←swan-lake-common@common"
+    );
+    let envrc = fs::read_to_string(consumer.join(".envrc.local")).unwrap();
+    assert!(!envrc.contains("zwanenzang"), "{envrc}");
+    let info = t.info(&t.shimmed(&consumer, "nix", &eval));
+    assert_eq!(info["value"], "consumer-1+common-2+zw-3");
+    assert_eq!(info["viaFollows"], "zw-3");
+    assert_eq!(t.info(&t.real_nix(&consumer, &eval)), locked);
 
     fs::remove_dir_all(&t.root).ok();
 }
