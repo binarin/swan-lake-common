@@ -31,7 +31,9 @@ in
         # swl runs git for worktrees and status, and curl for the forge API.
         # It is not wrapped with a PATH: the shim must find the caller's
         # nix, nh and deploy, and the generated wrappers exec this binary by
-        # its store path. fj, for `swl publish`, comes from the caller's PATH.
+        # its store path. From the caller's PATH come fj, for `swl publish`,
+        # and nix, for `swl env` to make the workspace's GC root of this
+        # store path.
         env.SWL_GIT = lib.getExe pkgs.git;
         env.SWL_CURL = lib.getExe pkgs.curl;
         # The chain and landing tests drive real git and nix on throwaway
