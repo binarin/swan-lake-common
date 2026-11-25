@@ -242,14 +242,28 @@ fn describe_head(dir: &Path) -> Result<(Option<String>, String)> {
     Ok((branch, head))
 }
 
-/// Keeps an existing checkout and says where it is against `target`.
-fn keep(dest: &Path, target: &Target) -> Result<String> {
+/// The canonical git common directory of the repository at `dir`.
+fn common_dir(dir: &Path) -> Option<PathBuf> {
+    let common = git_ok(dir, &["rev-parse", "--git-common-dir"])?;
+    dir.join(common).canonicalize().ok()
+}
+
+/// Keeps an existing checkout and says where it is against `target`. It must
+/// be a worktree of the repo's configured `source`.
+fn keep(dest: &Path, source: &Path, target: &Target) -> Result<String> {
     let top = git(dest, &["rev-parse", "--show-toplevel"])
         .ok()
         .map(PathBuf::from)
         .and_then(|t| t.canonicalize().ok());
     if top.as_deref() != Some(dest) {
         bail!("{} exists but is not a git checkout", dest.display());
+    }
+    if common_dir(dest).is_none() || common_dir(dest) != common_dir(source) {
+        bail!(
+            "{} exists but is not a worktree of {}; move it away",
+            dest.display(),
+            source.display()
+        );
     }
     let (branch, head) = describe_head(dest)?;
     let short = &head[..head.len().min(12)];
@@ -313,7 +327,8 @@ pub fn execute(
     for item in items {
         let dest = root.join(&item.name);
         if dest.exists() {
-            let how = keep(&dest, &item.target)?;
+            let source = &config.repo(&ws_add::checkout_repo(&item.name)?)?.source;
+            let how = keep(&dest, source, &item.target)?;
             println!("{}: {how}", dest.display());
         } else {
             let start = match &item.target {

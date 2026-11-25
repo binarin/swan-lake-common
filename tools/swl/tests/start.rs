@@ -103,6 +103,13 @@ fn start_creates_a_workspace_and_is_rerunnable() {
     let unknown = ["start", "SL-0002", "swan-lake", "unknown@x"];
     failed(&f.swl(&work, &unknown), 2, "not in the swl config");
     assert!(!work.join("SL-0002").exists());
+
+    // An existing directory that is not a worktree of the configured source
+    // is not kept.
+    let elsewhere = f.clone_elsewhere("swan-lake", "work/SL-0003/swan-lake");
+    let start3 = ["start", "SL-0003", "swan-lake"];
+    failed(&f.swl(&work, &start3), 2, "is not a worktree of");
+    assert!(!elsewhere.join(".envrc.local").exists());
 }
 
 /// The consumer branch `branch` on the forge with `manifest`, and its MR `n`.
