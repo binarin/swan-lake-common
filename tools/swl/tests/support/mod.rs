@@ -52,6 +52,10 @@ pub const TOKEN: &str = "test-token-0123";
 /// The path and Authorization header of each request.
 type SeenAuth = Arc<Mutex<Vec<(String, Option<String>)>>>;
 
+/// The programmed answers to cancellations, by MR path: HTTP status and
+/// message.
+type CancelReplies = Arc<Mutex<BTreeMap<String, VecDeque<(u16, String)>>>>;
+
 /// One request to the fake API.
 #[derive(Clone, Debug)]
 pub struct Seen {
@@ -61,7 +65,10 @@ pub struct Seen {
     pub body: String,
 }
 
-/// What the fake answers to the next merge request of an MR.
+/// What the fake answers to the next merge request of an MR. Without one
+/// programmed it answers as Forgejo 17 does: a request with
+/// `merge_when_checks_succeed` is scheduled ([`MergeReply::Schedule`]), also
+/// when the checks are green already; one without merges now.
 #[derive(Clone, Debug)]
 pub enum MergeReply {
     /// Merges now, as Forgejo's fast-forward-only merge does: the base
@@ -69,8 +76,14 @@ pub enum MergeReply {
     /// merged. 409 when the head is not the asked `head_commit_id`, or not a
     /// fast-forward of master.
     MergeNow,
-    /// 201: scheduled to merge when checks succeed.
+    /// 201: scheduled to merge when checks succeed. As on Forgejo, only a
+    /// later status event ([`FakeApi::set_status`] with `success`) merges
+    /// it; checks green already leave it scheduled.
     Schedule,
+    /// Scheduled as [`MergeReply::Schedule`], while the head's checks turn
+    /// green without a status event that would merge it: the race of CI
+    /// finishing as the merge is scheduled.
+    ScheduleAsChecksTurnGreen,
     /// Any other answer.
     Status(u16, String),
 }
@@ -78,8 +91,10 @@ pub enum MergeReply {
 /// GET responses by path; anything else is 404. Paths under a private repo
 /// answer only with `Authorization: token TOKEN`, as Forgejo does; any other
 /// token is a 401. Writes (`PATCH .../pulls/N` for the title, `POST
-/// .../pulls/N/merge`) need the token, and merges answer as programmed with
-/// [`FakeApi::on_merge`].
+/// .../pulls/N/merge`, `DELETE .../pulls/N/merge` to cancel a scheduled
+/// merge) need the token; merges answer as programmed with
+/// [`FakeApi::on_merge`], cancellations with [`FakeApi::on_cancel`] (else
+/// 204 for a scheduled merge, 404 for none).
 #[derive(Clone, Default)]
 pub struct FakeApi {
     pub port: u16,
@@ -88,6 +103,9 @@ pub struct FakeApi {
     pub seen_auth: SeenAuth,
     pub requests: Arc<Mutex<Vec<Seen>>>,
     pub merge_replies: Arc<Mutex<BTreeMap<String, VecDeque<MergeReply>>>>,
+    pub cancel_replies: CancelReplies,
+    /// The MRs (API paths) whose merge is scheduled for when checks succeed.
+    pub scheduled: Arc<Mutex<BTreeSet<String>>>,
     /// The forge's bare repos, `<forge>/binarin/<repo>`, for merges and,
     /// with `follow_pull_refs`, the heads of open MRs.
     pub forge: Arc<Mutex<Option<PathBuf>>>,
@@ -255,61 +273,110 @@ impl FakeApi {
             *pr = v.to_string();
             return ("201 Created".into(), pr.clone());
         }
-        let Some(pr_path) = path.strip_suffix("/merge").filter(|_| method == "POST") else {
+        let Some(pr_path) = path.strip_suffix("/merge") else {
             return not_found();
         };
-        let reply = self
-            .merge_replies
-            .lock()
-            .unwrap()
-            .get_mut(pr_path)
-            .and_then(VecDeque::pop_front);
         let message = |code: u16, text: &str, msg: &str| {
             (
                 format!("{code} {text}"),
                 serde_json::json!({ "message": msg }).to_string(),
             )
         };
-        match reply {
-            None => not_found(),
-            Some(MergeReply::Schedule) => ("201 Created".into(), String::new()),
-            Some(MergeReply::Status(code, msg)) => message(code, "Status", &msg),
-            Some(MergeReply::MergeNow) => {
-                let Some(pr) = self.responses.lock().unwrap().get(pr_path).cloned() else {
-                    return not_found();
-                };
-                let mut v: serde_json::Value =
-                    serde_json::from_str(&self.live(pr_path, repo, pr)).unwrap();
-                let head = v["head"]["sha"].as_str().unwrap_or("").to_string();
-                if req["head_commit_id"].as_str() != Some(head.as_str()) {
-                    return message(409, "Conflict", "head out of date");
+        if method == "DELETE" {
+            let reply = self
+                .cancel_replies
+                .lock()
+                .unwrap()
+                .get_mut(pr_path)
+                .and_then(VecDeque::pop_front);
+            return match reply {
+                Some((code, msg)) => message(code, "Status", &msg),
+                None if self.scheduled.lock().unwrap().remove(pr_path) => {
+                    ("204 No Content".into(), String::new())
                 }
-                let forge = self
-                    .forge
-                    .lock()
-                    .unwrap()
-                    .clone()
-                    .expect("the forge is set");
-                let dir = forge.join("binarin").join(repo);
-                if git_in(&dir, &["merge-base", "--is-ancestor", "master", &head]).is_none() {
-                    return message(409, "Conflict", "Not fast-forward: the base moved");
-                }
-                git_in(&dir, &["update-ref", "refs/heads/master", &head]).unwrap();
-                if let Some(branch) = v["head"]["ref"].as_str() {
-                    git_in(&dir, &["update-ref", "-d", &format!("refs/heads/{branch}")]);
-                }
-                let n = v["number"].clone();
-                v["state"] = "closed".into();
-                v["merged"] = true.into();
-                v["merge_commit_sha"] = head.into();
-                v["head"]["ref"] = format!("refs/pull/{n}/head").into();
-                self.responses
-                    .lock()
-                    .unwrap()
-                    .insert(pr_path.to_string(), v.to_string());
-                ("200 OK".into(), String::new())
-            }
+                None => not_found(),
+            };
         }
+        if method != "POST" {
+            return not_found();
+        }
+        let reply = self
+            .merge_replies
+            .lock()
+            .unwrap()
+            .get_mut(pr_path)
+            .and_then(VecDeque::pop_front)
+            .unwrap_or(if req["merge_when_checks_succeed"] == true {
+                MergeReply::Schedule
+            } else {
+                MergeReply::MergeNow
+            });
+        match reply {
+            MergeReply::Schedule => {
+                self.scheduled.lock().unwrap().insert(pr_path.to_string());
+                ("201 Created".into(), String::new())
+            }
+            MergeReply::ScheduleAsChecksTurnGreen => {
+                self.scheduled.lock().unwrap().insert(pr_path.to_string());
+                if let Some(head) = self.head(pr_path, repo) {
+                    self.set_status_without_event(repo, &head, "success");
+                }
+                ("201 Created".into(), String::new())
+            }
+            MergeReply::Status(code, msg) => message(code, "Status", &msg),
+            MergeReply::MergeNow => self.merge_pr(pr_path, repo, req["head_commit_id"].as_str()),
+        }
+    }
+
+    /// The head of the MR at the API path `pr_path`, as the forge has it.
+    fn head(&self, pr_path: &str, repo: &str) -> Option<String> {
+        let pr = self.responses.lock().unwrap().get(pr_path).cloned()?;
+        let v: serde_json::Value = serde_json::from_str(&self.live(pr_path, repo, pr)).ok()?;
+        v["head"]["sha"].as_str().map(str::to_string)
+    }
+
+    /// Merges the MR at the API path `pr_path` by fast-forward, as Forgejo
+    /// does; with `expected`, only at that head.
+    fn merge_pr(&self, pr_path: &str, repo: &str, expected: Option<&str>) -> (String, String) {
+        let message = |code: u16, text: &str, msg: &str| {
+            (
+                format!("{code} {text}"),
+                serde_json::json!({ "message": msg }).to_string(),
+            )
+        };
+        let Some(pr) = self.responses.lock().unwrap().get(pr_path).cloned() else {
+            return message(404, "Not Found", "not found");
+        };
+        let mut v: serde_json::Value = serde_json::from_str(&self.live(pr_path, repo, pr)).unwrap();
+        let head = v["head"]["sha"].as_str().unwrap_or("").to_string();
+        if expected.is_some_and(|e| e != head) {
+            return message(409, "Conflict", "head out of date");
+        }
+        let forge = self
+            .forge
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the forge is set");
+        let dir = forge.join("binarin").join(repo);
+        if git_in(&dir, &["merge-base", "--is-ancestor", "master", &head]).is_none() {
+            return message(409, "Conflict", "Not fast-forward: the base moved");
+        }
+        git_in(&dir, &["update-ref", "refs/heads/master", &head]).unwrap();
+        if let Some(branch) = v["head"]["ref"].as_str() {
+            git_in(&dir, &["update-ref", "-d", &format!("refs/heads/{branch}")]);
+        }
+        let n = v["number"].clone();
+        v["state"] = "closed".into();
+        v["merged"] = true.into();
+        v["merge_commit_sha"] = head.into();
+        v["head"]["ref"] = format!("refs/pull/{n}/head").into();
+        self.responses
+            .lock()
+            .unwrap()
+            .insert(pr_path.to_string(), v.to_string());
+        self.scheduled.lock().unwrap().remove(pr_path);
+        ("200 OK".into(), String::new())
     }
 
     pub fn base(&self) -> String {
@@ -328,6 +395,25 @@ impl FakeApi {
             .entry(format!("/api/v1/repos/binarin/{repo}/pulls/{n}"))
             .or_default()
             .extend(replies.iter().cloned());
+    }
+
+    /// The answers to the next cancellations of `repo#n`'s scheduled merge,
+    /// in order: HTTP status and message.
+    pub fn on_cancel(&self, repo: &str, n: u64, replies: &[(u16, &str)]) {
+        self.cancel_replies
+            .lock()
+            .unwrap()
+            .entry(format!("/api/v1/repos/binarin/{repo}/pulls/{n}"))
+            .or_default()
+            .extend(replies.iter().map(|(c, m)| (*c, m.to_string())));
+    }
+
+    /// Whether `repo#n`'s merge is scheduled.
+    pub fn is_scheduled(&self, repo: &str, n: u64) -> bool {
+        self.scheduled
+            .lock()
+            .unwrap()
+            .contains(&format!("/api/v1/repos/binarin/{repo}/pulls/{n}"))
     }
 
     /// The requests other than GET: `METHOD path body`.
@@ -366,8 +452,33 @@ impl FakeApi {
         );
     }
 
-    /// The combined commit status of `sha`: `pending`, `success`, `failure`.
+    /// A new commit status of `sha`, which becomes its combined status:
+    /// `pending`, `success`, `failure`. As on Forgejo, the status event of a
+    /// `success` merges the MRs at that head whose merge is scheduled.
     pub fn set_status(&self, repo: &str, sha: &str, state: &str) {
+        self.set_status_without_event(repo, sha, state);
+        if state != "success" {
+            return;
+        }
+        let prefix = format!("/api/v1/repos/binarin/{repo}/pulls/");
+        let due: Vec<String> = self
+            .scheduled
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| p.starts_with(&prefix))
+            .cloned()
+            .collect();
+        for pr_path in due {
+            if self.head(&pr_path, repo).as_deref() == Some(sha) {
+                self.merge_pr(&pr_path, repo, Some(sha));
+            }
+        }
+    }
+
+    /// The combined commit status of `sha`, without the status event that
+    /// would start a scheduled merge.
+    pub fn set_status_without_event(&self, repo: &str, sha: &str, state: &str) {
         let body = serde_json::json!({
             "state": state,
             "sha": sha,
