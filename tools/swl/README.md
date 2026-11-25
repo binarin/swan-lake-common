@@ -838,23 +838,27 @@ consumers stopping, the most urgent of those, in that order.
 It is stateless and rerunnable: each run reads common's master and
 promotion branch, the locks, the bump branches, the forge's MRs and the
 mirror, and goes on from there.
-- The promotion branch behind master by bump's own commits only (one
-  parent, only `flake.lock`, a subject `swl: bump `): no new bump, that one
-  is promoted.
-- Behind master by other commits (an unpromoted landing): it stops for the
-  owner and writes nothing. It never promotes someone else's landing as a
-  side effect; promote it (as `swl land` does for its MR) or wait, then
-  rerun. The promotion branch with commits that master lacks stops for the
-  owner too.
+- The promotion branch behind master by bump's own commits only: no new
+  bump, those are promoted. A commit counts as bump's by its form alone:
+  one parent, a change to `flake.lock` only, and a subject starting `swl:
+  bump `. So a landed MR whose single commit has that form counts too
+  (it is on master, so the owner pushed or merged it).
+- Behind master by any other commit (an unpromoted landing): it stops for
+  the owner and writes nothing; it does not promote that landing as a side
+  effect. Promote it (as `swl land` does for its MR) or wait, then rerun.
+  The promotion branch with commits that master lacks stops for the owner
+  too.
 - Common bumped and promoted, or nothing to bump: on to the consumers. A
   consumer at the promoted rev is done; one with an open bump MR at the
   right head goes to its merge.
 - Nothing new anywhere: `nothing to bump`, and nothing is written.
 
-`--dry-run` reads as a run does (it fetches the sources, asks `ls-remote`,
-the compare API and the forge), prints the plan and the first write it
-would do, and writes nothing: no worktree, commit, push or forge write, and
-no fj login is needed but for the private consumers' reads.
+`--dry-run` reads as a run does, prints the plan and the first write it
+would do, and writes nothing on the forge or GitHub: no worktree, commit,
+push or forge write, and no fj login is needed but for the private
+consumers' reads. It does fetch into the configured sources, as a run and
+`land --dry-run` do (their remote-tracking refs, and the bump branch's
+objects), and asks `ls-remote`, the compare API and the forge.
 
 The branch `swl-bump-common` is swl's own. A run updates it only while it
 has nothing but swl's bump commit: one commit (one parent, only
