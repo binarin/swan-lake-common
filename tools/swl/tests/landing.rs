@@ -36,10 +36,12 @@ const ZW_FLAKE: &str = r#"{
 
 /// The consumer pins common's promotion branch `current`, like
 /// `swan-lake-current`, as `lib` and `extra`. Not as `common`, so that the
-/// common pin policy, which wants the real GitHub URL, does not apply.
+/// common pin policy, which wants the real GitHub URL, does not apply. Its
+/// `zwanenzang` follows lib's, as swan-lake's nixpkgs follows common's.
 const CONSUMER_FLAKE: &str = r#"{
   inputs.lib.url = "git+file://@FORGE@/binarin/swan-lake-common?ref=current";
   inputs.extra.url = "git+file://@FORGE@/binarin/swan-lake-common?ref=current";
+  inputs.zwanenzang.follows = "lib/zwanenzang";
   outputs = { self, lib, extra, ... }: {
     value = builtins.readFile ./value.txt + "+" + lib.value;
     extra = extra.value;
@@ -919,6 +921,13 @@ fn check_accepts_forward_moves_and_refuses_backwards() {
     w.git(&w.consumer, &["commit", "-qam", "lib: bump"]);
     let bump = w.git(&w.consumer, &["rev-parse", "HEAD"]);
     let check = ["check", "--event", "mr", "--base", "origin/master"];
+    // A root input follows into the moved one, as in swan-lake.
+    let lock: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(w.consumer.join("flake.lock")).unwrap()).unwrap();
+    assert_eq!(
+        lock["nodes"]["root"]["inputs"]["zwanenzang"],
+        serde_json::json!(["lib", "zwanenzang"])
+    );
     let out = stdout(&w.swl(&w.consumer, &check, &[]));
     assert!(out.contains("lib: forward move "), "{out}");
     assert!(out.contains("is in current of file://"), "{out}");
