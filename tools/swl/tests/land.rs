@@ -279,7 +279,7 @@ fn land_runs_to_the_end_over_reruns() {
     failed(
         &t.land(&[]),
         4,
-        "waits for anyone: rebase sl-0020-land onto master (swl never force-pushes), then swl publish swan-lake (",
+        "waits for anyone: rebase sl-0020-land onto master: rerun swl land, or swl refresh (",
     );
     assert_eq!(t.f.api.writes().len(), 4, "the title is set once");
     // A forge that says merged but shows it open: not asked twice in a run.
@@ -795,7 +795,7 @@ fn land_keeps_or_makes_the_schedule_when_a_green_mr_may_not_be_merged() {
     failed(
         &t.land(&[]),
         4,
-        "waits for anyone: rebase sl-0020-land onto master (swl never force-pushes)",
+        "waits for anyone: rebase sl-0020-land onto master: rerun swl land, or swl refresh (",
     );
     assert!(t.f.api.is_scheduled("swan-lake-common", 1));
 
@@ -923,19 +923,458 @@ fn land_reads_a_500_to_a_fast_forward_merge_by_ancestry() {
         ]
     );
 
-    // Known behind the base, the head is not asked to merge at all.
+    // Known behind the base, and not rebased (an untracked file in its
+    // checkout): the head is not asked to merge at all.
+    fs::write(t.common.join("notes.txt"), "wip").unwrap();
     let writes = t.f.api.writes().len();
     let out = t.land(&[]);
     failed(
         &out,
         4,
         &format!(
-            "(swan-lake-common#1 is not mergeable by fast-forward: its head {} does not contain \
-             origin/master at {})",
-            &c2[..12],
-            &moved[..12]
+            "waits for anyone: swan-lake-common#1: sl-0020-land does not contain origin/master at \
+             {}, and its checkout {} is not rebased: it has uncommitted or untracked files: ?? \
+             notes.txt; commit or remove them; then rerun swl land (or swl refresh)",
+            &moved[..12],
+            t.common.display()
         ),
     );
     assert_eq!(t.f.api.writes().len(), writes, "{:?}", t.f.api.writes());
     assert_eq!(t.f.git(&forge_common, &["rev-parse", "master"]), moved);
+    assert_eq!(t.common_head(), c2);
+}
+
+impl Change {
+    /// `swl refresh` of the workspace.
+    fn refresh(&self, extra: &[&str]) -> Output {
+        let ws = self.ws.display().to_string();
+        let mut args = vec!["refresh", "--workspace", &ws, "--timeout", "0"];
+        args.extend(extra);
+        self.f
+            .swl_env(&self.f.root, &args, &[("SWL_FJ_KEYS", &self.keys)])
+    }
+
+    /// The head of `branch` in the forge's `repo`.
+    fn forge_head(&self, repo: &str, branch: &str) -> String {
+        self.f.git(&self.f.forge_repo(repo), &["rev-parse", branch])
+    }
+
+    /// The worktrees of `repo`'s source, by path.
+    fn worktrees(&self, repo: &str) -> Vec<String> {
+        self.f
+            .git(&self.f.source(repo), &["worktree", "list", "--porcelain"])
+            .lines()
+            .filter(|l| l.starts_with("worktree "))
+            .map(str::to_string)
+            .collect()
+    }
+}
+
+#[test]
+fn land_rebases_a_shared_mr_behind_its_base_and_schedules_its_merge() {
+    let t = Change::new("land-rebase");
+    t.mirror_at_once();
+    let c2 = t.common_head();
+    t.f.api.set_status("swan-lake-common", &c2, "success");
+    let moved =
+        t.f.commit_file_on_forge("swan-lake-common", "master", "other.txt", "o");
+
+    // A dry run plans the rebase and writes nothing.
+    let refs = t.forge_refs();
+    let worktrees = t.worktrees("swan-lake-common");
+    let log = stdout(&t.land(&["--dry-run"]));
+    assert!(
+        log.contains(&format!(
+            "would rebase sl-0020-land of swan-lake-common#1 (1 commit) onto origin/master at {}, \
+             and push it with --force-with-lease=refs/heads/sl-0020-land:{}",
+            &moved[..12],
+            &c2[..12]
+        )),
+        "{log}"
+    );
+    assert!(
+        log.contains("then: CI runs on the new head of swan-lake-common#1"),
+        "{log}"
+    );
+    assert_eq!(t.forge_refs(), refs);
+    assert_eq!(t.worktrees("swan-lake-common"), worktrees);
+    assert_eq!(t.common_head(), c2);
+    assert!(t.f.api.writes().is_empty(), "{:?}", t.f.api.writes());
+
+    // Rebased in a scratch worktree, pushed with a lease on the head read,
+    // the checkout moved to it; its CI is pending, so its merge is
+    // scheduled, and nothing is merged now.
+    let out = t.land_env(&[], &[("SWL_LOG", "swl::cmd=debug")]);
+    failed(
+        &out,
+        5,
+        "waits for nobody: swan-lake-common#1 waits for CI, then it merges",
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains(&format!("--force-with-lease=refs/heads/sl-0020-land:{c2}")),
+        "{err}"
+    );
+    let rebased = t.forge_head("swan-lake-common", "sl-0020-land");
+    assert_ne!(rebased, c2);
+    assert_eq!(
+        t.f.git(&t.common, &["rev-parse", "HEAD^"]),
+        moved,
+        "on the new master"
+    );
+    assert_eq!(t.common_head(), rebased);
+    assert_eq!(t.f.git(&t.common, &["status", "--porcelain"]), "");
+    assert_eq!(
+        t.forge_head("swan-lake-common", "refs/pull/1/head"),
+        rebased
+    );
+    assert_eq!(t.forge_head("swan-lake-common", "master"), moved);
+    assert_eq!(t.worktrees("swan-lake-common"), worktrees);
+    assert_eq!(
+        t.writes_since(0),
+        [
+            "PATCH /api/v1/repos/binarin/swan-lake-common/pulls/1".to_string(),
+            format!("POST {COMMON_MERGE} when checks succeed"),
+        ]
+    );
+    assert!(t.f.api.writes()[1].contains(&rebased));
+
+    // swl status shows it with CI pending; swl refresh has nothing to do.
+    let ws = t.ws.display().to_string();
+    let status = stdout(&t.f.swl_env(
+        &t.f.root,
+        &["status", "--workspace", &ws],
+        &[("SWL_FJ_KEYS", &t.keys)],
+    ));
+    assert!(
+        support::line(&status, "└─ lib: swan-lake-common@lib").contains("CI pending"),
+        "{status}"
+    );
+    let log = stdout(&t.refresh(&[]));
+    assert!(
+        log.contains("swan-lake-common#1: sl-0020-land contains origin/master already"),
+        "{log}"
+    );
+}
+
+#[test]
+fn refresh_is_a_no_op_when_every_branch_contains_its_base() {
+    let t = Change::new("refresh-current");
+    let refs = t.forge_refs();
+    let log = stdout(&t.refresh(&[]));
+    assert!(
+        log.contains("swan-lake-common#1: sl-0020-land contains origin/master already"),
+        "{log}"
+    );
+    assert!(
+        log.contains("swan-lake#2: sl-0020-land contains origin/master already"),
+        "{log}"
+    );
+    assert_eq!(t.forge_refs(), refs);
+    assert!(t.f.api.writes().is_empty(), "{:?}", t.f.api.writes());
+}
+
+#[test]
+fn refresh_stops_for_a_checkout_that_is_not_clean_or_not_at_the_remote_head() {
+    let t = Change::new("refresh-stops");
+    let c2 = t.common_head();
+    t.f.commit_file_on_forge("swan-lake-common", "master", "other.txt", "o");
+    let refs = t.forge_refs();
+    let stops = |needle: &str| {
+        let out = t.refresh(&[]);
+        failed(&out, 4, needle);
+        assert_eq!(t.forge_refs(), refs);
+    };
+
+    // A dry run says what it would do, and writes nothing.
+    let log = stdout(&t.refresh(&["--dry-run"]));
+    assert!(
+        log.contains("would rebase sl-0020-land of swan-lake-common#1"),
+        "{log}"
+    );
+    assert!(log.contains("dry run, nothing was written"), "{log}");
+    assert_eq!(t.forge_refs(), refs);
+
+    // Changes to a tracked file.
+    fs::write(t.common.join("value.txt"), "edited").unwrap();
+    stops("is not rebased: it has uncommitted or untracked files:  M value.txt");
+    t.f.git(&t.common, &["checkout", "-q", "value.txt"]);
+    // On another branch.
+    t.f.git(&t.common, &["switch", "-q", "--detach"]);
+    stops("is not rebased: it is on a detached HEAD, not sl-0020-land; switch to sl-0020-land");
+    t.f.git(&t.common, &["switch", "-q", "sl-0020-land"]);
+    // An unpushed commit.
+    t.commit(&t.common, "c3");
+    stops(
+        "is not rebased: sl-0020-land has commits that origin/sl-0020-land lacks; push them \
+         first (swl publish, or swl land for a landing commit)",
+    );
+    t.f.git(&t.common, &["reset", "-q", "--hard", &c2]);
+    // A commit pushed elsewhere: the forge's MR follows it.
+    t.f.commit_file_on_forge("swan-lake-common", "sl-0020-land", "theirs.txt", "t");
+    let refs = t.forge_refs();
+    let out = t.refresh(&[]);
+    failed(
+        &out,
+        4,
+        "is not rebased: origin/sl-0020-land has commits that sl-0020-land lacks; git pull \
+         --ff-only first",
+    );
+    assert_eq!(t.forge_refs(), refs);
+    assert_eq!(t.common_head(), c2);
+}
+
+#[test]
+fn refresh_aborts_a_conflicting_rebase_and_leaves_everything_as_it_was() {
+    let t = Change::new("refresh-conflict");
+    let c2 = t.common_head();
+    // Master changes the file that the MR changes.
+    t.f.commit_on_forge("swan-lake-common", "master", "c-other");
+    let refs = t.forge_refs();
+    let worktrees = t.worktrees("swan-lake-common");
+    let out = t.refresh(&[]);
+    failed(
+        &out,
+        4,
+        &format!(
+            "swan-lake-common#1: sl-0020-land does not contain origin/master at {}, and rebasing \
+             it conflicts in {} c2: value.txt; nothing was changed: rebase it by hand in {}, \
+             push it, then rerun swl refresh",
+            &t.forge_head("swan-lake-common", "master")[..12],
+            &c2[..7],
+            t.common.display()
+        ),
+    );
+    assert_eq!(t.forge_refs(), refs);
+    assert_eq!(t.common_head(), c2);
+    assert_eq!(t.f.git(&t.common, &["status", "--porcelain"]), "");
+    assert_eq!(t.worktrees("swan-lake-common"), worktrees);
+}
+
+#[test]
+fn refresh_loses_a_race_for_the_branch_to_its_lease() {
+    let t = Change::new("refresh-lease");
+    let c2 = t.common_head();
+    t.f.commit_file_on_forge("swan-lake-common", "master", "other.txt", "o");
+    // Someone pushes to the branch after swl read it: here as the scratch
+    // worktree is checked out, from a hook of the source that runs once.
+    let forge = t.f.forge_repo("swan-lake-common").display().to_string();
+    let hook = t.f.source("swan-lake-common").join("hooks/post-checkout");
+    fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\nrm \"$0\"\nc=$(git --git-dir={forge} commit-tree {c2}^{{tree}} -p {c2} -m race)\n\
+             git --git-dir={forge} update-ref refs/heads/sl-0020-land \"$c\"\n"
+        ),
+    )
+    .unwrap();
+    let mut perms = fs::metadata(&hook).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+    fs::set_permissions(&hook, perms).unwrap();
+    let out = t.refresh(&[]);
+    failed(
+        &out,
+        5,
+        &format!(
+            "waits for nobody: swan-lake-common#1: origin/sl-0020-land moved since it was read at \
+             {}, so the lease refused the push; nothing was changed: rerun swl refresh",
+            &c2[..12]
+        ),
+    );
+    assert!(!hook.exists(), "the race ran");
+    let race = t.forge_head("swan-lake-common", "sl-0020-land");
+    assert_eq!(
+        t.f.git(
+            &t.f.forge_repo("swan-lake-common"),
+            &["log", "-1", "--format=%s", &race]
+        ),
+        "race"
+    );
+    assert_eq!(t.common_head(), c2);
+}
+
+#[test]
+fn land_rebases_a_shared_mr_without_a_checkout_in_a_scratch_worktree() {
+    let t = Change::new("land-scratch");
+    let c2 = t.common_head();
+    let source = t.f.source("swan-lake-common");
+    t.f.git(
+        &source,
+        &["worktree", "remove", &t.common.display().to_string()],
+    );
+    let moved =
+        t.f.commit_file_on_forge("swan-lake-common", "master", "other.txt", "o");
+    let worktrees = t.worktrees("swan-lake-common");
+
+    // From the published MR, without a workspace: the plan.
+    let log = stdout(&t.land_from(&["--dry-run"]));
+    assert!(
+        log.contains(&format!(
+            "would rebase sl-0020-land of swan-lake-common#1 (1 commit) onto origin/master at {}",
+            &moved[..12]
+        )),
+        "{log}"
+    );
+    assert_eq!(t.forge_head("swan-lake-common", "sl-0020-land"), c2);
+
+    failed(
+        &t.land(&[]),
+        5,
+        "swan-lake-common#1 waits for CI, then it merges",
+    );
+    let rebased = t.forge_head("swan-lake-common", "sl-0020-land");
+    assert_eq!(
+        t.f.git(&source, &["rev-parse", &format!("{rebased}^")]),
+        moved
+    );
+    assert_eq!(
+        t.f.git(&source, &["log", "-1", "--format=%s", &rebased]),
+        "c2"
+    );
+    assert_eq!(t.worktrees("swan-lake-common"), worktrees);
+    assert!(
+        t.f.git(&source, &["branch", "--list", "swl-refresh-*"])
+            .is_empty()
+    );
+}
+
+/// The subjects of `branch`'s commits that `master` lacks, newest first.
+fn subjects(t: &Change, repo: &str, branch: &str) -> Vec<String> {
+    t.f.git(
+        &t.f.forge_repo(repo),
+        &["log", "--format=%s", &format!("master..{branch}")],
+    )
+    .lines()
+    .map(str::to_string)
+    .collect()
+}
+
+#[test]
+fn land_makes_the_consumer_landing_anew_on_a_master_whose_lock_moved() {
+    let t = Change::new("land-relanding");
+    t.mirror_at_once();
+    t.f.api
+        .on_merge("swan-lake-common", 1, &[MergeReply::MergeNow]);
+    failed(&t.land(&[]), 5, "swan-lake#2 waits for CI, then it merges");
+    assert!(t.f.api.is_scheduled("swan-lake", 2));
+    let landed = [
+        "swl: land swan-lake-common#1 (lib)",
+        "swl: manifest",
+        "consumer-2",
+    ];
+    assert_eq!(subjects(&t, "swan-lake", "sl-0020-land"), landed);
+
+    // Master moves without its lock: rebased with the landing as it is.
+    let m1 =
+        t.f.commit_file_on_forge("swan-lake", "master", "other.txt", "o");
+    let out = t.land(&[]);
+    failed(&out, 5, "swan-lake#2 waits for CI, then it merges");
+    let log = out_text(&out);
+    assert!(
+        log.contains(&format!(
+            "rebase sl-0020-land of swan-lake#2 (3 commits) onto origin/master at {}, and push",
+            &m1[..12]
+        )),
+        "{log}"
+    );
+    assert!(!log.contains("finalized anew"), "{log}");
+    let head = t.forge_head("swan-lake", "sl-0020-land");
+    assert_eq!(subjects(&t, "swan-lake", "sl-0020-land"), landed);
+    assert_eq!(t.f.git(&t.consumer, &["rev-parse", "HEAD~3"]), m1);
+    assert_eq!(t.f.git(&t.consumer, &["rev-parse", "HEAD"]), head);
+
+    // A bump on master moves the lock: the landing is dropped, the rest
+    // rebased and finalized anew on the new lock, and pushed once.
+    let c3 = t.f.commit_on_forge("swan-lake-common", "master", "c3");
+    let forge_common = t.f.forge_repo("swan-lake-common");
+    t.f.git(&forge_common, &["update-ref", "refs/heads/current", &c3]);
+    t.sync_mirror();
+    let bumper = t.f.clone_elsewhere("swan-lake", "bumper");
+    stdout(&t.f.nix(&bumper, &["flake", "update", "lib"]));
+    t.f.git(&bumper, &["commit", "-qam", "swl: bump common to c3"]);
+    t.f.git(&bumper, &["push", "-q", "origin", "HEAD:master"]);
+    let m2 = t.forge_head("swan-lake", "master");
+
+    // While the landing cannot be made anew (the mirror lost the merge
+    // commit), nothing is pushed.
+    let c1 = t.f.git(&forge_common, &["rev-parse", &format!("{c3}~2")]);
+    t.f.git(&t.mirror, &["update-ref", "refs/heads/current", &c1]);
+    let out = t.refresh(&[]);
+    failed(
+        &out,
+        4,
+        "swan-lake#2: sl-0020-land does not contain origin/master at",
+    );
+    failed(
+        &out,
+        4,
+        "and its landing commit, dropped to rebase it, cannot be made anew: not every entry has \
+         landed:\n  lib (swan-lake-common#1): stays: merged as",
+    );
+    assert!(out_text(&out).contains("nothing was pushed"));
+    assert_eq!(t.forge_head("swan-lake", "sl-0020-land"), head);
+    assert_eq!(t.f.git(&t.consumer, &["rev-parse", "HEAD"]), head);
+    assert!(
+        t.f.git(
+            &t.f.source("swan-lake"),
+            &["branch", "--list", "swl-refresh-*"]
+        )
+        .is_empty()
+    );
+    t.sync_mirror();
+
+    let out = t.land_env(&[], &[("SWL_LOG", "swl::cmd=debug")]);
+    failed(&out, 5, "swan-lake#2 waits for CI, then it merges");
+    let log = out_text(&out);
+    assert!(
+        log.contains(&format!(
+            "rebase sl-0020-land of swan-lake#2 (2 commits, without swl's landing commit {}, as \
+             origin/master moved flake.lock) onto origin/master at {} and finalize it anew, and \
+             push it with --force-with-lease=refs/heads/sl-0020-land:{}",
+            &head[..12],
+            &m2[..12],
+            &head[..12]
+        )),
+        "{log}"
+    );
+    assert!(
+        log.contains("swan-lake#2: finalized anew: swl: land swan-lake-common#1 (lib)"),
+        "{log}"
+    );
+    // swl env ran again for the moved lock.
+    assert!(log.contains("swan-lake: lib←swan-lake-common@lib"), "{log}");
+    let err = String::from_utf8_lossy(&out.stderr);
+    let pushes = err
+        .lines()
+        .filter(|l| l.contains(" push --quiet ") && l.contains(":refs/heads/sl-0020-land"))
+        .count();
+    assert_eq!(pushes, 1, "{err}");
+    let relanded = t.forge_head("swan-lake", "sl-0020-land");
+    assert_eq!(subjects(&t, "swan-lake", "sl-0020-land"), landed);
+    assert_eq!(t.f.git(&t.consumer, &["rev-parse", "HEAD"]), relanded);
+    assert_eq!(t.f.git(&t.consumer, &["rev-parse", "HEAD~3"]), m2);
+    assert_eq!(
+        t.f.git(
+            &t.consumer,
+            &["status", "--porcelain", "--untracked-files=no"]
+        ),
+        ""
+    );
+    assert!(!t.consumer.join("swl.toml").exists());
+    let lock = |rev: &str| {
+        t.f.git(
+            &t.f.forge_repo("swan-lake"),
+            &["show", &format!("{rev}:flake.lock")],
+        )
+    };
+    assert_eq!(lock(&relanded), lock(&m2), "the bumped lock has c3 already");
+    assert!(lock(&m2).contains(&c3));
+    assert!(t.f.api.is_scheduled("swan-lake", 2));
+    let last = t.f.api.writes().last().unwrap().clone();
+    assert!(
+        last.starts_with("POST /api/v1/repos/binarin/swan-lake/pulls/2/merge ")
+            && last.contains(&relanded),
+        "{last}"
+    );
 }

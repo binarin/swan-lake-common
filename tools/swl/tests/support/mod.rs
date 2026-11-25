@@ -861,6 +861,18 @@ impl Forge {
     /// A commit on the forge's `branch` of `repo`, made in a scratch clone;
     /// returns its sha.
     pub fn commit_on_forge(&self, repo: &str, branch: &str, value: &str) -> String {
+        self.commit_file_on_forge(repo, branch, "value.txt", value)
+    }
+
+    /// A commit of `file` with `value` on the forge's `branch` of `repo`;
+    /// returns its sha.
+    pub fn commit_file_on_forge(
+        &self,
+        repo: &str,
+        branch: &str,
+        file: &str,
+        value: &str,
+    ) -> String {
         let dir = self.root.join(format!("elsewhere-{repo}-{value}"));
         let url = self.forge_repo(repo).display().to_string();
         self.git(
@@ -878,8 +890,9 @@ impl Forge {
         } else {
             self.git(&dir, &["checkout", "-q", branch]);
         }
-        fs::write(dir.join("value.txt"), value).unwrap();
-        self.git(&dir, &["commit", "-qam", &format!("{repo}: {value}")]);
+        fs::write(dir.join(file), value).unwrap();
+        self.git(&dir, &["add", file]);
+        self.git(&dir, &["commit", "-qm", &format!("{repo}: {value}")]);
         self.git(&dir, &["push", "-q", "origin", &format!("HEAD:{branch}")]);
         let sha = self.git(&dir, &["rev-parse", "HEAD"]);
         fs::remove_dir_all(&dir).unwrap();

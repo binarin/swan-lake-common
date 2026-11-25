@@ -4,19 +4,22 @@
 //! saying what it waits for and for whom. Rerun it to continue.
 //!
 //! 1. The shared MRs that the consumers' `swl.toml` entries name, nested
-//!    entries first: a draft is marked ready, then it is merged by
+//!    entries first: one behind its base is rebased and pushed with a lease
+//!    ([`refresh`]), a draft is marked ready, then it is merged by
 //!    fast-forward: now when its checks are green, else when they succeed.
 //! 2. A merged MR whose input `flake.nix` declares at a branch other than the
 //!    base (common's `swan-lake-current`) is promoted: that branch is
 //!    fast-forwarded on the forge to the merge commit. Then the declared
 //!    source (common's GitHub mirror) must have it.
-//! 3. Each consumer: `swl finalize` when every entry is satisfied, the
-//!    landing commit pushed to its MR branch, and its merge requested.
+//! 3. Each consumer: rebased as a shared MR is when behind its base, `swl
+//!    finalize` when every entry is satisfied, the landing commit pushed to
+//!    its MR branch, and its merge requested.
 //! 4. When every consumer MR is merged, the workspace is removed (unless
 //!    `--keep`).
 //!
 //! Writes: only those, the forge's through [`ForgeWriter`]; git pushes are
-//! fast-forward only. `--dry-run` writes nothing.
+//! fast-forward only, but those of rebased MR branches, with a lease.
+//! `--dry-run` writes nothing.
 
 use std::{
     cell::RefCell,
@@ -40,6 +43,7 @@ use crate::{
     },
     git::{git, git_ok, short, valid_branch},
     manifest::{Entry, MANIFEST_FILE, Manifest},
+    refresh::{self, Part, Place},
     start,
     status::{self, MrFacts, MrRead, RemoteBranch, Row, RowFacts, Stage, Waits},
     style::{self, Tone},
@@ -181,9 +185,9 @@ fn shared_entries(manifests: &[(String, Manifest)]) -> Vec<SharedMr> {
 /// branch, waiting for a mirror and for the forge. `cmd` (`swl land`, `swl
 /// bump`) prefixes the messages and is what they say to rerun.
 pub(crate) struct Lander<'a> {
-    cmd: &'static str,
-    config: &'a Config,
-    reader: &'a dyn PrReader,
+    pub(crate) cmd: &'static str,
+    pub(crate) config: &'a Config,
+    pub(crate) reader: &'a dyn PrReader,
     writer: &'a dyn ForgeWriter,
     opts: &'a Options,
     /// Writes done in this run, so that none is repeated when the forge
@@ -266,8 +270,13 @@ impl Lander<'_> {
         Ok(None)
     }
 
-    /// Steps 1 and 2 for one shared MR.
-    fn shared(&self, rows: &[Row], (consumer, path, e): &SharedMr) -> Result<Step> {
+    /// Steps 1 and 2 for one shared MR; its checkout, if any, in `ws`.
+    fn shared(
+        &self,
+        rows: &[Row],
+        ws: Option<&Workspace>,
+        (_, path, e): &SharedMr,
+    ) -> Result<Step> {
         let cmd = self.cmd;
         let which = format!("{}#{}", e.repo, e.mr);
         let _span = tracing::debug_span!("shared", %which, %path).entered();
@@ -300,8 +309,31 @@ impl Lander<'_> {
                 ),
             ),
             MrRead::Open { info, .. } => {
-                let rebase = self.rebase_step(&e.repo, info, &format!("swl publish {consumer}"));
-                self.merge(&which, &e.repo, info, &rebase)
+                let checkout = match (&row.facts, ws) {
+                    (RowFacts::Shared(_), Some(ws)) => {
+                        ws.checkouts.iter().find(|c| c.name == row.name)
+                    }
+                    _ => None,
+                };
+                let place = match (checkout, ws) {
+                    (Some(c), Some(ws)) => Place::Checkout {
+                        dir: &c.dir,
+                        root: &ws.root,
+                    },
+                    _ => Place::Scratch,
+                };
+                let part = Part {
+                    which: which.clone(),
+                    repo: &e.repo,
+                    info,
+                    place,
+                    consumer: false,
+                };
+                match refresh::refresh(self, &part)? {
+                    Step::Done => {}
+                    step => return Ok(step),
+                }
+                self.merge(&which, &e.repo, info, &self.rebase_step(&e.repo, info))
             }
             MrRead::Merged {
                 merge_commit,
@@ -342,7 +374,7 @@ impl Lander<'_> {
     /// branch: `None` when the head contains the base's tip, or when that
     /// cannot be told (a repo not in the config, a base without a remote, a
     /// head that cannot be fetched).
-    pub(crate) fn base_missing(&self, repo: &str, info: &PrInfo) -> Option<String> {
+    fn base_missing(&self, repo: &str, info: &PrInfo) -> Option<String> {
         let rc = self.config.repo(repo).ok()?;
         let (src, base) = (&rc.source, rc.base());
         let remote = base_remote(src, base).ok()??;
@@ -614,14 +646,14 @@ impl Lander<'_> {
         }
     }
 
-    /// `land`'s step for an MR whose branch is behind its base: rebase it,
-    /// then `republish`, the command that pushes it again.
-    fn rebase_step(&self, repo: &str, info: &PrInfo, republish: &str) -> String {
+    /// `land`'s step for an MR whose branch is not mergeable by
+    /// fast-forward: a rerun rebases it ([`refresh::refresh`]).
+    fn rebase_step(&self, repo: &str, info: &PrInfo) -> String {
         let base = self.config.base_for(repo);
         let base_branch = base.split_once('/').map_or(base, |(_, b)| b);
         format!(
-            "rebase {} onto {base_branch} (swl never force-pushes), then {republish}",
-            info.head_ref
+            "rebase {} onto {base_branch}: rerun {}, or swl refresh",
+            info.head_ref, self.cmd
         )
     }
 
@@ -653,7 +685,8 @@ impl Lander<'_> {
                 Waits::Owner,
                 format!(
                     "promote {branch}: {remote}/{branch} at {} is not an ancestor of {which}'s \
-                     merge commit {}, so it cannot be fast-forwarded (swl never force-pushes)",
+                     merge commit {}, so it cannot be fast-forwarded (swl never force-pushes a \
+                     promotion branch)",
                     short(&tip),
                     short(merge_commit)
                 ),
@@ -730,8 +763,8 @@ impl Lander<'_> {
         }
     }
 
-    /// Step 3 for one consumer checkout.
-    fn consumer(&self, rows: &[Row], c: &Checkout) -> Result<Step> {
+    /// Step 3 for one consumer checkout of the workspace at `ws_root`.
+    fn consumer(&self, rows: &[Row], ws_root: &Path, c: &Checkout) -> Result<Step> {
         let cmd = self.cmd;
         let _span = tracing::debug_span!("consumer", name = %c.name).entered();
         let Some(row) = rows
@@ -821,7 +854,25 @@ impl Lander<'_> {
         if let Some(step) = self.mark_ready(&which, &c.name, info)? {
             return Ok(step);
         }
-        match finalize::land_all(&c.dir, self.reader, self.opts.dry_run)? {
+        // A landing commit not pushed yet is pushed first; the next pass
+        // rebases the branch with it.
+        if f.remote == RemoteBranch::Same {
+            let part = Part {
+                which: which.clone(),
+                repo: &c.name,
+                info,
+                place: Place::Checkout {
+                    dir: &c.dir,
+                    root: ws_root,
+                },
+                consumer: true,
+            };
+            match refresh::refresh(self, &part)? {
+                Step::Done => {}
+                step => return Ok(step),
+            }
+        }
+        match finalize::land_all(&c.dir, self.reader, self.opts.dry_run, true)? {
             Landing::NoManifest => {}
             Landing::Empty => {
                 return stop(
@@ -879,11 +930,11 @@ impl Lander<'_> {
             git(&c.dir, &["push", "--quiet", &remote, &refspec])?;
             return self.await_pull_head(&c.dir, &remote, &which, number);
         }
-        let rebase = self.rebase_step(&c.name, info, &format!("swl publish {}", c.name));
-        self.merge(&which, &c.name, info, &rebase)
+        self.merge(&which, &c.name, info, &self.rebase_step(&c.name, info))
     }
 
-    /// After a push: waits until the forge has updated the MR's pull ref.
+    /// After a push of `dir`'s HEAD: waits until the forge has updated the
+    /// MR's pull ref.
     pub(crate) fn await_pull_head(
         &self,
         dir: &Path,
@@ -891,13 +942,26 @@ impl Lander<'_> {
         which: &str,
         n: u64,
     ) -> Result<Step> {
-        let cmd = self.cmd;
         let head = git(dir, &["rev-parse", "HEAD"])?;
+        self.await_pull_at(dir, remote, which, n, &head)
+    }
+
+    /// After a push of `head`: waits until the forge has the MR's pull ref
+    /// there.
+    pub(crate) fn await_pull_at(
+        &self,
+        dir: &Path,
+        remote: &str,
+        which: &str,
+        n: u64,
+        head: &str,
+    ) -> Result<Step> {
+        let cmd = self.cmd;
         let pull = format!("refs/pull/{n}/head");
         let deadline = Instant::now() + self.opts.timeout;
         loop {
             let at = git(dir, &["ls-remote", remote, &pull])?;
-            if at.split_whitespace().next() == Some(head.as_str()) {
+            if at.split_whitespace().next() == Some(head) {
                 return Ok(Step::Progress);
             }
             if Instant::now() + self.opts.interval > deadline {
@@ -905,7 +969,7 @@ impl Lander<'_> {
                     Waits::Nobody,
                     format!(
                         "{which}: waiting for the forge to update the MR to {}; rerun {cmd}",
-                        short(&head)
+                        short(head)
                     ),
                 );
             }
@@ -926,13 +990,13 @@ impl Lander<'_> {
             }
         }
         for mr in shared_entries(&manifests) {
-            match self.shared(rows, &mr)? {
+            match self.shared(rows, Some(ws), &mr)? {
                 Step::Done => {}
                 other => return Ok(other),
             }
         }
         for c in &consumers {
-            match self.consumer(rows, c)? {
+            match self.consumer(rows, &ws.root, c)? {
                 Step::Done => {}
                 other => return Ok(other),
             }
@@ -945,7 +1009,7 @@ impl Lander<'_> {
 /// --porcelain --ignored` is one that removing the checkout may delete:
 /// swl's generated `.envrc.local`, direnv's `.direnv/`, `result*` links and
 /// `.swl`.
-fn disposable(dir: &Path, path: &str, ignored: bool) -> bool {
+pub(crate) fn disposable(dir: &Path, path: &str, ignored: bool) -> bool {
     if path == ".envrc.local" {
         return fs::read_to_string(dir.join(path)).is_ok_and(|t| t.starts_with(GENERATED_MARKER));
     }
@@ -1331,7 +1395,7 @@ pub fn run_from(
         );
         let lander = Lander::new("swl land", config, reader, writer, opts);
         for mr in shared_entries(&[(consumer.clone(), mr.manifest)]) {
-            match lander.shared(&rows, &mr)? {
+            match lander.shared(&rows, None, &mr)? {
                 Step::Done => {}
                 Step::Progress => unreachable!("a dry run writes nothing"),
                 Step::Planned(then) => return Ok(planned("swl land", &then)),

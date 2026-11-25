@@ -67,15 +67,15 @@ pub struct Options {
 }
 
 /// A worktree of a repo's source, detached at a revision in a scratch
-/// directory; removed on drop.
-struct Scratch {
+/// directory; removed on drop. `swl refresh` rebases in one too.
+pub(crate) struct Scratch {
     source: PathBuf,
-    dir: PathBuf,
+    pub(crate) dir: PathBuf,
     _tmp: TempDir,
 }
 
 impl Scratch {
-    fn new(source: &Path, name: &str, rev: &str) -> Result<Self> {
+    pub(crate) fn new(source: &Path, name: &str, rev: &str) -> Result<Self> {
         let tmp = TempDir::new("swl-bump")?;
         let dir = tmp.path().join(name);
         git(

@@ -18,6 +18,7 @@ mod nix;
 mod nix_args;
 mod pin_policy;
 mod publish;
+mod refresh;
 mod shim;
 mod start;
 mod status;
@@ -128,6 +129,24 @@ enum Commands {
         #[arg(long, value_name = "CONSUMER#MR")]
         from: Option<String>,
         /// Seconds to wait for the mirror and the forge
+        #[arg(long, default_value_t = 300, value_name = "SECONDS")]
+        timeout: u64,
+        /// Seconds between checks while waiting
+        #[arg(long, default_value_t = 10, value_name = "SECONDS")]
+        interval: u64,
+    },
+    /// Rebase the change's open MR branches onto their bases and push them with a lease, shared MRs first, then the consumers
+    #[command(
+        after_help = "Exit status: 0 when every MR branch contains its base or was rebased (and for a dry run), 3 when the next step waits for the owner, 4 for anyone, 5 for nobody (the forge: rerun later), 2 on errors."
+    )]
+    Refresh {
+        /// Print what would be rebased and pushed; write nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// Workspace directory [default: current directory]
+        #[arg(long, value_name = "DIR")]
+        workspace: Option<PathBuf>,
+        /// Seconds to wait for the forge to show a pushed head
         #[arg(long, default_value_t = 300, value_name = "SECONDS")]
         timeout: u64,
         /// Seconds between checks while waiting
@@ -373,6 +392,26 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 ),
                 None => land::run(&workspace_dir(workspace)?, &config, &reader, writer, &opts),
             };
+        }
+        Commands::Refresh {
+            dry_run,
+            workspace,
+            timeout,
+            interval,
+        } => {
+            let config = Config::load(config_flag)?;
+            let opts = land::Options {
+                dry_run,
+                keep: false,
+                timeout: Duration::from_secs(timeout),
+                interval: Duration::from_secs(interval),
+            };
+            return refresh::run(
+                &workspace_dir(workspace)?,
+                &config,
+                &forge::ForgeReader::from_env(),
+                &opts,
+            );
         }
         Commands::Bump {
             dry_run,

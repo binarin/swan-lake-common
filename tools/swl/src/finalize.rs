@@ -273,6 +273,37 @@ fn prepare(dir: &Path) -> Result<(PathBuf, Option<Prepared>)> {
     ))
 }
 
+/// The subject of a landing commit starts so.
+pub const LANDING_SUBJECT: &str = "swl: land ";
+
+/// Whether `sha` is a landing commit as [`land_all`] makes it: one parent,
+/// a subject starting `swl: land `, changes to `swl.toml` (entries removed,
+/// or the file deleted) and `flake.lock` only, on a parent whose `swl.toml`
+/// has entries.
+pub fn is_landing(dir: &Path, sha: &str) -> Result<bool> {
+    let line = git(dir, &["log", "-1", "--format=%P%x00%s", sha])?;
+    let (parents, subject) = line.split_once('\0').unwrap_or((&line, ""));
+    if parents.split_whitespace().count() != 1 || !subject.starts_with(LANDING_SUBJECT) {
+        return Ok(false);
+    }
+    let files = git(
+        dir,
+        &["diff-tree", "--no-commit-id", "--name-only", "-r", sha],
+    )?;
+    if !files.lines().any(|f| f == MANIFEST_FILE)
+        || files
+            .lines()
+            .any(|f| f != MANIFEST_FILE && f != "flake.lock")
+    {
+        return Ok(false);
+    }
+    let parent = format!("{sha}^:{MANIFEST_FILE}");
+    let Some(text) = git_ok(dir, &["show", &parent]) else {
+        return Ok(false);
+    };
+    Ok(Manifest::parse(&text).is_ok_and(|m| !m.is_empty()))
+}
+
 /// The landing commit: what it lands and how many entries remain.
 pub struct Committed {
     pub subject: String,
@@ -282,8 +313,15 @@ pub struct Committed {
 }
 
 /// Checks the relock of `probe` (nothing else changed, the pin policy) and
-/// commits it with the satisfied entries removed from the manifest.
-fn commit(p: &mut Prepared, nix: &Nix, probe: &Probe, old_bytes: &[u8]) -> Result<Committed> {
+/// commits it with the satisfied entries removed from the manifest; without
+/// the repo's commit hooks unless `hooks`.
+fn commit(
+    p: &mut Prepared,
+    nix: &Nix,
+    probe: &Probe,
+    old_bytes: &[u8],
+    hooks: bool,
+) -> Result<Committed> {
     let root = &p.root;
     let Some((new_bytes, roots)) = &probe.new_lock else {
         bail!("nothing has landed");
@@ -309,7 +347,7 @@ fn commit(p: &mut Prepared, nix: &Nix, probe: &Probe, old_bytes: &[u8]) -> Resul
     }
     p.manifest.write(root)?;
     let subject = format!(
-        "swl: land {}",
+        "{LANDING_SUBJECT}{}",
         landed
             .iter()
             .map(|(path, e)| format!("{}#{} ({path})", e.repo, e.mr))
@@ -326,20 +364,20 @@ fn commit(p: &mut Prepared, nix: &Nix, probe: &Probe, old_bytes: &[u8]) -> Resul
         ));
     }
     git(root, &["add", "-A", "--", "flake.lock", MANIFEST_FILE])?;
-    git(
-        root,
-        &[
-            "commit",
-            "--quiet",
-            "-m",
-            &subject,
-            "-m",
-            body.trim_end(),
-            "--",
-            "flake.lock",
-            MANIFEST_FILE,
-        ],
-    )?;
+    let mut args = vec!["commit", "--quiet"];
+    if !hooks {
+        args.push("--no-verify");
+    }
+    args.extend([
+        "-m",
+        &subject,
+        "-m",
+        body.trim_end(),
+        "--",
+        "flake.lock",
+        MANIFEST_FILE,
+    ]);
+    git(root, &args)?;
     Ok(Committed {
         subject,
         head: git(root, &["rev-parse", "HEAD"])?,
@@ -361,8 +399,9 @@ pub enum Landing {
 }
 
 /// `finalize` for `swl land`: one commit only when every entry is satisfied,
-/// so that no partial landing is pushed.
-pub fn land_all(dir: &Path, api: &dyn PrReader, dry_run: bool) -> Result<Landing> {
+/// so that no partial landing is pushed; without the repo's commit hooks
+/// unless `hooks` (a scratch worktree may lack their tools).
+pub fn land_all(dir: &Path, api: &dyn PrReader, dry_run: bool, hooks: bool) -> Result<Landing> {
     let (_, Some(mut p)) = prepare(dir)? else {
         return Ok(Landing::NoManifest);
     };
@@ -390,7 +429,7 @@ pub fn land_all(dir: &Path, api: &dyn PrReader, dry_run: bool) -> Result<Landing
     if dry_run {
         return Ok(Landing::WouldLand(lines));
     }
-    commit(&mut p, &nix, &probe, &old_bytes).map(Landing::Committed)
+    commit(&mut p, &nix, &probe, &old_bytes, hooks).map(Landing::Committed)
 }
 
 pub fn run(dir: &Path, wait: Option<Wait>, api: &dyn PrReader) -> Result<ExitCode> {
@@ -458,7 +497,7 @@ pub fn run(dir: &Path, wait: Option<Wait>, api: &dyn PrReader) -> Result<ExitCod
         );
         return Ok(ExitCode::from(1));
     }
-    let done = commit(&mut p, &nix, &probe, &old_bytes)?;
+    let done = commit(&mut p, &nix, &probe, &old_bytes, true)?;
     style::say(
         "swl finalize",
         Tone::Good,

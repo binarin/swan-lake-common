@@ -48,7 +48,7 @@ fn fetch_base(c: &Checkout, base: &str) -> Result<()> {
 
 /// The checkout's branch, refused when its state cannot be published as is:
 /// a detached HEAD, the base branch itself, tracked changes, or a branch on
-/// origin that HEAD does not contain (no force-push, ever).
+/// origin that HEAD does not contain (publish never force-pushes).
 fn publishable(c: &Checkout, base: &str) -> Result<Branch> {
     let dir = &c.dir;
     let Some(name) = git_ok(dir, &["symbolic-ref", "--quiet", "--short", "HEAD"]) else {
@@ -81,7 +81,7 @@ fn publishable(c: &Checkout, base: &str) -> Result<Branch> {
     {
         bail!(
             "{}: origin's {name} is at {}, which HEAD does not contain; a push would not be a \
-             fast-forward (swl never force-pushes): fetch and rebase or merge first",
+             fast-forward (swl publish never force-pushes): fetch and rebase or merge first",
             c.name,
             crate::git::short(r)
         );
