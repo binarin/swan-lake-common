@@ -566,9 +566,14 @@ pub enum MergeOutcome {
     /// Scheduled: it merges when its checks succeed (also when it was
     /// scheduled before).
     Scheduled,
-    /// The user may not merge it (permissions, branch protection, a merge
+    /// The user may not merge it (permissions, the merge whitelist, a merge
     /// style the repo does not allow): for the owner.
     Refused(String),
+    /// Branch protection: a required status check has not passed (yet).
+    ChecksPending(String),
+    /// Branch protection: approvals are missing, changes are requested, or
+    /// official reviews are requested.
+    NeedsApproval(String),
     /// Not mergeable by fast-forward: the base moved, rebase the branch.
     NotFastForward(String),
     /// The MR head is not the commit asked for: it moved.
@@ -579,6 +584,10 @@ pub enum MergeOutcome {
 
 /// The outcome of a merge request from Forgejo's answer: 200 merged, 201
 /// scheduled for when checks succeed, 403 and 405 refusals, 409 conflicts.
+/// A 405 of branch protection (`not allowed to merge [reason: …]`) is told
+/// by its reason, as Forgejo's source words it (not verified against a
+/// running Forgejo): required status checks, a head behind the base,
+/// approvals and reviews; anything else is a refusal.
 pub fn merge_outcome(code: u16, body: &str) -> Result<MergeOutcome> {
     let message = serde_json::from_str::<Value>(body)
         .ok()
@@ -600,6 +609,24 @@ pub fn merge_outcome(code: u16, body: &str) -> Result<MergeOutcome> {
         }
         409 => MergeOutcome::NotFastForward(why),
         405 if lower.contains("try again later") => MergeOutcome::TryLater(why),
+        405 if lower.contains("status check") => MergeOutcome::ChecksPending(why),
+        405 if ["behind", "not up to date", "rebase"]
+            .iter()
+            .any(|m| lower.contains(m)) =>
+        {
+            MergeOutcome::NotFastForward(why)
+        }
+        405 if [
+            "approval",
+            "requested changes",
+            "changes requested",
+            "review",
+        ]
+        .iter()
+        .any(|m| lower.contains(m)) =>
+        {
+            MergeOutcome::NeedsApproval(why)
+        }
         401 => bail!(LOGIN_REJECTED),
         403 | 405 => MergeOutcome::Refused(why),
         _ => bail!("merge request: {why}"),
@@ -617,42 +644,8 @@ pub enum MergeWhen {
     ChecksSucceed,
 }
 
-/// What the forge said to cancelling a scheduled merge (`DELETE
-/// .../pulls/{n}/merge`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CancelOutcome {
-    /// 204: a scheduled merge was cancelled.
-    Cancelled,
-    /// 404: nothing was scheduled.
-    NothingScheduled,
-    /// 403, 423: the user may not cancel it (another user's schedule, a
-    /// locked repo).
-    Refused(String),
-}
-
-/// The outcome of cancelling a scheduled merge from Forgejo's answer.
-pub fn cancel_outcome(code: u16, body: &str) -> Result<CancelOutcome> {
-    let message = serde_json::from_str::<Value>(body)
-        .ok()
-        .and_then(|v| v.get("message")?.as_str().map(|m| m.trim().to_string()))
-        .filter(|m| !m.is_empty())
-        .unwrap_or_else(|| body.trim().to_string());
-    let why = if message.is_empty() {
-        format!("HTTP {code}")
-    } else {
-        format!("HTTP {code}: {message}")
-    };
-    Ok(match code {
-        200 | 204 => CancelOutcome::Cancelled,
-        404 => CancelOutcome::NothingScheduled,
-        401 => bail!(LOGIN_REJECTED),
-        403 | 423 => CancelOutcome::Refused(why),
-        _ => bail!("cancelling a scheduled merge: {why}"),
-    })
-}
-
-/// The forge writes of `swl land`: marking an MR ready, requesting its
-/// merge, and cancelling a scheduled merge.
+/// The forge writes of `swl land`: marking an MR ready and requesting its
+/// merge.
 pub trait ForgeWriter {
     /// Sets the MR's title (a draft is marked ready by dropping `WIP:`).
     fn set_title(&self, repo: &str, number: u64, title: &str) -> Result<()>;
@@ -665,8 +658,6 @@ pub trait ForgeWriter {
         head: &str,
         when: MergeWhen,
     ) -> Result<MergeOutcome>;
-    /// Cancels the MR's scheduled merge, if any.
-    fn cancel_scheduled_merge(&self, repo: &str, number: u64) -> Result<CancelOutcome>;
 }
 
 /// The title without a draft prefix (Forgejo's `WIP:` and `[WIP]`).
@@ -747,12 +738,6 @@ impl ForgeWriter for FjWriter {
         let body = merge_request_body(head, when);
         let (code, text) = self.send("POST", &path, Some(&body))?;
         merge_outcome(code, &text).with_context(|| format!("POST {path}"))
-    }
-
-    fn cancel_scheduled_merge(&self, repo: &str, number: u64) -> Result<CancelOutcome> {
-        let path = format!("repos/{}/pulls/{number}/merge", slug(repo));
-        let (code, text) = self.send("DELETE", &path, None)?;
-        cancel_outcome(code, &text).with_context(|| format!("DELETE {path}"))
     }
 }
 
@@ -1010,28 +995,39 @@ mod tests {
             o(405, r#"{"message":"Please try again later"}"#),
             MergeOutcome::TryLater(_)
         ));
+        let protected = |reason: &str| {
+            let body = serde_json::json!({
+                "message": format!("not allowed to merge [reason: {reason}]")
+            });
+            merge_outcome(405, &body.to_string()).unwrap()
+        };
+        assert!(matches!(
+            protected("Not all required status checks successful"),
+            MergeOutcome::ChecksPending(_)
+        ));
+        assert!(matches!(
+            protected("The head branch is behind the base branch"),
+            MergeOutcome::NotFastForward(_)
+        ));
+        for reason in [
+            "Does not have enough approvals",
+            "There are requested changes",
+            "There are official review requests",
+        ] {
+            assert!(
+                matches!(protected(reason), MergeOutcome::NeedsApproval(_)),
+                "{reason}"
+            );
+        }
+        assert!(matches!(
+            protected("Changed protected files"),
+            MergeOutcome::Refused(_)
+        ));
         assert_eq!(
             merge_outcome(401, "").unwrap_err().to_string(),
             LOGIN_REJECTED
         );
         assert!(merge_outcome(500, "boom").is_err());
-    }
-
-    #[test]
-    fn cancel_answers() {
-        let o = |code, body| cancel_outcome(code, body).unwrap();
-        assert_eq!(o(204, ""), CancelOutcome::Cancelled);
-        assert_eq!(o(404, ""), CancelOutcome::NothingScheduled);
-        assert_eq!(
-            o(403, r#"{"message":"not the scheduler"}"#),
-            CancelOutcome::Refused("HTTP 403: not the scheduler".into())
-        );
-        assert!(matches!(o(423, ""), CancelOutcome::Refused(_)));
-        assert_eq!(
-            cancel_outcome(401, "").unwrap_err().to_string(),
-            LOGIN_REJECTED
-        );
-        assert!(cancel_outcome(500, "boom").is_err());
     }
 
     #[test]

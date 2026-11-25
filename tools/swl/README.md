@@ -636,30 +636,44 @@ whom. Rerun it to continue. The steps:
    anyone to mark ready on the forge. Then it is merged with Forgejo's API,
    `POST /repos/{owner}/{repo}/pulls/{n}/merge` with `{"Do":
    "fast-forward-only", "delete_branch_after_merge": true,
-   "head_commit_id": <the head read>}`, so that a moved head is not merged
-   blindly, after a fresh read of the head's combined commit status:
-   - green (`success`): a plain merge, now. Any scheduled merge is cancelled
-     first (`DELETE /repos/{owner}/{repo}/pulls/{n}/merge`: 204 cancelled,
-     404 nothing scheduled), since a run cannot tell whether an earlier one
-     scheduled it;
+   "head_commit_id": <the head read>}`, after a fresh read of the head's
+   combined commit status:
+   - green (`success`): a plain merge, now. Forgejo deletes a pending
+     schedule when it merges, and a stale one on a merged MR does nothing
+     (relied on, not verified against the real forge);
    - pending, no status yet, or unreadable: the same request with
-     `"merge_when_checks_succeed": true`. Scheduled: it waits for CI, then
-     merges; nobody waits, rerun. When the status reads green right after
-     scheduling, the schedule is cancelled and the MR merged directly, in
-     the same run;
+     `"merge_when_checks_succeed": true`. Scheduled (201, or 409 "already
+     scheduled"): it waits for CI, then merges; nobody waits, rerun. When
+     the status reads green right after scheduling, a direct merge is
+     attempted in the same run;
    - failing: fix CI first, for anyone.
+
+   `head_commit_id` makes Forgejo refuse a direct merge of a head that
+   moved (409, rerun). A scheduled merge is different: Forgejo merges the
+   head that gets the success event, which need not be the head read.
 
    Forgejo (17.0.1) starts a scheduled merge only on a later commit status
    event: scheduled while the checks are green already, it answers
-   "scheduled" and never merges. So `land` never leaves a green MR
-   scheduled, and never says it waits for CI while the status is green. A
-   refused cancellation (403, 423: another user's schedule, a locked repo)
-   waits for the owner. The user may not merge (403, 405): it waits for the
-   owner, `merge <repo>#N`. Not a fast-forward (the base moved): `rebase
-   <branch> onto <base> (swl never force-pushes)`, for anyone. An MR merged
-   by hand meanwhile is merged: on to the next step. A closed MR: reopen
-   it, or drop the entry. A shared checkout that is not published (local,
-   needs publish) stops with its `status` step.
+   "scheduled" and never merges. So `land` merges a green MR directly, and
+   never says it waits for CI while the status is green. A direct merge
+   that is refused never loses a schedule: the schedule is kept, or
+   requested when the run has not made one, and the 405 is told by its
+   reason (`not allowed to merge [reason: …]`, as Forgejo's source words
+   it):
+   - a required status check that has not passed (one green so far covers
+     only the statuses reported): it waits for nobody, rerun;
+   - approvals missing, changes or official reviews requested: it waits for
+     the owner, `approve <repo>#N on the forge`;
+   - the head behind the base: `rebase <branch> onto <base> (swl never
+     force-pushes)`, for anyone, as for a 409 that is not a fast-forward;
+   - anything else, such as `User not allowed to merge PR` (the merge
+     whitelist, permissions): it waits for the owner, `merge <repo>#N`.
+     When scheduling is refused too, that is only reported.
+
+   An MR merged by hand (or by its schedule) meanwhile is merged: on to the
+   next step. A closed MR: reopen it, or drop the entry. A shared checkout
+   that is not published (local, needs publish) stops with its `status`
+   step.
 2. Promotion, for a merged MR whose input the consumer's `flake.nix`
    declares at a branch other than the repo's base branch (common's
    `swan-lake-current`; zwanenzang, pinned at master, needs none): when
@@ -708,8 +722,7 @@ check` has run (Forgejo refuses a direct merge only while a required check
 is not green). Each repo's master protection must therefore require the
 `swl check` status (and CI) for `land` to be safe.
 
-Writes are only those: the title, merge requests and the cancellation of a
-scheduled merge through fj's login (see
+Writes are only those: the title and merge requests through fj's login (see
 [Forge access](#forge-access)), the git pushes of the promotion and of the
 landing commit, the finalize commit, and the workspace removal. A write
 that one run did already and that the forge does not show yet is not
@@ -733,12 +746,11 @@ login)`. Without a login what the anonymous API cannot see is `unknown`.
 swl has no token configuration of its own.
 
 `land` reads the same way, and writes with fj's login, which it needs: the
-title of a draft (`PATCH /repos/{owner}/{repo}/pulls/{n}`), merge requests
-and the cancellation of a scheduled merge (`POST` and `DELETE
-/repos/{owner}/{repo}/pulls/{n}/merge`), under the same token rules (stdin,
-no redirect, only the forge).
-A 403 or 405 to a merge request is a refusal for the owner, not a rejected
-login; a 401 is.
+title of a draft (`PATCH /repos/{owner}/{repo}/pulls/{n}`) and merge
+requests (`POST /repos/{owner}/{repo}/pulls/{n}/merge`), under the same
+token rules (stdin, no redirect, only the forge).
+A 403 or 405 to a merge request is a refusal (see [Landing](#landing)), not
+a rejected login; a 401 is.
 
 `check`, `ci env` and `finalize` read MR state anonymously only, also with
 an fj login (`GET /api/v1/repos/binarin/<repo>/pulls/<n>`, through curl),
@@ -782,12 +794,11 @@ the override URLs) redirect them, for tests.
 - `land` follows one change in one workspace, step by step: an MR that waits
   for CI stops the run, also when later MRs could proceed. It knows a
   merge's outcome from Forgejo's answer (200 merged, 201 scheduled, 409
-  conflict, 403/405 refused) and messages, and a cancellation's (204, 404,
-  403/423); a scheduled auto-merge that fails shows as the MR still open on
-  the next run. These answers, and Forgejo's scheduled merge that waits for
-  a status event, are tested against the fake forge of the tests only, not
-  against Forgejo itself. The cancellation before a direct merge is a
-  write even when nothing is scheduled (it answers 404).
+  conflict, 403/405 refused, the reasons of a 405) and messages; a
+  scheduled auto-merge that fails shows as the MR still open on the next
+  run. These answers, Forgejo's scheduled merge that waits for a status
+  event, and the schedule that a direct merge deletes, are tested against
+  the fake forge of the tests only, not against Forgejo itself.
 - `land` tells a landed consumer from the forge's pull refs and its
   remote-tracking branch: with `fetch.prune` the pruned branch of a merged
   MR is not seen, so the workspace stays; remove it by hand.

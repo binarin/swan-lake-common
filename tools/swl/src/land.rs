@@ -36,8 +36,7 @@ use crate::{
     env::GENERATED_MARKER,
     finalize::{self, Landing},
     forge::{
-        CancelOutcome, CiState, ForgeWriter, MergeOutcome, MergeWhen, PrInfo, PrReader, PrState,
-        ready_title,
+        CiState, ForgeWriter, MergeOutcome, MergeWhen, PrInfo, PrReader, PrState, ready_title,
     },
     git::{git, git_ok, short, valid_branch},
     manifest::{Entry, MANIFEST_FILE, Manifest},
@@ -104,6 +103,15 @@ fn stop_at(row: &Row) -> Result<Step> {
     stop(
         v.waits,
         format!("{}: {}; next: {}", row.name, v.stage, v.next),
+    )
+}
+
+/// What a scheduled merge request does, for [`Lander::act`].
+fn schedule_what(which: &str, info: &PrInfo) -> String {
+    format!(
+        "request the merge of {which} at {} (fast-forward only, when its checks succeed, \
+         deleting its branch)",
+        short(&info.head_sha)
     )
 }
 
@@ -309,8 +317,9 @@ impl Lander<'_> {
     ///
     /// Forgejo merges a scheduled MR on a later commit status event only:
     /// scheduled on checks that are green already, it never merges. So a
-    /// green MR is merged directly (any scheduled merge cancelled first), and
-    /// one that turns green right after its merge was scheduled too.
+    /// green MR is merged directly, and so is one that turns green right
+    /// after its merge was scheduled. A direct merge that branch protection
+    /// refuses leaves the schedule in place, or makes one.
     fn merge(&self, which: &str, repo: &str, info: &PrInfo, republish: &str) -> Result<Step> {
         let ci = self.ci_now(repo, &info.head_sha);
         tracing::debug!(%which, ?ci, "the head's combined commit status before merging");
@@ -324,14 +333,9 @@ impl Lander<'_> {
             return Ok(step);
         }
         if ci == Some(CiState::Green) {
-            return self.merge_now(which, repo, info, republish);
+            return self.merge_now(which, repo, info, republish, false);
         }
-        let what = format!(
-            "request the merge of {which} at {} (fast-forward only, when its checks succeed, \
-             deleting its branch)",
-            short(&info.head_sha)
-        );
-        if !self.act(&format!("merge {which}"), &what)? {
+        if !self.act(&format!("merge {which}"), &schedule_what(which, info))? {
             return self.dry_stop(&format!("{which} merges when its checks succeed"));
         }
         let outcome = self.writer.request_merge(
@@ -347,10 +351,10 @@ impl Lander<'_> {
                     Tone::Plain,
                     format!(
                         "{which}: its checks turned green as the merge was scheduled, and \
-                     no later status would start it"
+                         no later status would start it"
                     ),
                 );
-                return self.merge_now(which, repo, info, republish);
+                return self.merge_now(which, repo, info, republish, true);
             }
             return stop(
                 Waits::Nobody,
@@ -362,43 +366,102 @@ impl Lander<'_> {
         self.merge_answer(which, repo, info, outcome, republish)
     }
 
-    /// Merges an MR whose checks are green: cancels any scheduled merge
-    /// (nothing scheduled is fine), then requests a plain fast-forward merge.
-    fn merge_now(&self, which: &str, repo: &str, info: &PrInfo, republish: &str) -> Result<Step> {
+    /// Merges an MR whose checks are green with a plain fast-forward merge.
+    /// Forgejo deletes a pending schedule when it merges (relied on, not
+    /// verified against a running Forgejo); a stale one on a merged MR does
+    /// nothing. A refusal by branch protection or permissions keeps the
+    /// schedule (`scheduled`), or requests one.
+    fn merge_now(
+        &self,
+        which: &str,
+        repo: &str,
+        info: &PrInfo,
+        republish: &str,
+        scheduled: bool,
+    ) -> Result<Step> {
         let what = format!(
-            "merge {which} at {} now, its checks being green (cancelling a scheduled merge \
-             first; fast-forward only, deleting its branch)",
+            "merge {which} at {} now, its checks being green (fast-forward only, deleting its \
+             branch)",
             short(&info.head_sha)
         );
         if !self.act(&format!("merge now {which}"), &what)? {
             return self.dry_stop(&format!("{which} is merged"));
         }
-        match self.writer.cancel_scheduled_merge(repo, info.number)? {
-            CancelOutcome::Cancelled => style::say(
-                "swl land",
-                Tone::Plain,
-                format!("cancelled the scheduled merge of {which}"),
-            ),
-            CancelOutcome::NothingScheduled => {
-                tracing::debug!(%which, "no scheduled merge to cancel")
-            }
-            CancelOutcome::Refused(why) => {
-                return stop(
-                    Waits::Owner,
-                    format!("merge {which} (cancelling its scheduled merge was refused: {why})"),
-                );
-            }
-        }
         let outcome =
             self.writer
                 .request_merge(repo, info.number, &info.head_sha, MergeWhen::Now)?;
-        if outcome == MergeOutcome::Scheduled {
-            return stop(
+        match &outcome {
+            MergeOutcome::Scheduled => stop(
                 Waits::Nobody,
                 format!("{which}: the forge did not merge it yet; rerun swl land"),
-            );
+            ),
+            MergeOutcome::ChecksPending(_)
+            | MergeOutcome::NeedsApproval(_)
+            | MergeOutcome::Refused(_)
+                if !self.merged_now(repo, info.number) =>
+            {
+                let note = if scheduled {
+                    "its merge stays scheduled for when its checks succeed".to_string()
+                } else {
+                    self.schedule_after_refusal(which, repo, info)?
+                };
+                self.refusal(which, outcome, &note)
+            }
+            _ => self.merge_answer(which, repo, info, outcome, republish),
         }
-        self.merge_answer(which, repo, info, outcome, republish)
+    }
+
+    /// Requests the scheduled merge of an MR whose direct merge was refused;
+    /// what came of it, for the message.
+    fn schedule_after_refusal(&self, which: &str, repo: &str, info: &PrInfo) -> Result<String> {
+        self.act(&format!("merge {which}"), &schedule_what(which, info))?;
+        let answer =
+            self.writer
+                .request_merge(repo, info.number, &info.head_sha, MergeWhen::ChecksSucceed);
+        Ok(match answer {
+            Ok(MergeOutcome::Scheduled) => {
+                "its merge is scheduled for when its checks succeed".to_string()
+            }
+            Ok(MergeOutcome::Refused(why)) => {
+                format!("scheduling its merge was refused too: {why}")
+            }
+            Ok(other) => format!("its merge could not be scheduled: {other:?}"),
+            Err(e) => format!("scheduling its merge failed: {e:#}"),
+        })
+    }
+
+    /// The stop for a refused direct merge; `note` says what became of the
+    /// schedule.
+    fn refusal(&self, which: &str, outcome: MergeOutcome, note: &str) -> Result<Step> {
+        match outcome {
+            MergeOutcome::ChecksPending(why) => stop(
+                Waits::Nobody,
+                format!(
+                    "{which}: a required status check has not passed yet ({why}); {note}; rerun \
+                     swl land"
+                ),
+            ),
+            MergeOutcome::NeedsApproval(why) => stop(
+                Waits::Owner,
+                format!("approve {which} on the forge ({why}); {note}; then rerun swl land"),
+            ),
+            MergeOutcome::Refused(why) => stop(
+                Waits::Owner,
+                format!("merge {which} (the forge refused: {why}); {note}"),
+            ),
+            other => unreachable!("not a refusal: {other:?}"),
+        }
+    }
+
+    /// Whether the forge shows the MR merged (by hand, or by its schedule).
+    fn merged_now(&self, repo: &str, number: u64) -> bool {
+        matches!(
+            self.reader.pr(repo, number),
+            Ok(Some(PrInfo {
+                state: PrState::Merged { .. },
+                ..
+            }))
+        )
     }
 
     /// The step after the forge's answer to a merge request.
@@ -416,15 +479,6 @@ impl Lander<'_> {
             .split_once('/')
             .map_or(self.config.base_for(repo), |(_, b)| b)
             .to_string();
-        let merged_now = || -> bool {
-            matches!(
-                self.reader.pr(repo, info.number),
-                Ok(Some(PrInfo {
-                    state: PrState::Merged { .. },
-                    ..
-                }))
-            )
-        };
         match outcome {
             MergeOutcome::Merged => {
                 style::say("swl land", Tone::Good, format!("{which} is merged"));
@@ -436,10 +490,20 @@ impl Lander<'_> {
                     "{which} waits for CI, then it merges (merge when checks succeed); rerun swl land"
                 ),
             ),
-            _ if merged_now() => Ok(Step::Progress),
+            _ if self.merged_now(repo, info.number) => Ok(Step::Progress),
             MergeOutcome::Refused(why) => stop(
                 Waits::Owner,
                 format!("merge {which} (the forge refused: {why})"),
+            ),
+            MergeOutcome::ChecksPending(why) => stop(
+                Waits::Nobody,
+                format!(
+                    "{which}: a required status check has not passed yet ({why}); rerun swl land"
+                ),
+            ),
+            MergeOutcome::NeedsApproval(why) => stop(
+                Waits::Owner,
+                format!("approve {which} on the forge ({why}), then rerun swl land"),
             ),
             MergeOutcome::NotFastForward(why) => stop(
                 Waits::Anyone,
@@ -1013,10 +1077,6 @@ impl ForgeWriter for DryRunWriter {
     }
 
     fn request_merge(&self, _: &str, _: u64, _: &str, _: MergeWhen) -> Result<MergeOutcome> {
-        bail!("a dry run writes nothing")
-    }
-
-    fn cancel_scheduled_merge(&self, _: &str, _: u64) -> Result<CancelOutcome> {
         bail!("a dry run writes nothing")
     }
 }

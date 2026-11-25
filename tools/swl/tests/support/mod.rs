@@ -52,10 +52,6 @@ pub const TOKEN: &str = "test-token-0123";
 /// The path and Authorization header of each request.
 type SeenAuth = Arc<Mutex<Vec<(String, Option<String>)>>>;
 
-/// The programmed answers to cancellations, by MR path: HTTP status and
-/// message.
-type CancelReplies = Arc<Mutex<BTreeMap<String, VecDeque<(u16, String)>>>>;
-
 /// One request to the fake API.
 #[derive(Clone, Debug)]
 pub struct Seen {
@@ -68,7 +64,8 @@ pub struct Seen {
 /// What the fake answers to the next merge request of an MR. Without one
 /// programmed it answers as Forgejo 17 does: a request with
 /// `merge_when_checks_succeed` is scheduled ([`MergeReply::Schedule`]), also
-/// when the checks are green already; one without merges now.
+/// when the checks are green already; one without merges now, as Forgejo's
+/// merge does, which deletes a pending schedule.
 #[derive(Clone, Debug)]
 pub enum MergeReply {
     /// Merges now, as Forgejo's fast-forward-only merge does: the base
@@ -76,9 +73,10 @@ pub enum MergeReply {
     /// merged. 409 when the head is not the asked `head_commit_id`, or not a
     /// fast-forward of master.
     MergeNow,
-    /// 201: scheduled to merge when checks succeed. As on Forgejo, only a
-    /// later status event ([`FakeApi::set_status`] with `success`) merges
-    /// it; checks green already leave it scheduled.
+    /// 201: scheduled to merge when checks succeed (409 "already scheduled"
+    /// when it is). As on Forgejo, only a later status event
+    /// ([`FakeApi::set_status`] with `success`) merges it; checks green
+    /// already leave it scheduled.
     Schedule,
     /// Scheduled as [`MergeReply::Schedule`], while the head's checks turn
     /// green without a status event that would merge it: the race of CI
@@ -91,10 +89,8 @@ pub enum MergeReply {
 /// GET responses by path; anything else is 404. Paths under a private repo
 /// answer only with `Authorization: token TOKEN`, as Forgejo does; any other
 /// token is a 401. Writes (`PATCH .../pulls/N` for the title, `POST
-/// .../pulls/N/merge`, `DELETE .../pulls/N/merge` to cancel a scheduled
-/// merge) need the token; merges answer as programmed with
-/// [`FakeApi::on_merge`], cancellations with [`FakeApi::on_cancel`] (else
-/// 204 for a scheduled merge, 404 for none).
+/// .../pulls/N/merge`) need the token, and merges answer as programmed with
+/// [`FakeApi::on_merge`].
 #[derive(Clone, Default)]
 pub struct FakeApi {
     pub port: u16,
@@ -103,7 +99,6 @@ pub struct FakeApi {
     pub seen_auth: SeenAuth,
     pub requests: Arc<Mutex<Vec<Seen>>>,
     pub merge_replies: Arc<Mutex<BTreeMap<String, VecDeque<MergeReply>>>>,
-    pub cancel_replies: CancelReplies,
     /// The MRs (API paths) whose merge is scheduled for when checks succeed.
     pub scheduled: Arc<Mutex<BTreeSet<String>>>,
     /// The forge's bare repos, `<forge>/binarin/<repo>`, for merges and,
@@ -282,21 +277,6 @@ impl FakeApi {
                 serde_json::json!({ "message": msg }).to_string(),
             )
         };
-        if method == "DELETE" {
-            let reply = self
-                .cancel_replies
-                .lock()
-                .unwrap()
-                .get_mut(pr_path)
-                .and_then(VecDeque::pop_front);
-            return match reply {
-                Some((code, msg)) => message(code, "Status", &msg),
-                None if self.scheduled.lock().unwrap().remove(pr_path) => {
-                    ("204 No Content".into(), String::new())
-                }
-                None => not_found(),
-            };
-        }
         if method != "POST" {
             return not_found();
         }
@@ -313,8 +293,15 @@ impl FakeApi {
             });
         match reply {
             MergeReply::Schedule => {
-                self.scheduled.lock().unwrap().insert(pr_path.to_string());
-                ("201 Created".into(), String::new())
+                if self.scheduled.lock().unwrap().insert(pr_path.to_string()) {
+                    ("201 Created".into(), String::new())
+                } else {
+                    message(
+                        409,
+                        "Conflict",
+                        "pull request is already scheduled to auto merge when checks succeed",
+                    )
+                }
             }
             MergeReply::ScheduleAsChecksTurnGreen => {
                 self.scheduled.lock().unwrap().insert(pr_path.to_string());
@@ -395,17 +382,6 @@ impl FakeApi {
             .entry(format!("/api/v1/repos/binarin/{repo}/pulls/{n}"))
             .or_default()
             .extend(replies.iter().cloned());
-    }
-
-    /// The answers to the next cancellations of `repo#n`'s scheduled merge,
-    /// in order: HTTP status and message.
-    pub fn on_cancel(&self, repo: &str, n: u64, replies: &[(u16, &str)]) {
-        self.cancel_replies
-            .lock()
-            .unwrap()
-            .entry(format!("/api/v1/repos/binarin/{repo}/pulls/{n}"))
-            .or_default()
-            .extend(replies.iter().map(|(c, m)| (*c, m.to_string())));
     }
 
     /// Whether `repo#n`'s merge is scheduled.

@@ -608,15 +608,13 @@ fn land_merges_an_mr_with_green_checks_directly() {
     assert!(log.contains("then: swan-lake-common#1 is merged"), "{log}");
     assert!(t.f.api.writes().is_empty(), "{:?}", t.f.api.writes());
 
-    // A plain merge, after cancelling whatever may be scheduled (nothing).
-    // With SWL_LOG=debug, the writes and the decisions on stderr, without
-    // the token (which `land` checks).
+    // A plain merge. With SWL_LOG=debug, the writes and the decisions on
+    // stderr, without the token (which `land` checks).
     let out = t.land_env(&[], &[("SWL_LOG", "debug")]);
     let err = String::from_utf8_lossy(&out.stderr);
     for want in [
-        &format!("DELETE http://127.0.0.1:{}{COMMON_MERGE}", t.f.api.port),
-        "status=404",
-        "no scheduled merge to cancel",
+        &format!("POST http://127.0.0.1:{}{COMMON_MERGE}", t.f.api.port),
+        "status=200",
         "the pass ends",
         "authed=true",
     ] {
@@ -625,7 +623,6 @@ fn land_merges_an_mr_with_green_checks_directly() {
     let log = out_text(&out);
     assert!(log.contains("swan-lake-common#1 is merged"), "{log}");
     assert!(!log.contains("swan-lake-common#1 waits for CI"), "{log}");
-    assert!(!log.contains("cancelled the scheduled merge"), "{log}");
     let writes = t.f.api.writes();
     let post = writes
         .iter()
@@ -638,10 +635,9 @@ fn land_merges_an_mr_with_green_checks_directly() {
                            "head_commit_id": c2})
     );
     assert_eq!(
-        t.writes_since(0)[..3],
+        t.writes_since(0)[..2],
         [
             "PATCH /api/v1/repos/binarin/swan-lake-common/pulls/1".to_string(),
-            format!("DELETE {COMMON_MERGE}"),
             format!("POST {COMMON_MERGE} now"),
         ]
     );
@@ -649,7 +645,7 @@ fn land_merges_an_mr_with_green_checks_directly() {
     failed(&out, 5, "swan-lake#2 waits for CI, then it merges");
     assert!(t.f.api.is_scheduled("swan-lake", 2));
     assert_eq!(
-        t.writes_since(3).last().unwrap(),
+        t.writes_since(2).last().unwrap(),
         "POST /api/v1/repos/binarin/swan-lake/pulls/2/merge when checks succeed"
     );
 
@@ -665,8 +661,13 @@ fn land_merges_an_mr_with_green_checks_directly() {
     assert_eq!(t.f.api.writes().len(), writes, "nothing more to write");
 }
 
+/// Forgejo's 405 for a branch protection `reason`.
+fn protected(reason: &str) -> MergeReply {
+    MergeReply::Status(405, format!("not allowed to merge [reason: {reason}]"))
+}
+
 #[test]
-fn land_cancels_a_scheduled_merge_once_the_checks_are_green() {
+fn land_merges_a_scheduled_mr_directly_once_its_checks_are_green() {
     let t = Change::new("land-scheduled");
     t.mirror_at_once();
     let c2 = t.common_head();
@@ -703,57 +704,36 @@ fn land_cancels_a_scheduled_merge_once_the_checks_are_green() {
     assert!(!log.contains("waits for CI"), "{log}");
     assert_eq!(t.f.api.writes().len(), 2, "a dry run writes nothing");
 
-    // Cancelling is refused: for the owner.
-    t.f.api
-        .on_cancel("swan-lake-common", 1, &[(403, "not the scheduler")]);
-    failed(
-        &t.land(&[]),
-        3,
-        "waits for the owner: merge swan-lake-common#1 (cancelling its scheduled merge was refused: HTTP 403: not the scheduler)",
-    );
-    assert_eq!(t.writes_since(2), [format!("DELETE {COMMON_MERGE}")]);
-
-    // Cancelled, then the direct merge is refused: for the owner, as before.
+    // Green as far as reported, but a required check has not reported: the
+    // direct merge is refused, and the schedule stays (Forgejo answers that
+    // it is scheduled already).
     t.f.api.on_merge(
         "swan-lake-common",
         1,
-        &[MergeReply::Status(
-            405,
-            "User not allowed to merge PR".into(),
-        )],
+        &[protected("Not all required status checks successful")],
     );
     let out = t.land(&[]);
     failed(
         &out,
-        3,
-        "waits for the owner: merge swan-lake-common#1 (the forge refused: HTTP 405: User not allowed to merge PR)",
+        5,
+        "waits for nobody: swan-lake-common#1: a required status check has not passed yet (HTTP 405: not allowed to merge [reason: Not all required status checks successful]); its merge is scheduled for when its checks succeed; rerun swl land",
     );
-    assert!(
-        out_text(&out).contains("cancelled the scheduled merge of swan-lake-common#1"),
-        "{}",
-        text(&out)
-    );
-    assert!(!t.f.api.is_scheduled("swan-lake-common", 1));
+    assert!(t.f.api.is_scheduled("swan-lake-common", 1));
     assert_eq!(
-        t.writes_since(3),
+        t.writes_since(2),
         [
-            format!("DELETE {COMMON_MERGE}"),
             format!("POST {COMMON_MERGE} now"),
+            format!("POST {COMMON_MERGE} when checks succeed"),
         ]
     );
 
-    // Allowed now: nothing left to cancel, merged directly.
+    // Allowed now: merged directly; the merge deletes the schedule.
     let out = t.land(&[]);
     let log = out_text(&out);
     assert!(log.contains("swan-lake-common#1 is merged"), "{log}");
     assert!(!log.contains("swan-lake-common#1 waits for CI"), "{log}");
-    assert_eq!(
-        t.writes_since(5)[..2],
-        [
-            format!("DELETE {COMMON_MERGE}"),
-            format!("POST {COMMON_MERGE} now"),
-        ]
-    );
+    assert_eq!(t.writes_since(4)[0], format!("POST {COMMON_MERGE} now"));
+    assert!(!t.f.api.is_scheduled("swan-lake-common", 1));
     assert_eq!(
         t.f.git(
             &t.f.forge_repo("swan-lake-common"),
@@ -762,6 +742,81 @@ fn land_cancels_a_scheduled_merge_once_the_checks_are_green() {
         c2
     );
     failed(&out, 5, "swan-lake#2 waits for CI, then it merges");
+}
+
+#[test]
+fn land_keeps_or_makes_the_schedule_when_a_green_mr_may_not_be_merged() {
+    let t = Change::new("land-refused");
+    let c2 = t.common_head();
+    t.f.api.set_status("swan-lake-common", &c2, "success");
+
+    // Not on the merge whitelist: for the owner; the merge is scheduled.
+    t.f.api.on_merge(
+        "swan-lake-common",
+        1,
+        &[MergeReply::Status(
+            405,
+            "User not allowed to merge PR".into(),
+        )],
+    );
+    failed(
+        &t.land(&[]),
+        3,
+        "waits for the owner: merge swan-lake-common#1 (the forge refused: HTTP 405: User not allowed to merge PR); its merge is scheduled for when its checks succeed",
+    );
+    assert!(t.f.api.is_scheduled("swan-lake-common", 1));
+    assert_eq!(
+        t.writes_since(1),
+        [
+            format!("POST {COMMON_MERGE} now"),
+            format!("POST {COMMON_MERGE} when checks succeed"),
+        ]
+    );
+
+    // Missing approvals: for the owner; the schedule stays.
+    t.f.api.on_merge(
+        "swan-lake-common",
+        1,
+        &[protected("Does not have enough approvals")],
+    );
+    failed(
+        &t.land(&[]),
+        3,
+        "waits for the owner: approve swan-lake-common#1 on the forge (HTTP 405: not allowed to merge [reason: Does not have enough approvals]); its merge is scheduled for when its checks succeed; then rerun swl land",
+    );
+    assert!(t.f.api.is_scheduled("swan-lake-common", 1));
+
+    // Behind the base: rebase, for anyone.
+    t.f.api.on_merge(
+        "swan-lake-common",
+        1,
+        &[protected("The head branch is behind the base branch")],
+    );
+    failed(
+        &t.land(&[]),
+        4,
+        "waits for anyone: rebase sl-0020-land onto master (swl never force-pushes)",
+    );
+    assert!(t.f.api.is_scheduled("swan-lake-common", 1));
+
+    // Scheduling is refused too: only reported.
+    t.f.api.scheduled.lock().unwrap().clear();
+    let refused = MergeReply::Status(405, "User not allowed to merge PR".into());
+    t.f.api
+        .on_merge("swan-lake-common", 1, &[refused.clone(), refused]);
+    failed(
+        &t.land(&[]),
+        3,
+        "merge swan-lake-common#1 (the forge refused: HTTP 405: User not allowed to merge PR); scheduling its merge was refused too: HTTP 405: User not allowed to merge PR",
+    );
+    assert!(!t.f.api.is_scheduled("swan-lake-common", 1));
+    let writes = t.f.api.writes();
+    assert!(
+        writes
+            .iter()
+            .all(|w| w.starts_with("POST ") || w.starts_with("PATCH ")),
+        "{writes:?}"
+    );
 }
 
 #[test]
@@ -781,22 +836,45 @@ fn land_merges_directly_when_the_checks_turn_green_as_the_merge_is_scheduled() {
         log.contains("swan-lake-common#1: its checks turned green as the merge was scheduled"),
         "{log}"
     );
-    assert!(
-        log.contains("cancelled the scheduled merge of swan-lake-common#1"),
-        "{log}"
-    );
     assert!(log.contains("swan-lake-common#1 is merged"), "{log}");
     assert!(!log.contains("swan-lake-common#1 waits for CI"), "{log}");
     assert_eq!(
-        t.writes_since(0)[..4],
+        t.writes_since(0)[..3],
         [
             "PATCH /api/v1/repos/binarin/swan-lake-common/pulls/1".to_string(),
             format!("POST {COMMON_MERGE} when checks succeed"),
-            format!("DELETE {COMMON_MERGE}"),
             format!("POST {COMMON_MERGE} now"),
         ]
     );
     assert!(!t.f.api.is_scheduled("swan-lake-common", 1));
     // On to the consumer, in the same run.
     failed(&out, 5, "swan-lake#2 waits for CI, then it merges");
+
+    // The race again on the consumer, whose direct merge a required check
+    // refuses: the schedule from before stays, not asked for again.
+    let landing = t.f.git(&t.consumer, &["rev-parse", "HEAD"]);
+    t.f.api.scheduled.lock().unwrap().clear();
+    t.f.api.set_status("swan-lake", &landing, "pending");
+    let writes = t.f.api.writes().len();
+    t.f.api.on_merge(
+        "swan-lake",
+        2,
+        &[
+            MergeReply::ScheduleAsChecksTurnGreen,
+            protected("Not all required status checks successful"),
+        ],
+    );
+    failed(
+        &t.land(&[]),
+        5,
+        "swan-lake#2: a required status check has not passed yet (HTTP 405: not allowed to merge [reason: Not all required status checks successful]); its merge stays scheduled for when its checks succeed",
+    );
+    assert!(t.f.api.is_scheduled("swan-lake", 2));
+    assert_eq!(
+        t.writes_since(writes),
+        [
+            "POST /api/v1/repos/binarin/swan-lake/pulls/2/merge when checks succeed".to_string(),
+            "POST /api/v1/repos/binarin/swan-lake/pulls/2/merge now".to_string(),
+        ]
+    );
 }
