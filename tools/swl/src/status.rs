@@ -657,31 +657,6 @@ fn ancestor(dir: &Path, a: &str, b: &str) -> Result<bool, String> {
     Ok(git_ok(dir, &["merge-base", "--is-ancestor", a, b]).is_some())
 }
 
-/// The head of `branch` in the repository at `url`, by `ls-remote`.
-/// Never prompts for credentials.
-fn declared_head(url: &str, branch: &str) -> Result<String, String> {
-    let out = std::process::Command::new(crate::git::GIT)
-        .args(["ls-remote", url, &format!("refs/heads/{branch}")])
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .stdin(std::process::Stdio::null())
-        .output()
-        .map_err(|e| format!("running {}: {e}", crate::git::GIT))?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        return Err(err
-            .trim()
-            .lines()
-            .last()
-            .unwrap_or("git ls-remote failed")
-            .to_string());
-    }
-    String::from_utf8_lossy(&out.stdout)
-        .split_whitespace()
-        .next()
-        .map(str::to_string)
-        .ok_or_else(|| format!("no branch {branch}"))
-}
-
 fn remote_state(dir: &Path, head: &str, remote_head: Option<&str>) -> RemoteBranch {
     match remote_head {
         None => RemoteBranch::Missing,
@@ -757,7 +732,7 @@ impl Ctx<'_> {
         let on_forge = ancestor(dir, merge_commit, &tip);
         let declared_source = match declared.git_url {
             Some(url) if self.fetcher.enabled() => {
-                let has = declared_head(&url, &branch)
+                let has = ancestry::remote_head(&url, &format!("refs/heads/{branch}"))
                     .and_then(|tip| ancestry::is_ancestor(&url, merge_commit, &tip, false));
                 Some((url, has))
             }

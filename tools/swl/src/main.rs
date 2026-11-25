@@ -1,3 +1,5 @@
+// The check rules use all of it from the next commit on.
+#[allow(dead_code)]
 mod ancestry;
 mod check;
 mod ci;
@@ -6,6 +8,8 @@ mod env;
 mod finalize;
 mod forge;
 mod git;
+#[allow(dead_code)]
+mod github;
 mod lock;
 mod lock_change;
 mod manifest;

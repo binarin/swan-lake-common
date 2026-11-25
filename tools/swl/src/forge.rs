@@ -170,35 +170,59 @@ pub trait PrReader {
     }
 }
 
-/// `(HTTP status, body)` of a GET of `<base>/<path>` through curl, or an
-/// error when the forge is unreachable. A token goes to curl on stdin, never
-/// on its command line, and a request with it follows no redirect.
-fn api_get(base: &str, path: &str, token: Option<&str>) -> Result<(u16, String)> {
-    let url = format!("{}/{path}", base.trim_end_matches('/'));
+/// An HTTP request through curl.
+pub struct Request<'a> {
+    pub method: &'a str,
+    pub url: &'a str,
+    /// Sent as `Authorization: token <token>`.
+    pub token: Option<&'a str>,
+    pub accept: &'a str,
+    /// A JSON body.
+    pub body: Option<&'a str>,
+    /// What the server is, for errors: `forge API`, `GitHub API`.
+    pub what: &'a str,
+}
+
+/// `(HTTP status, body)` of a request through curl, or an error when the
+/// server is unreachable. A token goes to curl on stdin, never on its command
+/// line, and a request with it follows no redirect.
+pub fn http(req: &Request) -> Result<(u16, String)> {
+    let url = req.url;
     let mut cmd = Command::new(CURL);
     cmd.args([
         "--silent",
         "--show-error",
+        "--globoff",
         "--max-time",
         "30",
+        "--request",
+        req.method,
         "--header",
-        "Accept: application/json",
+        &format!("Accept: {}", req.accept),
         "--write-out",
         "\n%{http_code}",
     ]);
-    match token {
+    if let Some(body) = req.body {
+        cmd.args([
+            "--header",
+            "Content-Type: application/json",
+            "--data-binary",
+            body,
+        ]);
+    }
+    match req.token {
         Some(_) => cmd.args(["--config", "-"]),
         None => cmd.arg("--location"),
     };
     let mut child = cmd
-        .arg(&url)
+        .arg(url)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .with_context(|| format!("running {CURL}"))?;
     let mut stdin = child.stdin.take().expect("piped");
-    if let Some(token) = token {
+    if let Some(token) = req.token {
         let token = token.replace('\\', "\\\\").replace('"', "\\\"");
         writeln!(stdin, "header = \"Authorization: token {token}\"")
             .context("passing the token to curl")?;
@@ -209,7 +233,9 @@ fn api_get(base: &str, path: &str, token: Option<&str>) -> Result<(u16, String)>
         .with_context(|| format!("running {CURL}"))?;
     if !out.status.success() {
         bail!(
-            "forge API unreachable: GET {url}: {}",
+            "{} unreachable: {} {url}: {}",
+            req.what,
+            req.method,
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
@@ -218,8 +244,20 @@ fn api_get(base: &str, path: &str, token: Option<&str>) -> Result<(u16, String)>
     let code = code
         .trim()
         .parse()
-        .with_context(|| format!("GET {url}: no HTTP status"))?;
+        .with_context(|| format!("{} {url}: no HTTP status", req.method))?;
     Ok((code, body.to_string()))
+}
+
+/// `(HTTP status, body)` of a GET of `<base>/<path>` on the forge API.
+fn api_get(base: &str, path: &str, token: Option<&str>) -> Result<(u16, String)> {
+    http(&Request {
+        method: "GET",
+        url: &format!("{}/{path}", base.trim_end_matches('/')),
+        token,
+        accept: "application/json",
+        body: None,
+        what: "forge API",
+    })
 }
 
 /// What a 401 or 403 to a request with fj's token means.

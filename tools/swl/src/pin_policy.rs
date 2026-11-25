@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
 
-use crate::ancestry;
+use crate::{ancestry, git::is_rev};
 
 pub const CANONICAL: &str = "github:binarin/swan-lake-common/swan-lake-current";
 /// A temporary Forgejo branch pin, as the SL-34 workflow used.
@@ -35,10 +35,6 @@ pub fn is_next_name(name: &str) -> bool {
 pub struct Pins {
     pub common_rev: String,
     pub next: Vec<(String, Value)>,
-}
-
-fn is_rev(s: &str) -> bool {
-    s.len() == 40 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 fn is_nar_hash(s: &str) -> bool {
