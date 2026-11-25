@@ -241,25 +241,45 @@ fn rerun_env(cmd: &str, root: &Path, config: &Config) {
     }
 }
 
+/// A local branch of a source that `finalize` needs in a scratch worktree;
+/// deleted on drop, which must come after the worktree's removal (declare
+/// it before the [`Scratch`]): a branch checked out cannot be deleted.
+struct TempBranch<'a> {
+    source: &'a Path,
+    name: String,
+}
+
+impl<'a> TempBranch<'a> {
+    fn new(source: &'a Path) -> Self {
+        Self {
+            source,
+            name: format!("swl-refresh-{}", std::process::id()),
+        }
+    }
+}
+
+impl Drop for TempBranch<'_> {
+    fn drop(&mut self) {
+        let _ = git(self.source, &["branch", "--quiet", "-D", &self.name]);
+    }
+}
+
 /// Makes the dropped landing commit `dropped`, which landed `paths`, anew
-/// on the scratch worktree's HEAD, on a temporary branch (which `finalize`
-/// needs), without hooks: the same entries landed, and the same `swl.toml`
-/// left. The new head, or why not.
+/// on the scratch worktree's HEAD, on the temporary branch `tmp` (which
+/// `finalize` needs), without hooks: the same entries landed, and the same
+/// `swl.toml` left. The new head, or why not.
 fn refinalize(
     l: &Lander,
     s: &Scratch,
-    source: &Path,
+    tmp: &TempBranch,
     which: &str,
     dropped: &str,
     paths: &BTreeSet<String>,
 ) -> Result<String, String> {
     let err = |e: anyhow::Error| format!("{e:#}");
-    let tmp = format!("swl-refresh-{}", std::process::id());
-    git(&s.dir, &["switch", "--quiet", "-C", &tmp]).map_err(err)?;
-    let landed = finalize::land_exactly(&s.dir, l.reader, paths);
-    let _ = git(&s.dir, &["switch", "--quiet", "--detach"]);
-    let _ = git(source, &["branch", "--quiet", "-D", &tmp]);
-    let done = landed.map_err(err)??;
+    git(&s.dir, &["switch", "--quiet", "-C", &tmp.name]).map_err(err)?;
+    let done = finalize::land_exactly(&s.dir, l.reader, paths).map_err(err)??;
+    let source = tmp.source;
     let manifest = |rev: &str| git_ok(source, &["show", &format!("{rev}:{MANIFEST_FILE}")]);
     if manifest(&done.head) != manifest(dropped) {
         return Err(format!(
@@ -442,6 +462,8 @@ pub(crate) fn refresh(l: &Lander, part: &Part) -> Result<Step> {
             "CI runs on the new head of {which}, then its merge is requested"
         )));
     }
+    // Dropped after the scratch worktree.
+    let tmp_branch = TempBranch::new(source);
     let scratch = Scratch::new(source, part.repo, &start)?;
     if let Some(conflict) = rebase(&scratch.dir, &base_tip)? {
         let by_hand = match part.place {
@@ -467,7 +489,7 @@ pub(crate) fn refresh(l: &Lander, part: &Part) -> Result<Step> {
         );
     }
     if let Some(paths) = &landed {
-        match refinalize(l, &scratch, source, which, &observed, paths) {
+        match refinalize(l, &scratch, &tmp_branch, which, &observed, paths) {
             Ok(h) => head = h,
             Err(why) => {
                 return stop(

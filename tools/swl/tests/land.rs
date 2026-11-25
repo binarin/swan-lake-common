@@ -1667,6 +1667,16 @@ fn refresh_makes_a_partial_landing_anew_with_the_same_entries() {
     assert_eq!(t.f.git(&t.consumer, &["rev-parse", "HEAD"]), head);
     assert_eq!(t.f.git(&t.consumer, &["rev-parse", "HEAD~4"]), m2);
     assert_eq!(t.f.git(&t.consumer, &["show", "HEAD:swl.toml"]), partial);
+    let source = t.f.source("swan-lake");
+    assert!(
+        t.f.git(&source, &["branch", "--list", "swl-refresh-*"])
+            .is_empty()
+    );
+    assert_eq!(
+        t.worktrees("swan-lake").len(),
+        2,
+        "the scratch worktree is gone"
+    );
 }
 
 #[test]
