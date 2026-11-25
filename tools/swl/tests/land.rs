@@ -959,6 +959,35 @@ impl Change {
         self.f.git(&self.f.forge_repo(repo), &["rev-parse", branch])
     }
 
+    /// Runs `script` once when a push from `repo`'s source reaches the
+    /// forge, before the forge reads the push (git's
+    /// `remote.origin.receivepack`); the file that says it ran.
+    fn before_receive(&self, repo: &str, script: &str) -> PathBuf {
+        let wrapper = self.f.root.join(format!("receive-pack-{repo}"));
+        let ran = self.f.root.join(format!("receive-pack-{repo}.ran"));
+        fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nif [ ! -e {ran} ]; then\ntouch {ran}\n{script}\nfi\nexec git \
+                 receive-pack \"$@\"\n",
+                ran = ran.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&wrapper).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        fs::set_permissions(&wrapper, perms).unwrap();
+        self.f.git(
+            &self.f.source(repo),
+            &[
+                "config",
+                "remote.origin.receivepack",
+                &wrapper.display().to_string(),
+            ],
+        );
+        ran
+    }
+
     /// The worktrees of `repo`'s source, by path.
     fn worktrees(&self, repo: &str) -> Vec<String> {
         self.f
@@ -1156,22 +1185,16 @@ fn refresh_loses_a_race_for_the_branch_to_its_lease() {
     let t = Change::new("refresh-lease");
     let c2 = t.common_head();
     t.f.commit_file_on_forge("swan-lake-common", "master", "other.txt", "o");
-    // Someone pushes to the branch after swl read it: here as the scratch
-    // worktree is checked out, from a hook of the source that runs once.
+    // Someone pushes to the branch after swl read it: here as swl's push
+    // reaches the forge, before the forge advertises its refs.
     let forge = t.f.forge_repo("swan-lake-common").display().to_string();
-    let hook = t.f.source("swan-lake-common").join("hooks/post-checkout");
-    fs::create_dir_all(hook.parent().unwrap()).unwrap();
-    fs::write(
-        &hook,
-        format!(
-            "#!/bin/sh\nrm \"$0\"\nc=$(git --git-dir={forge} commit-tree {c2}^{{tree}} -p {c2} -m race)\n\
+    let ran = t.before_receive(
+        "swan-lake-common",
+        &format!(
+            "c=$(git --git-dir={forge} commit-tree {c2}^{{tree}} -p {c2} -m race)\n\
              git --git-dir={forge} update-ref refs/heads/sl-0020-land \"$c\"\n"
         ),
-    )
-    .unwrap();
-    let mut perms = fs::metadata(&hook).unwrap().permissions();
-    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
-    fs::set_permissions(&hook, perms).unwrap();
+    );
     let out = t.refresh(&[]);
     failed(
         &out,
@@ -1182,7 +1205,7 @@ fn refresh_loses_a_race_for_the_branch_to_its_lease() {
             &c2[..12]
         ),
     );
-    assert!(!hook.exists(), "the race ran");
+    assert!(ran.exists(), "the race ran");
     let race = t.forge_head("swan-lake-common", "sl-0020-land");
     assert_eq!(
         t.f.git(

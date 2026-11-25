@@ -376,10 +376,16 @@ pub(crate) fn refresh(l: &Lander, part: &Part) -> Result<Step> {
         }
     }
     let refspec = format!("{head}:refs/heads/{branch}");
-    if let Err(e) = git(
-        &scratch.dir,
-        &["push", "--quiet", &lease, &remote, &refspec],
-    ) {
+    let push = [
+        "-c",
+        "core.hooksPath=/dev/null",
+        "push",
+        "--quiet",
+        &lease,
+        &remote,
+        &refspec,
+    ];
+    if let Err(e) = git(&scratch.dir, &push) {
         return match push_rejection(&format!("{e:#}")) {
             None => Err(e.context(format!("pushing {branch} of {which}"))),
             Some(Rejection::Moved) => stop(
