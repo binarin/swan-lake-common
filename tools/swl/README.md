@@ -472,7 +472,10 @@ Exit status 1 with one line per problem.
     the policy.
 
 `check` reads `flake.nix` with `nix eval --impure` (no input is fetched) and
-uses the real `nix` on PATH, never a swl wrapper.
+uses the real `nix` on PATH, never a swl wrapper. That eval runs in nix's
+restricted mode (`restrict-eval`, with only the repo readable): it fetches
+nothing, reads no file outside the repo and sees no environment variable.
+No nix call of swl gets `SWL_GITHUB_TOKEN` or `SWL_FJ_KEYS`.
 
 ### `swl ci env [DIR]`
 

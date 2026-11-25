@@ -1043,6 +1043,44 @@ fn check_accepts_forward_moves_and_refuses_backwards() {
     );
 }
 
+/// `check` evaluates the MR's flake.nix in restricted mode: it reads
+/// nothing outside the repo, and sees no environment.
+#[test]
+fn check_evaluates_flake_nix_restricted() {
+    let w = World::new("restricted");
+    let secret = w.root.join("secret.txt");
+    fs::write(&secret, "git+file:///nowhere").unwrap();
+    let flake = fs::read_to_string(w.consumer.join("flake.nix")).unwrap();
+    fs::write(
+        w.consumer.join("flake.nix"),
+        flake.replacen(
+            "{\n",
+            &format!(
+                "{{\n  inputs.newin.url = builtins.readFile {};\n",
+                secret.display()
+            ),
+            1,
+        ),
+    )
+    .unwrap();
+    fs::write(
+        w.consumer.join("swl.toml"),
+        "[inputs.newin]\nrepo = \"swan-lake-common\"\nmr = 1\n",
+    )
+    .unwrap();
+    w.git(&w.consumer, &["add", "-A"]);
+    w.git(&w.consumer, &["commit", "-qm", "newin"]);
+    failed(
+        &w.swl(
+            &w.consumer,
+            &["check", "--event", "mr", "--base", "origin/master"],
+            &[("SWL_GITHUB_TOKEN", "gh-secret")],
+        ),
+        2,
+        "forbidden in restricted mode",
+    );
+}
+
 /// The review's attack on a landing that adds an input: its `original` is
 /// the entry's repo, its `locked` source another repo.
 #[test]
