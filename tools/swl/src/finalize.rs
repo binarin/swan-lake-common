@@ -225,14 +225,20 @@ fn locked_rev(lock: &Value, input: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-pub fn run(dir: &Path, wait: Option<Wait>, api: &dyn PrReader) -> Result<ExitCode> {
+/// A consumer repo ready to finalize: on a branch, with no uncommitted
+/// changes to the flake files, and its manifest.
+struct Prepared {
+    root: PathBuf,
+    branch: String,
+    manifest: Manifest,
+}
+
+/// `None` when the repo has no manifest. Refuses a detached HEAD and
+/// uncommitted changes to flake.nix, flake.lock or swl.toml.
+fn prepare(dir: &Path) -> Result<(PathBuf, Option<Prepared>)> {
     let root = PathBuf::from(git(dir, &["rev-parse", "--show-toplevel"])?);
-    let Some(mut manifest) = Manifest::read(&root)? else {
-        println!(
-            "swl finalize: no {MANIFEST_FILE} in {}: nothing to finalize",
-            root.display()
-        );
-        return Ok(ExitCode::SUCCESS);
+    let Some(manifest) = Manifest::read(&root)? else {
+        return Ok((root, None));
     };
     let Some(branch) = git_ok(&root, &["symbolic-ref", "--quiet", "--short", "HEAD"]) else {
         bail!(
@@ -256,7 +262,100 @@ pub fn run(dir: &Path, wait: Option<Wait>, api: &dyn PrReader) -> Result<ExitCod
             "commit or discard the changes to flake.nix, flake.lock and {MANIFEST_FILE} first:\n{dirty}"
         );
     }
-    if manifest.is_empty() {
+    Ok((
+        root.clone(),
+        Some(Prepared {
+            root,
+            branch,
+            manifest,
+        }),
+    ))
+}
+
+/// The landing commit: what it lands and how many entries remain.
+pub struct Committed {
+    pub subject: String,
+    /// The new HEAD.
+    pub head: String,
+    pub remaining: usize,
+}
+
+/// Checks the relock of `probe` (nothing else changed, the pin policy) and
+/// commits it with the satisfied entries removed from the manifest.
+fn commit(p: &mut Prepared, nix: &Nix, probe: &Probe, old_bytes: &[u8]) -> Result<Committed> {
+    let root = &p.root;
+    let Some((new_bytes, roots)) = &probe.new_lock else {
+        bail!("nothing has landed");
+    };
+    let old: Value = serde_json::from_slice(old_bytes).context("parsing flake.lock")?;
+    let new: Value = serde_json::from_slice(new_bytes)?;
+    lock_change::verify(&old, &new, roots).context("the relock changed more than intended")?;
+    let decls = nix.declarations(root)?;
+    pin_policy::check(&decls, &new, &|url| nix.parse_flake_ref(url))
+        .context("the relocked flake.lock breaks the common pin policy")?;
+
+    let landed: Vec<(String, Entry)> = probe
+        .statuses
+        .iter()
+        .filter(|(_, s)| matches!(s, Status::Satisfied { .. }))
+        .map(|(path, _)| (path.clone(), p.manifest.inputs[path].clone()))
+        .collect();
+    for (path, _) in &landed {
+        p.manifest.inputs.remove(path);
+    }
+    if new_bytes != old_bytes {
+        fs::write(root.join("flake.lock"), new_bytes).context("writing flake.lock")?;
+    }
+    p.manifest.write(root)?;
+    let subject = format!(
+        "swl: land {}",
+        landed
+            .iter()
+            .map(|(path, e)| format!("{}#{} ({path})", e.repo, e.mr))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let mut body = String::new();
+    for r in roots {
+        let (a, b) = (locked_rev(&old, r), locked_rev(&new, r));
+        body.push_str(&format!(
+            "{r}: {} -> {}\n",
+            a.as_deref().map(short).unwrap_or("(new)"),
+            b.as_deref().map(short).unwrap_or("?")
+        ));
+    }
+    git(root, &["add", "-A", "--", "flake.lock", MANIFEST_FILE])?;
+    git(
+        root,
+        &[
+            "commit",
+            "--quiet",
+            "-m",
+            &subject,
+            "-m",
+            body.trim_end(),
+            "--",
+            "flake.lock",
+            MANIFEST_FILE,
+        ],
+    )?;
+    Ok(Committed {
+        subject,
+        head: git(root, &["rev-parse", "HEAD"])?,
+        remaining: p.manifest.inputs.len(),
+    })
+}
+
+pub fn run(dir: &Path, wait: Option<Wait>, api: &dyn PrReader) -> Result<ExitCode> {
+    let (root, Some(mut p)) = prepare(dir)? else {
+        let root = PathBuf::from(git(dir, &["rev-parse", "--show-toplevel"])?);
+        println!(
+            "swl finalize: no {MANIFEST_FILE} in {}: nothing to finalize",
+            root.display()
+        );
+        return Ok(ExitCode::SUCCESS);
+    };
+    if p.manifest.is_empty() {
         println!(
             "swl finalize: {MANIFEST_FILE} has no entries; remove it (git rm {MANIFEST_FILE}) before landing"
         );
@@ -264,11 +363,10 @@ pub fn run(dir: &Path, wait: Option<Wait>, api: &dyn PrReader) -> Result<ExitCod
     }
     let nix = Nix::find()?;
     let old_bytes = fs::read(root.join("flake.lock")).context("reading flake.lock")?;
-    let old: Value = serde_json::from_slice(&old_bytes).context("parsing flake.lock")?;
     let deadline = wait.as_ref().map(|w| Instant::now() + w.timeout);
     let probe = loop {
-        let p = probe(&root, &manifest, api, &nix, &old_bytes)?;
-        let waiting_for = p
+        let probe = probe(&root, &p.manifest, api, &nix, &old_bytes)?;
+        let waiting_for = probe
             .statuses
             .iter()
             .filter(|(_, s)| matches!(s, Status::NotYetReachable { .. }))
@@ -282,11 +380,11 @@ pub fn run(dir: &Path, wait: Option<Wait>, api: &dyn PrReader) -> Result<ExitCod
                 );
                 thread::sleep(w.interval);
             }
-            _ => break p,
+            _ => break probe,
         }
     };
     for (path, status) in &probe.statuses {
-        let e = &manifest.inputs[path];
+        let e = &p.manifest.inputs[path];
         println!(
             "swl finalize: {path} ({}#{}): {}",
             e.repo,
@@ -294,70 +392,25 @@ pub fn run(dir: &Path, wait: Option<Wait>, api: &dyn PrReader) -> Result<ExitCod
             describe(status)
         );
     }
-    let Some((new_bytes, roots)) = probe.new_lock else {
+    if probe.new_lock.is_none() {
         println!("swl finalize: nothing has landed; no commit made");
         return Ok(ExitCode::from(1));
-    };
-    let new: Value = serde_json::from_slice(&new_bytes)?;
-    lock_change::verify(&old, &new, &roots).context("the relock changed more than intended")?;
-    let decls = nix.declarations(&root)?;
-    pin_policy::check(&decls, &new, &|url| nix.parse_flake_ref(url))
-        .context("the relocked flake.lock breaks the common pin policy")?;
-
-    let landed: Vec<(String, Entry)> = probe
-        .statuses
-        .iter()
-        .filter(|(_, s)| matches!(s, Status::Satisfied { .. }))
-        .map(|(p, _)| (p.clone(), manifest.inputs[p].clone()))
-        .collect();
-    for (path, _) in &landed {
-        manifest.inputs.remove(path);
     }
-    if new_bytes != old_bytes {
-        fs::write(root.join("flake.lock"), &new_bytes).context("writing flake.lock")?;
-    }
-    manifest.write(&root)?;
-    let subject = format!(
-        "swl: land {}",
-        landed
-            .iter()
-            .map(|(p, e)| format!("{}#{} ({p})", e.repo, e.mr))
-            .collect::<Vec<_>>()
-            .join(", ")
+    let done = commit(&mut p, &nix, &probe, &old_bytes)?;
+    println!(
+        "swl finalize: committed {} on {}: {}",
+        short(&done.head),
+        p.branch,
+        done.subject
     );
-    let mut body = String::new();
-    for r in &roots {
-        let (a, b) = (locked_rev(&old, r), locked_rev(&new, r));
-        body.push_str(&format!(
-            "{r}: {} -> {}\n",
-            a.as_deref().map(short).unwrap_or("(new)"),
-            b.as_deref().map(short).unwrap_or("?")
-        ));
-    }
-    git(&root, &["add", "-A", "--", "flake.lock", MANIFEST_FILE])?;
-    git(
-        &root,
-        &[
-            "commit",
-            "--quiet",
-            "-m",
-            &subject,
-            "-m",
-            body.trim_end(),
-            "--",
-            "flake.lock",
-            MANIFEST_FILE,
-        ],
-    )?;
-    let head = git(&root, &["rev-parse", "--short", "HEAD"])?;
-    println!("swl finalize: committed {head} on {branch}: {subject}");
-    if manifest.is_empty() {
+    if done.remaining == 0 {
         println!(
-            "Next (nothing was pushed): push this commit to {branch} (fast-forward) and merge \
-             the MR, whose swl check accepts the landing."
+            "Next (nothing was pushed): push this commit to {} (fast-forward) and merge the MR, \
+             whose swl check accepts the landing.",
+            p.branch
         );
     } else {
-        let n = manifest.inputs.len();
+        let n = done.remaining;
         println!(
             "{n} entr{} remain in {MANIFEST_FILE}. Nothing was pushed; pushed to the MR branch, \
              this partial landing passes swl check. Rerun swl finalize once the rest has landed.",
