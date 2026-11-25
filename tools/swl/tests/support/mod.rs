@@ -262,9 +262,13 @@ impl FakeApi {
                 return not_found();
             };
             let mut v: serde_json::Value = serde_json::from_str(pr).unwrap();
-            let title = req["title"].as_str().unwrap_or("").to_string();
-            v["draft"] = title.to_ascii_uppercase().starts_with("WIP:").into();
-            v["title"] = title.into();
+            if let Some(title) = req["title"].as_str() {
+                v["draft"] = title.to_ascii_uppercase().starts_with("WIP:").into();
+                v["title"] = title.into();
+            }
+            if let Some(body) = req["body"].as_str() {
+                v["body"] = body.into();
+            }
             *pr = v.to_string();
             return ("201 Created".into(), pr.clone());
         }

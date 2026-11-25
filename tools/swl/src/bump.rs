@@ -827,6 +827,17 @@ impl Bumper<'_> {
             return Ok(Step::Done);
         }
         let title = format!("{CONSUMER_SUBJECT}{}", short(target));
+        let body = format!(
+            "Moves {} to {}, the promoted {COMMON_REPO}.\n\nOpened by `{CMD}`, which updates \
+             `{BUMP_BRANCH}` (with a lease on the head it read) while it has nothing but its own \
+             commit.",
+            c.inputs
+                .iter()
+                .map(|i| i.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            short(target)
+        );
         let mut mr = None;
         let mut up_to_date = false;
         if let Some(tip) = &tip {
@@ -924,17 +935,6 @@ impl Bumper<'_> {
                 ),
             },
             None => {
-                let body = format!(
-                    "Moves {} to {}, the promoted {COMMON_REPO}.\n\nOpened by `{CMD}`, which \
-                     updates `{BUMP_BRANCH}` (with a lease on the head it read) while it has \
-                     nothing but its own commit.",
-                    c.inputs
-                        .iter()
-                        .map(|i| i.name.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    short(target)
-                );
                 let what = format!("open the bump MR {title:?} of {name}");
                 if !self.lander.act(&format!("open {name}"), &what)? {
                     return Ok(Step::Planned(format!("merge the bump MR of {name}")));
@@ -954,13 +954,15 @@ impl Bumper<'_> {
                 ),
             );
         }
+        // Its title names the rev: a stale one means a stale description.
         if info.title != title
             && self.lander.act(
                 &format!("title {which}"),
-                &format!("retitle {which} {title:?}"),
+                &format!("retitle {which} {title:?} and update its description"),
             )?
         {
             self.writer.set_title(name, info.number, &title)?;
+            self.writer.set_body(name, info.number, &body)?;
         }
         let rebase = format!("rerun {CMD}, which rebuilds {BUMP_BRANCH} on {}", c.branch);
         match self.lander.merge(&which, name, &info, &rebase)? {

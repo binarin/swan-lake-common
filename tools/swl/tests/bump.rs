@@ -618,6 +618,15 @@ fn bump_updates_its_own_branch_and_mr() {
             )),
         "{writes:?}"
     );
+    let pr = t.f.api.responses.lock().unwrap()["/api/v1/repos/binarin/swan-lake/pulls/1"].clone();
+    let pr: serde_json::Value = serde_json::from_str(&pr).unwrap();
+    assert!(
+        pr["body"]
+            .as_str()
+            .unwrap()
+            .starts_with(&format!("Moves lib to {}, the promoted", short(&second))),
+        "{pr}"
+    );
 
     // CI succeeds on both: merged by their schedules; done.
     for c in CONSUMERS {

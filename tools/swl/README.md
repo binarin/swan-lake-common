@@ -864,7 +864,8 @@ consumer's base branch whose lock change is below the common inputs only
 nothing that branch lacks. When its base or its
 rev is stale, it is rebuilt on the current base and pushed with
 `--force-with-lease` to the head it read (the one push swl may force), and
-its open MR follows, retitled. Anything else on it stops that consumer for
+its open MR follows, retitled and its description updated (`PATCH
+/repos/{owner}/{repo}/pulls/{n}`). Anything else on it stops that consumer for
 anyone: delete the branch on the forge, then rerun.
 
 Limits:

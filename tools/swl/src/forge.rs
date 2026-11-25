@@ -649,6 +649,8 @@ pub enum MergeWhen {
 pub trait ForgeWriter {
     /// Sets the MR's title (a draft is marked ready by dropping `WIP:`).
     fn set_title(&self, repo: &str, number: u64, title: &str) -> Result<()>;
+    /// Sets the MR's description.
+    fn set_body(&self, repo: &str, number: u64, body: &str) -> Result<()>;
     /// Requests a fast-forward merge of `head`, now or when checks succeed,
     /// deleting the branch after the merge.
     fn request_merge(
@@ -713,6 +715,18 @@ impl FjWriter {
     }
 }
 
+impl FjWriter {
+    /// `PATCH /repos/{owner}/{repo}/pulls/{n}` with `fields`.
+    fn edit_pr(&self, repo: &str, number: u64, fields: Value) -> Result<()> {
+        let path = format!("repos/{}/pulls/{number}", slug(repo));
+        match self.send("PATCH", &path, Some(&fields))? {
+            (200 | 201, _) => Ok(()),
+            (401, _) => bail!(LOGIN_REJECTED),
+            (code, body) => bail!("PATCH {path}: HTTP {code}: {}", body.trim()),
+        }
+    }
+}
+
 /// The body of a merge request: fast-forward only, at `head`, deleting the
 /// branch; with `merge_when_checks_succeed` for [`MergeWhen::ChecksSucceed`].
 pub fn merge_request_body(head: &str, when: MergeWhen) -> Value {
@@ -729,12 +743,11 @@ pub fn merge_request_body(head: &str, when: MergeWhen) -> Value {
 
 impl ForgeWriter for FjWriter {
     fn set_title(&self, repo: &str, number: u64, title: &str) -> Result<()> {
-        let path = format!("repos/{}/pulls/{number}", slug(repo));
-        match self.send("PATCH", &path, Some(&serde_json::json!({ "title": title })))? {
-            (200 | 201, _) => Ok(()),
-            (401, _) => bail!(LOGIN_REJECTED),
-            (code, body) => bail!("PATCH {path}: HTTP {code}: {}", body.trim()),
-        }
+        self.edit_pr(repo, number, serde_json::json!({ "title": title }))
+    }
+
+    fn set_body(&self, repo: &str, number: u64, body: &str) -> Result<()> {
+        self.edit_pr(repo, number, serde_json::json!({ "body": body }))
     }
 
     fn request_merge(

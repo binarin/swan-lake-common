@@ -1149,6 +1149,10 @@ impl ForgeWriter for DryRunWriter {
         bail!("a dry run writes nothing")
     }
 
+    fn set_body(&self, _: &str, _: u64, _: &str) -> Result<()> {
+        bail!("a dry run writes nothing")
+    }
+
     fn request_merge(&self, _: &str, _: u64, _: &str, _: MergeWhen) -> Result<MergeOutcome> {
         bail!("a dry run writes nothing")
     }
