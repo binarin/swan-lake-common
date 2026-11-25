@@ -34,7 +34,7 @@ in
         # its store path. From the caller's PATH come fj, for `swl publish`;
         # nix, for `swl env` to make the workspace's GC root of this store
         # path; and direnv, optional, for `swl start` to allow the consumers'
-        # .envrc. `status` and `start` read fj's login from its keys.json,
+        # .envrc. `status`, `start` and `land` use fj's login from its keys.json,
         # not fj itself.
         env.SWL_GIT = lib.getExe pkgs.git;
         env.SWL_CURL = lib.getExe pkgs.curl;

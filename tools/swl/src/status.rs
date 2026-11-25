@@ -231,7 +231,7 @@ fn open_verdict(
     }
 }
 
-fn merged_verdict(p: &Promotion, consumer: &str) -> Verdict {
+fn merged_verdict(p: &Promotion) -> Verdict {
     match (&p.on_forge, &p.declared_source) {
         (Ok(true), Some((url, Ok(false)))) => verdict(
             Stage::Promoted,
@@ -240,11 +240,7 @@ fn merged_verdict(p: &Promotion, consumer: &str) -> Verdict {
         ),
         (Ok(true), _) => Verdict {
             landable: true,
-            ..verdict(
-                Stage::Promoted,
-                format!("swl land {consumer} (not implemented yet)"),
-                Waits::Anyone,
-            )
+            ..verdict(Stage::Promoted, "swl land", Waits::Anyone)
         },
         (Ok(false), _) => verdict(Stage::Merged, format!("promote {}", p.branch), Waits::Owner),
         (Err(e), _) => verdict(
@@ -284,7 +280,7 @@ fn mr_verdict(which: &str, read: &MrRead, consumer: &str) -> Verdict {
         MrRead::Open { info, ci } => open_verdict(which, info, ci, consumer),
         MrRead::Merged {
             promotion: Some(p), ..
-        } => merged_verdict(p, consumer),
+        } => merged_verdict(p),
         MrRead::Merged { .. } => verdict(Stage::Merged, "-", Waits::Nobody),
         MrRead::Closed => verdict(
             Stage::NeedsPublish,
@@ -462,7 +458,7 @@ pub fn consumer_verdict(f: &ConsumerFacts) -> Verdict {
         RemoteBranch::Behind if f.local_lock_change => {
             return verdict(
                 Stage::NeedsPublish,
-                "swl land (not implemented yet): the local landing commit goes to master",
+                "swl land: it pushes the local landing commit to the MR branch",
                 Waits::Anyone,
             );
         }
@@ -571,7 +567,7 @@ pub fn consumer_verdict(f: &ConsumerFacts) -> Verdict {
     }
     if !f.entries.is_empty() {
         return Verdict {
-            next: format!("swl land {c} (not implemented yet)"),
+            next: "swl land".to_string(),
             waits: Waits::Anyone,
             ..own
         };
@@ -585,6 +581,42 @@ pub struct Row {
     pub follows: Option<String>,
     pub verdict: Verdict,
     pub details: Vec<String>,
+    /// What the verdict was computed from, for `swl land`.
+    pub facts: RowFacts,
+}
+
+/// The facts behind a row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RowFacts {
+    /// Not read (the row is unknown).
+    None,
+    Shared(SharedFacts),
+    /// A manifest entry that no checkout follows: its MR alone.
+    Entry {
+        repo: String,
+        read: MrRead,
+    },
+    Consumer(ConsumerFacts),
+}
+
+impl Row {
+    /// The forge's read of the MR the row follows or, for a consumer, of its
+    /// own MR.
+    pub fn mr_read(&self) -> Option<(u64, &MrRead)> {
+        let facts = match &self.facts {
+            RowFacts::Shared(f) => &f.mr,
+            RowFacts::Consumer(f) => &f.mr,
+            RowFacts::Entry { read, .. } => {
+                let n = self.follows.as_deref()?.rsplit_once('#')?.1.parse().ok()?;
+                return Some((n, read));
+            }
+            RowFacts::None => return None,
+        };
+        match facts {
+            MrFacts::Read { number, read } => Some((*number, read)),
+            _ => None,
+        }
+    }
 }
 
 impl Row {
@@ -594,6 +626,7 @@ impl Row {
             follows: None,
             verdict: verdict(Stage::Unknown(format!("{e:#}")), "-", Waits::Nobody),
             details,
+            facts: RowFacts::None,
         }
     }
 
@@ -968,7 +1001,7 @@ fn shared_row(
 ) -> Row {
     let mut details = Vec::new();
     let input = c.shared.as_ref().map_or("", |(_, i)| i.as_str());
-    let result = (|| -> Result<(Verdict, Option<String>)> {
+    let result = (|| -> Result<(Verdict, Option<String>, SharedFacts)> {
         details.push(format!("input {input}  {}", head_line(&c.dir)?));
         let mine: Vec<&Hop> = hops.iter().filter(|h| h.checkout == c.name).collect();
         for h in &mine {
@@ -1039,7 +1072,7 @@ fn shared_row(
             MrFacts::Read { number, .. } => Some(format!("{repo}#{number}")),
             _ => None,
         };
-        let v = shared_verdict(&SharedFacts {
+        let facts = SharedFacts {
             repo: repo.to_string(),
             base,
             branch,
@@ -1050,15 +1083,16 @@ fn shared_row(
             consumers,
             missing_entry,
             mr,
-        });
-        Ok((v, follows))
+        };
+        Ok((shared_verdict(&facts), follows, facts))
     })();
     match result {
-        Ok((verdict, follows)) => Row {
+        Ok((verdict, follows, facts)) => Row {
             name: c.name.clone(),
             follows,
             verdict,
             details,
+            facts: RowFacts::Shared(facts),
         },
         Err(e) => Row::unknown(&c.name, e, details),
     }
@@ -1102,7 +1136,7 @@ fn entry_lines(manifest: &Manifest) -> String {
 
 fn consumer_row(ctx: &Ctx, hops: &[Hop], ws: &Workspace, rows: &[Row], c: &Checkout) -> Row {
     let mut details = Vec::new();
-    let result = (|| -> Result<Verdict> {
+    let result = (|| -> Result<ConsumerFacts> {
         details.push(head_line(&c.dir)?);
         let manifest = Manifest::read(&c.dir)?.unwrap_or_default();
         details.push(entry_lines(&manifest));
@@ -1168,7 +1202,7 @@ fn consumer_row(ctx: &Ctx, hops: &[Hop], ws: &Workspace, rows: &[Row], c: &Check
             MrFacts::NotLookedUp(why) => details.push(format!("MR: {why}")),
             _ => {}
         }
-        Ok(consumer_verdict(&ConsumerFacts {
+        Ok(ConsumerFacts {
             name: c.name.clone(),
             base,
             topic,
@@ -1181,14 +1215,15 @@ fn consumer_row(ctx: &Ctx, hops: &[Hop], ws: &Workspace, rows: &[Row], c: &Check
             unpublished_inputs,
             entries: entry_verdicts(&manifest, rows),
             mr,
-        }))
+        })
     })();
     match result {
-        Ok(verdict) => Row {
+        Ok(facts) => Row {
             name: c.name.clone(),
             follows: None,
-            verdict,
+            verdict: consumer_verdict(&facts),
             details,
+            facts: RowFacts::Consumer(facts),
         },
         Err(e) => Row::unknown(&c.name, e, details),
     }
@@ -1255,6 +1290,10 @@ fn mr_row(
         verdict: mr_verdict(&which, &read, consumer),
         follows: Some(which.clone()),
         name: which,
+        facts: RowFacts::Entry {
+            repo: entry.repo.clone(),
+            read,
+        },
     }
 }
 
@@ -1449,9 +1488,9 @@ pub fn collect_from(
     let read = ctx.read_mr(&consumer, n, None);
     details.push(describe_mr(&which, &read));
     let head_in_base = ancestor(&source, &head, &base) == Ok(true);
-    let row = (|| -> Result<Verdict> {
+    let row = (|| -> Result<ConsumerFacts> {
         let landing_pushed = landing_at(&source, &head, &base)?;
-        Ok(consumer_verdict(&ConsumerFacts {
+        Ok(ConsumerFacts {
             name: consumer.clone(),
             base: base.clone(),
             topic: Some(branches.first().map_or("(gone)", |b| b).to_string()),
@@ -1468,10 +1507,11 @@ pub fn collect_from(
             unpublished_inputs: Vec::new(),
             entries: entry_verdicts(&manifest, &rows),
             mr: MrFacts::Read { number: n, read },
-        }))
+        })
     })();
+    let row = row.map(|f| (consumer_verdict(&f), f));
     rows.push(match row {
-        Ok(v) if branches.is_empty() && v.stage != Stage::Landed => Row {
+        Ok((v, facts)) if branches.is_empty() && v.stage != Stage::Landed => Row {
             name: consumer.clone(),
             follows: None,
             verdict: verdict(
@@ -1483,12 +1523,14 @@ pub fn collect_from(
                 Waits::Anyone,
             ),
             details,
+            facts: RowFacts::Consumer(facts),
         },
-        Ok(verdict) => Row {
+        Ok((verdict, facts)) => Row {
             name: consumer.clone(),
             follows: None,
             verdict,
             details,
+            facts: RowFacts::Consumer(facts),
         },
         Err(e) => Row::unknown(&consumer, e, details),
     });
@@ -1651,7 +1693,7 @@ mod tests {
             ..shared()
         });
         assert!(promoted.landable);
-        assert!(promoted.next.starts_with("swl land swan-lake"));
+        assert_eq!(promoted.next, "swl land");
         // A merged MR wins over a detached or deleted branch.
         assert_eq!(
             s(SharedFacts {
@@ -1946,13 +1988,13 @@ mod tests {
             entries: vec![("swan-lake-common#1".into(), ready)],
             ..f
         };
-        assert_eq!(cv(f.clone()).1, "swl land swan-lake (not implemented yet)");
+        assert_eq!(cv(f.clone()).1, "swl land");
         // CI pending waits for nobody: deferred too.
         let pending = ConsumerFacts {
             mr: open(false, Some(CiState::Pending)),
             ..f.clone()
         };
-        assert_eq!(cv(pending).1, "swl land swan-lake (not implemented yet)");
+        assert_eq!(cv(pending).1, "swl land");
         // A draft or failing CI is the consumer's own step first.
         let draft = ConsumerFacts {
             mr: open(true, Some(CiState::Green)),

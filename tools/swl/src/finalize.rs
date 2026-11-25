@@ -346,6 +346,52 @@ fn commit(p: &mut Prepared, nix: &Nix, probe: &Probe, old_bytes: &[u8]) -> Resul
     })
 }
 
+/// What [`land_all`] did, for `swl land`.
+pub enum Landing {
+    /// No swl.toml: nothing to land.
+    NoManifest,
+    /// A swl.toml without entries, which should be removed.
+    Empty,
+    /// Not every entry is satisfied; one line per entry.
+    Waiting(Vec<String>),
+    /// With `dry_run`: every entry is satisfied, and would land.
+    WouldLand(Vec<String>),
+    Committed(Committed),
+}
+
+/// `finalize` for `swl land`: one commit only when every entry is satisfied,
+/// so that no partial landing is pushed.
+pub fn land_all(dir: &Path, api: &dyn PrReader, dry_run: bool) -> Result<Landing> {
+    let (_, Some(mut p)) = prepare(dir)? else {
+        return Ok(Landing::NoManifest);
+    };
+    if p.manifest.is_empty() {
+        return Ok(Landing::Empty);
+    }
+    let nix = Nix::find()?;
+    let old_bytes = fs::read(p.root.join("flake.lock")).context("reading flake.lock")?;
+    let probe = probe(&p.root, &p.manifest, api, &nix, &old_bytes)?;
+    let lines: Vec<String> = probe
+        .statuses
+        .iter()
+        .map(|(path, status)| {
+            let e = &p.manifest.inputs[path];
+            format!("{path} ({}#{}): {}", e.repo, e.mr, describe(status))
+        })
+        .collect();
+    if !probe
+        .statuses
+        .values()
+        .all(|s| matches!(s, Status::Satisfied { .. }))
+    {
+        return Ok(Landing::Waiting(lines));
+    }
+    if dry_run {
+        return Ok(Landing::WouldLand(lines));
+    }
+    commit(&mut p, &nix, &probe, &old_bytes).map(Landing::Committed)
+}
+
 pub fn run(dir: &Path, wait: Option<Wait>, api: &dyn PrReader) -> Result<ExitCode> {
     let (root, Some(mut p)) = prepare(dir)? else {
         let root = PathBuf::from(git(dir, &["rev-parse", "--show-toplevel"])?);
@@ -405,8 +451,9 @@ pub fn run(dir: &Path, wait: Option<Wait>, api: &dyn PrReader) -> Result<ExitCod
     );
     if done.remaining == 0 {
         println!(
-            "Next (nothing was pushed): push this commit to {} (fast-forward) and merge the MR, \
-             whose swl check accepts the landing.",
+            "Next (nothing was pushed): swl land pushes this commit to the MR branch and requests \
+             the merge; or push it to {} yourself (fast-forward) and merge the MR, whose swl check \
+             accepts the landing.",
             p.branch
         );
     } else {

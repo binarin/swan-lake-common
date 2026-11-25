@@ -319,26 +319,14 @@ fn status_follows_a_change_from_local_to_landed() {
     // Promoted; the declared source (here the forge itself) has it.
     t.f.git(&forge_common, &["update-ref", "refs/heads/current", &c2]);
     let out = t.status(true);
-    assert_row(
-        &out,
-        common,
-        "promoted",
-        "swl land swan-lake (not implemented yet)",
-        "anyone",
-    );
+    assert_row(&out, common, "promoted", "swl land", "anyone");
     assert!(out.contains(", in current; file://"), "{out}");
     assert!(out.contains("has it"), "{out}");
-    assert_row(
-        &out,
-        consumer,
-        "CI green",
-        "swl land swan-lake (not implemented yet)",
-        "anyone",
-    );
+    assert_row(&out, consumer, "CI green", "swl land", "anyone");
     // The same, from the published MR alone.
     let out = t.status_from("swan-lake#2");
     assert_row(&out, "swan-lake-common#1", "promoted", "swl land", "anyone");
-    assert_row(&out, consumer, "CI green", "swl land swan-lake", "anyone");
+    assert_row(&out, consumer, "CI green", "swl land", "anyone");
     assert!(out.contains("the head of sl-0010-x"), "{out}");
     // A consumer MR merged with its entry still in swl.toml (merged by
     // hand): the entry needs nothing more.

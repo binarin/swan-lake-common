@@ -4,11 +4,10 @@ mod ci;
 mod config;
 mod env;
 mod finalize;
-// `swl land` uses its writes from a later commit on.
-#[allow(dead_code)]
 mod forge;
 mod git;
 mod github;
+mod land;
 mod lock;
 mod lock_change;
 mod lock_rules;
@@ -103,6 +102,30 @@ enum Commands {
         /// Do not fetch; use the refs already known
         #[arg(long)]
         no_fetch: bool,
+    },
+    /// Land the workspace's change: merge the shared MRs, promote, finalize, push and merge each consumer MR, then remove the workspace
+    #[command(
+        after_help = "Exit status: 0 when everything has landed or there is nothing to land (and for a dry run), 3 when the next step waits for the owner, 4 for anyone, 5 for nobody (CI, a mirror, the forge: rerun later), 2 on errors."
+    )]
+    Land {
+        /// Print what would be done; write nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// Keep the workspace when everything has landed
+        #[arg(long)]
+        keep: bool,
+        /// Workspace directory [default: current directory; with --from, ./<consumer branch>]
+        #[arg(long, value_name = "DIR")]
+        workspace: Option<PathBuf>,
+        /// A published consumer MR, e.g. swan-lake#12: swl start --from it first (or reuse its workspace)
+        #[arg(long, value_name = "CONSUMER#MR")]
+        from: Option<String>,
+        /// Seconds to wait for the mirror and the forge
+        #[arg(long, default_value_t = 300, value_name = "SECONDS")]
+        timeout: u64,
+        /// Seconds between checks while waiting
+        #[arg(long, default_value_t = 10, value_name = "SECONDS")]
+        interval: u64,
     },
     /// Push a consumer's changed shared checkouts and the consumer, open their MRs, and record them in swl.toml
     Publish {
@@ -253,7 +276,8 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     &fetcher,
                     &forge::ForgeReader::from_env(),
                     &swl,
-                )?,
+                )
+                .map(drop)?,
                 None => start::run_new(
                     &config,
                     &cwd,
@@ -288,6 +312,42 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     &fetcher,
                 )?,
             }
+        }
+        Commands::Land {
+            dry_run,
+            keep,
+            workspace,
+            from,
+            timeout,
+            interval,
+        } => {
+            let config = Config::load(config_flag)?;
+            let opts = land::Options {
+                dry_run,
+                keep,
+                timeout: Duration::from_secs(timeout),
+                interval: Duration::from_secs(interval),
+            };
+            let reader = forge::ForgeReader::from_env();
+            let writer: Box<dyn forge::ForgeWriter> = if dry_run {
+                Box::new(land::DryRunWriter)
+            } else {
+                Box::new(forge::FjWriter::from_env()?)
+            };
+            let writer = writer.as_ref();
+            return match from {
+                Some(from) => land::run_from(
+                    &config,
+                    &std::env::current_dir().context("current directory")?,
+                    &from,
+                    workspace.as_deref(),
+                    &reader,
+                    writer,
+                    &current_exe()?,
+                    &opts,
+                ),
+                None => land::run(&workspace_dir(workspace)?, &config, &reader, writer, &opts),
+            };
         }
         Commands::Publish {
             consumer,

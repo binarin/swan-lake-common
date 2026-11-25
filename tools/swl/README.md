@@ -10,8 +10,9 @@ A consumer branch that depends on unmerged shared-repo changes names their
 MRs in a manifest, `swl.toml`. `swl publish` pushes the work and writes the
 manifest, CI builds against the MRs' heads (`swl ci env`) and gates MRs and
 master (`swl check`), and `swl finalize` turns landed entries into a lock
-bump. `swl start` sets up the workspace for a change, and `swl status` shows
-where it stands. `plan` and `land` (the lander) are not part of swl yet.
+bump. `swl start` sets up the workspace for a change, `swl status` shows
+where it stands, and `swl land` takes it to master. `plan` is not part of
+swl yet.
 
 ## Workspace layout
 
@@ -42,6 +43,7 @@ swl publish swan-lake                     # push, open MRs, write swl.toml
 swl check                                 # CI: the MR or master gate
 swl ci env                                # CI: nix wrapper with the MR overrides
 swl finalize [--wait]                     # landed entries -> one lock commit
+swl land [--dry-run] [--keep] [--from swan-lake#12]   # merge, promote, finalize, merge, clean up
 ```
 
 `ws add`, `env` and `status` use the current directory as the workspace unless
@@ -103,7 +105,7 @@ swl finalize [--wait]                     # landed entries -> one lock commit
 - `status [--no-fetch]` shows where the workspace's change stands; see
   [Status](#status).
 
-`publish`, `check`, `ci env` and `finalize` are described under
+`publish`, `check`, `ci env`, `finalize` and `land` are described under
 [Manifest and landing](#manifest-and-landing).
 
 ## Status
@@ -159,8 +161,8 @@ A shared checkout without an MR whose HEAD is in the rev each consumer locks,
 or already in its base, is `no MR needed`; a consumer whose HEAD is in its
 base is `no change`. A consumer MR with entries is not merged on its own:
 while its own step waits for the owner (merge) or nobody (CI), its next step
-waits for the entries' rows, then is `swl land` (not implemented yet; see
-the landing procedure below). A draft or failing CI is its own step first.
+waits for the entries' rows, then is `swl land` (see [Landing](#landing)).
+A draft or failing CI is its own step first.
 
 The next steps are `swl publish <consumer>` (anyone), `mark <repo>#N ready`
 (anyone), wait for CI (nobody), `merge <repo>#N` (owner),
@@ -549,17 +551,92 @@ commits nothing and exits 1; so does a `swl.toml` without entries, which
 should be removed. `--wait` polls (default every 10 s, for up to
 300 s) while merged entries are not yet reachable, then finalizes what is.
 
-The landing procedure, after `finalize`:
+`finalize` is a building block of `swl land`, which pushes its commit to
+the MR branch and requests the merge. By hand: push the commit to the MR
+branch (fast-forward) and merge the MR once its CI, whose `swl check`
+accepts the landing, is green. When entries remain, the commit is a partial
+landing, which the MR's `swl check` accepts too; rerun `finalize` once the
+rest has landed. `swl publish` refuses to push a lock change.
 
-```sh
-git push origin HEAD:master          # fast-forward only: the MR must be based on current master
-git push origin --delete <branch>    # Forgejo marks the MR merged; stacked MRs restack
-```
+### Landing
 
-Master's CI then runs `swl check` on the result. When entries remain, the
-commit is a partial landing, which the MR's `swl check` accepts; rerun
-`finalize` once the rest has landed. `swl publish` refuses to push a lock
-change.
+`swl land [--dry-run] [--keep] [--workspace DIR] [--timeout S] [--interval S]`
+takes the workspace's change to master, and `swl land --from CONSUMER#MR`
+does so for a published change: it runs `swl start --from` first (or reuses
+its workspace, `--workspace DIR` or `./<consumer branch>`) and lands there;
+a consumer MR that `swl status --from` shows as landed has nothing left to
+do (with `--workspace DIR` of an existing workspace, that is removed).
+
+It is stateless: each run reads the state as `swl status` does (the
+checkouts, the manifests, the forge and the mirror), does what it can, and
+stops at the first step it cannot do, saying what it waits for and for
+whom. Rerun it to continue. The steps:
+
+1. The shared MRs that the consumers' `swl.toml` entries name, nested
+   entries (`common/zwanenzang`) first. A draft (`WIP:` title) is marked
+   ready (its title without the prefix); a draft without that prefix is for
+   anyone to mark ready on the forge. Then the merge is requested with
+   Forgejo's API, `POST /repos/{owner}/{repo}/pulls/{n}/merge` with
+   `{"Do": "fast-forward-only", "merge_when_checks_succeed": true,
+   "delete_branch_after_merge": true, "head_commit_id": <the head read>}`,
+   so that a moved head is not merged blindly. Merged now: on to the next
+   step. Scheduled: it waits for CI, then merges; nobody waits, rerun. The
+   user may not merge (403, 405): it waits for the owner, `merge <repo>#N`.
+   Not a fast-forward (the base moved): `rebase <branch> onto <base> (swl
+   never force-pushes)`, for anyone. Failing CI: fix it first. A closed MR:
+   reopen it, or drop the entry. A shared checkout that is not published
+   (local, needs publish) stops with its `status` step.
+2. Promotion, for a merged MR whose input the consumer's `flake.nix`
+   declares at a branch other than the repo's base branch (common's
+   `swan-lake-current`; zwanenzang, pinned at master, needs none): when
+   that branch on the forge is an ancestor of the merge commit,
+   `git push origin <merge commit>:refs/heads/<branch>` from the repo's
+   source, never forced; skipped when it has the commit. A refused push (a
+   protected branch) waits for the owner, with the exact command; a push
+   that is no longer a fast-forward (the branch moved since the fetch)
+   waits for nobody: rerun. Then the
+   declared source (common's GitHub mirror) must have it: polled every
+   `--interval` (default 10 s) for up to `--timeout` (default 300 s), as
+   `finalize --wait`; after that, rerun.
+3. Each consumer: when every entry is satisfied, `finalize` (no partial
+   landing is pushed; otherwise it says what it waits for), then the
+   landing commit is pushed to the consumer's MR branch (fast-forward
+   only: other unpushed commits are refused, `swl publish` them first), and
+   after the forge has seen the new head, its merge is requested as above.
+   The consumer MR (found by the pull ref at the branch head) must be open,
+   for that branch, and at the remote branch head; else it stops for anyone
+   to check it on the forge. A draft is marked ready. A consumer without
+   entries just has its merge requested.
+4. When every consumer MR is merged, the workspace is removed, unless
+   `--keep`: each checkout is removed from its source with `git worktree
+   remove`, after its now merged local branch is deleted with `git branch
+   -d` (the checkout is detached at the base first). A checkout is kept,
+   and said so, with uncommitted, untracked or ignored files (other than
+   the generated `.envrc.local`, `.direnv/`, `result*` links and `.swl`),
+   or with commits in neither the base nor its remote branch. Then `.swl`
+   and the directory go. A workspace where no consumer landed through a
+   merged MR (its MR merged, or its pushed branch, now in the base, the
+   head of a merged MR) has nothing to land and stays.
+
+`--dry-run` reads as a run does and prints the first writes it would do and
+what follows, writing nothing (no forge request other than reads, no push,
+commit or removal), and needs no fj login for that (only for private
+repos' reads); with `--from` and no workspace yet, the plan for the shared
+MRs. Exit status: 0 when everything has landed or there is nothing to land
+(and for a dry run), 3 when the next step waits for the owner, 4 when it
+waits for anyone, 5 when it waits for nobody (CI, the mirror, the forge:
+rerun later), 2 on errors.
+
+"Merge when checks succeed" waits for the checks that the branch
+protection of the base branch requires; with none required, Forgejo can
+merge before `swl check` has run. Each repo's master protection must
+therefore require the `swl check` status (and CI) for `land` to be safe.
+
+Writes are only those: the title and merge requests through fj's login (see
+[Forge access](#forge-access)), the git pushes of the promotion and of the
+landing commit, the finalize commit, and the workspace removal. A write
+that one run did already and that the forge does not show yet is not
+repeated: the run stops, rerun it.
 
 ### Forge access
 
@@ -577,6 +654,12 @@ server; an address with user info is refused). An OAuth login whose
 rejects (401 or 403) makes the row `unknown (fj login rejected: run fj auth
 login)`. Without a login what the anonymous API cannot see is `unknown`.
 swl has no token configuration of its own.
+
+`land` reads the same way, and writes with fj's login, which it needs: the
+title of a draft (`PATCH /repos/{owner}/{repo}/pulls/{n}`) and merge
+requests, under the same token rules (stdin, no redirect, only the forge).
+A 403 or 405 to a merge request is a refusal for the owner, not a rejected
+login; a 401 is.
 
 `check`, `ci env` and `finalize` read MR state anonymously only, also with
 an fj login (`GET /api/v1/repos/binarin/<repo>/pulls/<n>`, through curl),
@@ -617,6 +700,15 @@ the override URLs) redirect them, for tests.
   stacked MRs).
 - `finalize`'s history fetch is cheap for swan-lake-common, but would fetch
   the whole commit history of a large fork such as nixpkgs.
+- `land` follows one change in one workspace, step by step: an MR that waits
+  for CI stops the run, also when later MRs could proceed. It knows a
+  merge's outcome from Forgejo's answer (200 merged, 201 scheduled, 409
+  conflict, 403/405 refused) and messages; a scheduled auto-merge that fails
+  shows as the MR still open on the next run. These answers are tested
+  against the fake forge of the tests only, not against Forgejo itself.
+- `land` tells a landed consumer from the forge's pull refs and its
+  remote-tracking branch: with `fetch.prune` the pruned branch of a merged
+  MR is not seen, so the workspace stays; remove it by hand.
 - `check` refuses moves of inputs that are not GitHub or `https://` git
   sources (tarballs, GitLab, sourcehut, …), even legitimate ones: bump
   those on master directly.

@@ -1,0 +1,1090 @@
+//! `swl land`: takes a workspace's change to master. Stateless: each run
+//! reads the state as `swl status` does (the checkouts, manifests, forge and
+//! mirror), does what it can, and stops at the first step it cannot do,
+//! saying what it waits for and for whom. Rerun it to continue.
+//!
+//! 1. The shared MRs that the consumers' `swl.toml` entries name, nested
+//!    entries first: a draft is marked ready, then a fast-forward merge is
+//!    requested for when its checks succeed.
+//! 2. A merged MR whose input `flake.nix` declares at a branch other than the
+//!    base (common's `swan-lake-current`) is promoted: that branch is
+//!    fast-forwarded on the forge to the merge commit. Then the declared
+//!    source (common's GitHub mirror) must have it.
+//! 3. Each consumer: `swl finalize` when every entry is satisfied, the
+//!    landing commit pushed to its MR branch, and its merge requested.
+//! 4. When every consumer MR is merged, the workspace is removed (unless
+//!    `--keep`).
+//!
+//! Writes: only those, the forge's through [`ForgeWriter`]; git pushes are
+//! fast-forward only. `--dry-run` writes nothing.
+
+use std::{
+    cell::RefCell,
+    collections::BTreeSet,
+    fs,
+    path::{Path, PathBuf},
+    process::ExitCode,
+    thread,
+    time::{Duration, Instant},
+};
+
+use anyhow::{Context, Result, bail};
+
+use crate::{
+    ancestry,
+    config::Config,
+    env::GENERATED_MARKER,
+    finalize::{self, Landing},
+    forge::{CiState, ForgeWriter, MergeOutcome, PrInfo, PrReader, PrState, ready_title},
+    git::{git, git_ok, short, valid_branch},
+    manifest::{Entry, MANIFEST_FILE, Manifest},
+    start,
+    status::{self, MrFacts, MrRead, RemoteBranch, Row, RowFacts, Stage, Waits},
+    workspace::{Checkout, Workspace},
+    ws_add::{Fetcher, base_remote},
+};
+
+/// Exit status when the next step waits for the owner (a merge or a
+/// promotion that the user may not do).
+pub const EXIT_OWNER: u8 = 3;
+/// Exit status when the next step waits for whoever works on the change.
+pub const EXIT_ANYONE: u8 = 4;
+/// Exit status when the next step waits for nobody (CI, a mirror, the
+/// forge): rerun later.
+pub const EXIT_NOBODY: u8 = 5;
+
+/// Runs before giving up in one run: each step that writes collects the
+/// state again.
+const MAX_STEPS: usize = 40;
+
+pub struct Options {
+    pub dry_run: bool,
+    pub keep: bool,
+    /// How long to wait for the mirror and the forge, and how often to look.
+    pub timeout: Duration,
+    pub interval: Duration,
+}
+
+/// A write that this run did already is due again: the forge lags.
+#[derive(Debug)]
+struct Repeated(String);
+
+impl std::fmt::Display for Repeated {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Repeated {}
+
+/// Where a run stopped.
+#[derive(Debug, PartialEq, Eq)]
+enum Step {
+    /// Something was written: read the state again.
+    Progress,
+    /// Nothing to do for this item.
+    Done,
+    /// A dry run reached a write; what follows depends on it.
+    Planned(String),
+    /// The next step waits for someone.
+    Stop(Waits, String),
+}
+
+fn stop(waits: Waits, msg: impl Into<String>) -> Result<Step> {
+    Ok(Step::Stop(waits, msg.into()))
+}
+
+/// A row's own verdict as the reason to stop.
+fn stop_at(row: &Row) -> Result<Step> {
+    let v = &row.verdict;
+    stop(
+        v.waits,
+        format!("{}: {}; next: {}", row.name, v.stage, v.next),
+    )
+}
+
+/// Why the forge refused a push.
+#[derive(Debug, PartialEq, Eq)]
+enum Rejection {
+    /// Not a fast-forward of the branch as the forge has it now: it moved.
+    Moved,
+    /// Refused (a protected branch, a hook), with the forge's words.
+    Refused(String),
+}
+
+/// The rejection in git's error output of a push; `None` for another
+/// failure (offline, no such remote).
+fn push_rejection(msg: &str) -> Option<Rejection> {
+    let lower = msg.to_ascii_lowercase();
+    if ["non-fast-forward", "fetch first", "stale info"]
+        .iter()
+        .any(|m| lower.contains(m))
+    {
+        return Some(Rejection::Moved);
+    }
+    if !["rejected", "denied", "protected", "declined", "not allowed"]
+        .iter()
+        .any(|m| lower.contains(m))
+    {
+        return None;
+    }
+    // The forge's own words: `remote:` lines and the rejection.
+    let reason: Vec<&str> = msg
+        .lines()
+        .filter_map(|l| match l.find("remote:") {
+            Some(i) => Some(l[i..].trim()),
+            None => l.contains("rejected").then(|| l.trim()),
+        })
+        .collect();
+    Some(Rejection::Refused(match reason.as_slice() {
+        [] => msg.lines().last().unwrap_or("").trim().to_string(),
+        lines => lines.join("; "),
+    }))
+}
+
+/// One shared MR to land: the first consumer that names it, the input path
+/// there, and the entry.
+type SharedMr = (String, String, Entry);
+
+/// The unique MRs of the consumers' manifests, nested input paths first
+/// (deepest first), then by path.
+fn shared_entries(manifests: &[(String, Manifest)]) -> Vec<SharedMr> {
+    let mut seen = BTreeSet::new();
+    let mut out: Vec<SharedMr> = Vec::new();
+    for (consumer, m) in manifests {
+        for (path, e) in &m.inputs {
+            if seen.insert((e.repo.clone(), e.mr)) {
+                out.push((consumer.clone(), path.clone(), e.clone()));
+            }
+        }
+    }
+    out.sort_by(|(_, a, _), (_, b, _)| {
+        let depth = |p: &str| p.matches('/').count();
+        depth(b).cmp(&depth(a)).then_with(|| a.cmp(b))
+    });
+    out
+}
+
+struct Lander<'a> {
+    config: &'a Config,
+    reader: &'a dyn PrReader,
+    writer: &'a dyn ForgeWriter,
+    opts: &'a Options,
+    /// Writes done in this run, so that none is repeated when the forge
+    /// lags.
+    done: RefCell<BTreeSet<String>>,
+}
+
+impl Lander<'_> {
+    /// Says what is (or with `--dry-run` would be) done. `Ok(false)` in a dry
+    /// run; a [`Repeated`] error when this run did the same already.
+    fn act(&self, key: &str, what: &str) -> Result<bool> {
+        if self.opts.dry_run {
+            println!("swl land: would {what}");
+            return Ok(false);
+        }
+        if !self.done.borrow_mut().insert(key.to_string()) {
+            return Err(Repeated(format!(
+                "{what}: done once in this run already, but the forge does not show it yet; rerun \
+                 swl land"
+            ))
+            .into());
+        }
+        println!("swl land: {what}");
+        Ok(true)
+    }
+
+    fn dry_stop(&self, what: &str) -> Result<Step> {
+        Ok(Step::Planned(what.to_string()))
+    }
+
+    /// Marks a draft MR ready by dropping its `WIP:` title prefix. A draft
+    /// without one is for someone to mark ready on the forge.
+    fn mark_ready(&self, which: &str, repo: &str, info: &PrInfo) -> Result<Option<Step>> {
+        if !info.draft {
+            return Ok(None);
+        }
+        let title = ready_title(&info.title);
+        if title == info.title.trim() {
+            return stop(
+                Waits::Anyone,
+                format!(
+                    "{which} is a draft without a WIP: title; mark it ready on the forge, then \
+                     rerun swl land"
+                ),
+            )
+            .map(Some);
+        }
+        if self.act(
+            &format!("ready {which}"),
+            &format!("mark {which} ready: {title:?}"),
+        )? {
+            self.writer.set_title(repo, info.number, &title)?;
+        }
+        Ok(None)
+    }
+
+    /// Steps 1 and 2 for one shared MR.
+    fn shared(&self, rows: &[Row], (consumer, path, e): &SharedMr) -> Result<Step> {
+        let which = format!("{}#{}", e.repo, e.mr);
+        let Some(row) = rows
+            .iter()
+            .find(|r| r.follows.as_deref() == Some(which.as_str()))
+        else {
+            return stop(Waits::Nobody, format!("{which}: no status; rerun swl land"));
+        };
+        if row.verdict.stage == Stage::Landed {
+            return Ok(Step::Done);
+        }
+        if let RowFacts::Shared(_) = &row.facts
+            && matches!(
+                row.verdict.stage,
+                Stage::Local | Stage::NeedsPublish | Stage::Pushed | Stage::Unknown(_)
+            )
+        {
+            return stop_at(row);
+        }
+        let Some((_, read)) = row.mr_read() else {
+            return stop_at(row);
+        };
+        match read {
+            MrRead::Error(_) | MrRead::NotFound(_) => stop_at(row),
+            MrRead::Closed => stop(
+                Waits::Anyone,
+                format!(
+                    "{which} ({path}) was closed without merging: reopen it, or drop the entry"
+                ),
+            ),
+            MrRead::Open { info, ci } => self.merge(
+                &which,
+                &e.repo,
+                info,
+                ci,
+                &format!("swl publish {consumer}"),
+            ),
+            MrRead::Merged {
+                merge_commit,
+                promotion,
+            } => {
+                let Some(p) = promotion else {
+                    return stop_at(row);
+                };
+                if !valid_branch(&p.branch) {
+                    return stop(
+                        Waits::Anyone,
+                        format!(
+                            "{which}: the declared branch {:?} is not a branch name",
+                            p.branch
+                        ),
+                    );
+                }
+                match &p.on_forge {
+                    Err(err) => stop(
+                        Waits::Owner,
+                        format!(
+                            "{which}: promote {} (cannot tell whether done: {err})",
+                            p.branch
+                        ),
+                    ),
+                    Ok(false) => self.promote(&which, &e.repo, merge_commit, &p.branch),
+                    Ok(true) => match &p.declared_source {
+                        Some((url, _)) => self.mirror(&which, url, &p.branch, merge_commit),
+                        None => Ok(Step::Done),
+                    },
+                }
+            }
+        }
+    }
+
+    /// Marks an open MR ready and requests its merge. `republish` is the
+    /// command that updates its branch after a rebase.
+    fn merge(
+        &self,
+        which: &str,
+        repo: &str,
+        info: &PrInfo,
+        ci: &Result<Option<CiState>, String>,
+        republish: &str,
+    ) -> Result<Step> {
+        if let Ok(Some(CiState::Failing(s))) = ci {
+            return stop(
+                Waits::Anyone,
+                format!("{which}: CI failing ({s}); fix it, then rerun swl land"),
+            );
+        }
+        if let Some(step) = self.mark_ready(which, repo, info)? {
+            return Ok(step);
+        }
+        let what = format!(
+            "request the merge of {which} at {} (fast-forward only, when its checks succeed, \
+             deleting its branch)",
+            short(&info.head_sha)
+        );
+        if !self.act(&format!("merge {which}"), &what)? {
+            return self.dry_stop(&format!("{which} merges when its checks succeed"));
+        }
+        let base_branch = self
+            .config
+            .base_for(repo)
+            .split_once('/')
+            .map_or(self.config.base_for(repo), |(_, b)| b)
+            .to_string();
+        let outcome = self
+            .writer
+            .request_merge(repo, info.number, &info.head_sha)?;
+        let merged_now = || -> bool {
+            matches!(
+                self.reader.pr(repo, info.number),
+                Ok(Some(PrInfo {
+                    state: PrState::Merged { .. },
+                    ..
+                }))
+            )
+        };
+        match outcome {
+            MergeOutcome::Merged => {
+                println!("swl land: {which} is merged");
+                Ok(Step::Progress)
+            }
+            MergeOutcome::Scheduled => stop(
+                Waits::Nobody,
+                format!(
+                    "{which} waits for CI, then it merges (merge when checks succeed); rerun swl land"
+                ),
+            ),
+            _ if merged_now() => Ok(Step::Progress),
+            MergeOutcome::Refused(why) => stop(
+                Waits::Owner,
+                format!("merge {which} (the forge refused: {why})"),
+            ),
+            MergeOutcome::NotFastForward(why) => stop(
+                Waits::Anyone,
+                format!(
+                    "rebase {} onto {base_branch} (swl never force-pushes), then {republish} \
+                     ({which} is not mergeable by fast-forward: {why})",
+                    info.head_ref
+                ),
+            ),
+            MergeOutcome::HeadMoved(why) => stop(
+                Waits::Anyone,
+                format!("{which}: its head moved ({why}); rerun swl land"),
+            ),
+            MergeOutcome::TryLater(why) => stop(
+                Waits::Nobody,
+                format!("{which}: the forge is not ready ({why}); rerun swl land"),
+            ),
+        }
+    }
+
+    /// Step 2: fast-forwards `branch` on the forge to the merge commit.
+    fn promote(&self, which: &str, repo: &str, merge_commit: &str, branch: &str) -> Result<Step> {
+        let rc = self.config.repo(repo)?;
+        let src = &rc.source;
+        let remote = base_remote(src, rc.base())?.unwrap_or_else(|| "origin".into());
+        let tracking = format!("refs/remotes/{remote}/{branch}");
+        let tip =
+            git(src, &["rev-parse", "--verify", "--quiet", &tracking]).with_context(|| {
+                format!(
+                    "{which}: {remote}/{branch} is not known in {}",
+                    src.display()
+                )
+            })?;
+        let cmd = format!(
+            "git -C {} push {remote} {merge_commit}:refs/heads/{branch}",
+            src.display()
+        );
+        if git_ok(src, &["merge-base", "--is-ancestor", &tip, merge_commit]).is_none() {
+            return stop(
+                Waits::Owner,
+                format!(
+                    "promote {branch}: {remote}/{branch} at {} is not an ancestor of {which}'s \
+                     merge commit {}, so it cannot be fast-forwarded (swl never force-pushes)",
+                    short(&tip),
+                    short(merge_commit)
+                ),
+            );
+        }
+        let what = format!("promote {which}: {cmd}");
+        if !self.act(&format!("promote {which}"), &what)? {
+            return self.dry_stop(&format!(
+                "{branch} has {which}, and its declared source too"
+            ));
+        }
+        let refspec = format!("{merge_commit}:refs/heads/{branch}");
+        match git(src, &["push", &remote, &refspec]) {
+            Ok(_) => Ok(Step::Progress),
+            Err(e) => match push_rejection(&format!("{e:#}")) {
+                None => Err(e.context(format!("promoting {which}"))),
+                Some(Rejection::Moved) => stop(
+                    Waits::Nobody,
+                    format!(
+                        "promote {which}: {remote}'s {branch} moved since it was fetched; rerun \
+                         swl land"
+                    ),
+                ),
+                Some(Rejection::Refused(reason)) => stop(
+                    Waits::Owner,
+                    format!("promote: {cmd} (the push was refused: {reason})"),
+                ),
+            },
+        }
+    }
+
+    /// Waits for the declared source (common's GitHub mirror) to have the
+    /// merge commit in `branch`.
+    fn mirror(&self, which: &str, url: &str, branch: &str, merge_commit: &str) -> Result<Step> {
+        let deadline = Instant::now() + self.opts.timeout;
+        let refname = format!("refs/heads/{branch}");
+        loop {
+            let has = ancestry::remote_head(url, &refname)
+                .and_then(|tip| ancestry::is_ancestor(url, merge_commit, &tip, false));
+            if has == Ok(true) {
+                return Ok(Step::Done);
+            }
+            let why = match has {
+                Err(e) => format!("cannot tell yet: {e}"),
+                _ => "not yet".into(),
+            };
+            if self.opts.dry_run || Instant::now() + self.opts.interval > deadline {
+                return stop(
+                    Waits::Nobody,
+                    format!(
+                        "{which}: waiting for {url} {branch} to have {} ({why}); rerun swl land",
+                        short(merge_commit)
+                    ),
+                );
+            }
+            println!(
+                "swl land: {which}: {url} {branch} does not have {} yet; checking again in {}s",
+                short(merge_commit),
+                self.opts.interval.as_secs()
+            );
+            thread::sleep(self.opts.interval);
+        }
+    }
+
+    /// Step 3 for one consumer checkout.
+    fn consumer(&self, rows: &[Row], c: &Checkout) -> Result<Step> {
+        let Some(row) = rows
+            .iter()
+            .find(|r| r.name == c.name && r.follows.is_none())
+        else {
+            return stop(
+                Waits::Nobody,
+                format!("{}: no status; rerun swl land", c.name),
+            );
+        };
+        if matches!(row.verdict.stage, Stage::Landed | Stage::NoChange(_)) {
+            return Ok(Step::Done);
+        }
+        let RowFacts::Consumer(f) = &row.facts else {
+            return stop_at(row);
+        };
+        let Some(branch) = &f.topic else {
+            return stop_at(row);
+        };
+        if f.dirty {
+            return stop(
+                Waits::Anyone,
+                format!("{}: commit or stash the uncommitted changes first", c.name),
+            );
+        }
+        if !f.unpublished_inputs.is_empty() {
+            return stop_at(row);
+        }
+        let remote = base_remote(&c.dir, &f.base)?.unwrap_or_else(|| "origin".into());
+        let remote_head = git(
+            &c.dir,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("refs/remotes/{remote}/{branch}"),
+            ],
+        )
+        .ok();
+        match f.remote {
+            RemoteBranch::Missing | RemoteBranch::Other => return stop_at(row),
+            RemoteBranch::Behind => {
+                let rh = remote_head.as_deref().unwrap_or("HEAD");
+                let changed = git(&c.dir, &["diff", "--name-only", rh, "HEAD"])?;
+                if changed
+                    .lines()
+                    .any(|f| f != "flake.lock" && f != MANIFEST_FILE)
+                {
+                    return stop(
+                        Waits::Anyone,
+                        format!(
+                            "{}: {branch} has unpushed commits besides a landing; swl publish {}",
+                            c.name, c.name
+                        ),
+                    );
+                }
+            }
+            RemoteBranch::Same => {}
+        }
+        let (number, read) = match &f.mr {
+            MrFacts::Read { number, read } => (*number, read),
+            MrFacts::None => {
+                return stop(
+                    Waits::Anyone,
+                    format!("{}: {branch} has no MR; swl publish {}", c.name, c.name),
+                );
+            }
+            _ => return stop_at(row),
+        };
+        let which = format!("{}#{number}", c.name);
+        let (info, ci) = match read {
+            MrRead::Merged { .. } => return Ok(Step::Done),
+            MrRead::Open { info, ci } => (info, ci),
+            _ => return stop_at(row),
+        };
+        // The MR was found by its head commit: it must be this branch's.
+        if info.head_ref != *branch || Some(info.head_sha.as_str()) != remote_head.as_deref() {
+            return stop(
+                Waits::Anyone,
+                format!(
+                    "{which} is not the MR of {branch} at {}: the forge has {} at {}; check it on \
+                     the forge",
+                    remote_head.as_deref().map_or("(none)", short),
+                    info.head_ref,
+                    short(&info.head_sha)
+                ),
+            );
+        }
+        if let Some(step) = self.mark_ready(&which, &c.name, info)? {
+            return Ok(step);
+        }
+        match finalize::land_all(&c.dir, self.reader, self.opts.dry_run)? {
+            Landing::NoManifest => {}
+            Landing::Empty => {
+                return stop(
+                    Waits::Anyone,
+                    format!(
+                        "{}: {MANIFEST_FILE} has no entries; git rm {MANIFEST_FILE}, commit, then \
+                         rerun swl land",
+                        c.name
+                    ),
+                );
+            }
+            Landing::Waiting(lines) => {
+                return stop(
+                    Waits::Anyone,
+                    format!(
+                        "{}: not every entry has landed, so no landing is pushed:\n  {}",
+                        c.name,
+                        lines.join("\n  ")
+                    ),
+                );
+            }
+            Landing::WouldLand(lines) => {
+                println!(
+                    "swl land: would finalize {}:\n  {}",
+                    c.name,
+                    lines.join("\n  ")
+                );
+                return self.dry_stop(&format!(
+                    "then push the landing to {branch} and request the merge of {which}"
+                ));
+            }
+            Landing::Committed(done) => {
+                println!(
+                    "swl land: {}: committed {} on {branch}: {}",
+                    c.name,
+                    short(&done.head),
+                    done.subject
+                );
+                return Ok(Step::Progress);
+            }
+        }
+        if f.remote == RemoteBranch::Behind {
+            let what = format!(
+                "push {}'s landing to {remote}/{branch} (fast-forward)",
+                c.name
+            );
+            if !self.act(&format!("push {}", c.name), &what)? {
+                return self.dry_stop(&format!("then request the merge of {which}"));
+            }
+            let refspec = format!("HEAD:refs/heads/{branch}");
+            git(&c.dir, &["push", "--quiet", &remote, &refspec])?;
+            return self.await_pull_head(&c.dir, &remote, &which, number);
+        }
+        self.merge(
+            &which,
+            &c.name,
+            info,
+            ci,
+            &format!("swl publish {}", c.name),
+        )
+    }
+
+    /// After a push: waits until the forge has updated the MR's pull ref.
+    fn await_pull_head(&self, dir: &Path, remote: &str, which: &str, n: u64) -> Result<Step> {
+        let head = git(dir, &["rev-parse", "HEAD"])?;
+        let pull = format!("refs/pull/{n}/head");
+        let deadline = Instant::now() + self.opts.timeout;
+        loop {
+            let at = git(dir, &["ls-remote", remote, &pull])?;
+            if at.split_whitespace().next() == Some(head.as_str()) {
+                return Ok(Step::Progress);
+            }
+            if Instant::now() + self.opts.interval > deadline {
+                return stop(
+                    Waits::Nobody,
+                    format!(
+                        "{which}: waiting for the forge to update the MR to {}; rerun swl land",
+                        short(&head)
+                    ),
+                );
+            }
+            thread::sleep(self.opts.interval);
+        }
+    }
+
+    /// One pass over the state: the first step that writes or stops.
+    fn step(&self, ws: &Workspace, rows: &[Row]) -> Result<Step> {
+        let consumers: Vec<&Checkout> = ws.checkouts.iter().filter(|c| c.is_consumer()).collect();
+        if consumers.is_empty() {
+            bail!("no consumer checkout in {}", ws.root.display());
+        }
+        let mut manifests = Vec::new();
+        for c in &consumers {
+            if let Some(m) = Manifest::read(&c.dir)? {
+                manifests.push((c.name.clone(), m));
+            }
+        }
+        for mr in shared_entries(&manifests) {
+            match self.shared(rows, &mr)? {
+                Step::Done => {}
+                other => return Ok(other),
+            }
+        }
+        for c in &consumers {
+            match self.consumer(rows, c)? {
+                Step::Done => {}
+                other => return Ok(other),
+            }
+        }
+        Ok(Step::Done)
+    }
+}
+
+/// Whether an untracked (`??`) or ignored (`!!`) path of `git status
+/// --porcelain --ignored` is one that removing the checkout may delete:
+/// swl's generated `.envrc.local`, direnv's `.direnv/`, `result*` links and
+/// `.swl`.
+fn disposable(dir: &Path, path: &str, ignored: bool) -> bool {
+    if path == ".envrc.local" {
+        return fs::read_to_string(dir.join(path)).is_ok_and(|t| t.starts_with(GENERATED_MARKER));
+    }
+    ignored
+        && (path == ".direnv/"
+            || path == ".swl/"
+            || (path.starts_with("result") && !path.trim_end_matches('/').contains('/')))
+}
+
+impl Lander<'_> {
+    /// Whether a consumer of the workspace landed through a merged MR: the
+    /// forge says its MR is merged, or its pushed branch, now in the base, is
+    /// the head of a merged MR.
+    fn landed_by_merge(&self, ws: &Workspace, rows: &[Row]) -> Result<bool> {
+        for c in ws.checkouts.iter().filter(|c| c.is_consumer()) {
+            let Some(RowFacts::Consumer(f)) = rows
+                .iter()
+                .find(|r| r.name == c.name && r.follows.is_none())
+                .map(|r| &r.facts)
+            else {
+                continue;
+            };
+            if let MrFacts::Read {
+                read: MrRead::Merged { .. },
+                ..
+            } = f.mr
+            {
+                return Ok(true);
+            }
+            let (Some(branch), true) = (&f.topic, f.remote_in_base) else {
+                continue;
+            };
+            let Some(remote) = base_remote(&c.dir, &f.base)? else {
+                continue;
+            };
+            let Some(head) = git_ok(
+                &c.dir,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/remotes/{remote}/{branch}"),
+                ],
+            ) else {
+                continue;
+            };
+            let refs = git(&c.dir, &["ls-remote", &remote, "refs/pull/*/head"])?;
+            for (sha, r) in start::parse_ls_remote(&refs) {
+                let n = r
+                    .strip_prefix("refs/pull/")
+                    .and_then(|r| r.strip_suffix("/head"))
+                    .and_then(|n| n.parse().ok());
+                if let (true, Some(n)) = (sha == head, n)
+                    && let Ok(Some(PrInfo {
+                        state: PrState::Merged { .. },
+                        ..
+                    })) = self.reader.pr(&c.name, n)
+                {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+}
+
+/// Why a checkout is kept rather than removed, if it is: uncommitted,
+/// untracked or ignored files (but [`disposable`] ones), or commits in
+/// neither the base nor its remote branch.
+fn keep_reason(c: &Checkout, base: &str) -> Result<Option<String>> {
+    let status = git(&c.dir, &["status", "--porcelain", "--ignored"])?;
+    let mut changed = Vec::new();
+    let mut ignored = Vec::new();
+    for line in status.lines() {
+        let (code, path) = line.split_at(line.len().min(3));
+        match code.trim() {
+            "??" if disposable(&c.dir, path, false) => {}
+            "!!" if disposable(&c.dir, path, true) => {}
+            "!!" => ignored.push(path),
+            _ => changed.push(line),
+        }
+    }
+    if !changed.is_empty() {
+        return Ok(Some(format!(
+            "uncommitted or untracked files: {}",
+            changed.join(", ")
+        )));
+    }
+    if !ignored.is_empty() {
+        return Ok(Some(format!(
+            "ignored files that removing it would delete: {}",
+            ignored.join(", ")
+        )));
+    }
+    let head = git(&c.dir, &["rev-parse", "HEAD"])?;
+    let mut contained = git_ok(&c.dir, &["merge-base", "--is-ancestor", &head, base]).is_some();
+    if let Some(b) = git_ok(&c.dir, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+        && let Some(r) = base_remote(&c.dir, base)?
+    {
+        let tracking = format!("refs/remotes/{r}/{b}");
+        contained |= git_ok(&c.dir, &["merge-base", "--is-ancestor", &head, &tracking]).is_some();
+    }
+    Ok((!contained).then(|| format!("HEAD {} has unpushed commits", short(&head))))
+}
+
+/// Step 4: removes the workspace's checkouts (`git worktree remove` from
+/// their sources), their merged local branches (`git branch -d`), `.swl`
+/// and the directory. Dirty checkouts and those with unpushed commits are
+/// kept, and said so.
+fn remove_workspace(ws: &Workspace, config: &Config, dry_run: bool) -> Result<()> {
+    let mut kept = Vec::new();
+    for c in &ws.checkouts {
+        let repo = c
+            .shared
+            .as_ref()
+            .map_or(c.name.as_str(), |(r, _)| r.as_str());
+        let rc = config.repo(repo)?;
+        let base = rc.base();
+        if let Some(r) = base_remote(&c.dir, base)? {
+            git(&c.dir, &["fetch", "--quiet", &r])?;
+        }
+        if let Some(why) = keep_reason(c, base)? {
+            println!("swl land: keeping {}: {why}", c.dir.display());
+            kept.push(c.name.clone());
+            continue;
+        }
+        let branch = git_ok(&c.dir, &["symbolic-ref", "--quiet", "--short", "HEAD"]);
+        if dry_run {
+            println!(
+                "swl land: would remove {}{}",
+                c.dir.display(),
+                branch
+                    .as_deref()
+                    .map(|b| format!(" and its branch {b}"))
+                    .unwrap_or_default()
+            );
+            continue;
+        }
+        let envrc = c.dir.join(".envrc.local");
+        if fs::read_to_string(&envrc).is_ok_and(|t| t.starts_with(GENERATED_MARKER)) {
+            fs::remove_file(&envrc).with_context(|| format!("removing {}", envrc.display()))?;
+        }
+        if let Some(b) = &branch {
+            // Off the branch, at the base that contains it, so that
+            // `git branch -d` sees it merged.
+            git(&c.dir, &["switch", "--quiet", "--detach", base])?;
+            match git(&c.dir, &["branch", "--quiet", "-d", b]) {
+                Ok(_) => println!("swl land: deleted the merged branch {b} of {repo}"),
+                Err(e) => println!("swl land: kept the branch {b} of {repo}: {e:#}"),
+            }
+        }
+        git(
+            &rc.source,
+            &["worktree", "remove", &c.dir.to_string_lossy()],
+        )
+        .with_context(|| format!("removing the worktree {}", c.dir.display()))?;
+        println!("swl land: removed {}", c.dir.display());
+    }
+    if !kept.is_empty() {
+        println!(
+            "swl land: kept {} and the workspace {}",
+            kept.join(", "),
+            ws.root.display()
+        );
+        return Ok(());
+    }
+    if dry_run {
+        println!("swl land: would remove {}", ws.root.display());
+        return Ok(());
+    }
+    let dot_swl = ws.root.join(".swl");
+    if dot_swl.exists() {
+        fs::remove_dir_all(&dot_swl).with_context(|| format!("removing {}", dot_swl.display()))?;
+    }
+    match fs::remove_dir(&ws.root) {
+        Ok(()) => println!("swl land: removed {}", ws.root.display()),
+        Err(e) => println!(
+            "swl land: kept {}, which has other files: {e}",
+            ws.root.display()
+        ),
+    }
+    Ok(())
+}
+
+fn exit(waits: Waits, msg: &str, dry_run: bool) -> ExitCode {
+    let who = match waits {
+        Waits::Owner => "the owner",
+        Waits::Anyone => "anyone",
+        Waits::Nobody => "nobody",
+    };
+    println!("swl land: waits for {who}: {msg}");
+    if dry_run {
+        return ExitCode::SUCCESS;
+    }
+    ExitCode::from(match waits {
+        Waits::Owner => EXIT_OWNER,
+        Waits::Anyone => EXIT_ANYONE,
+        Waits::Nobody => EXIT_NOBODY,
+    })
+}
+
+fn planned(then: &str) -> ExitCode {
+    println!("swl land: dry run, nothing was written; then: {then}");
+    ExitCode::SUCCESS
+}
+
+/// The writer of a dry run, which writes nothing: it needs no fj login.
+pub struct DryRunWriter;
+
+impl ForgeWriter for DryRunWriter {
+    fn set_title(&self, _: &str, _: u64, _: &str) -> Result<()> {
+        bail!("a dry run writes nothing")
+    }
+
+    fn request_merge(&self, _: &str, _: u64, _: &str) -> Result<MergeOutcome> {
+        bail!("a dry run writes nothing")
+    }
+}
+
+/// Lands the change of the workspace at `root`.
+pub fn run(
+    root: &Path,
+    config: &Config,
+    reader: &dyn PrReader,
+    writer: &dyn ForgeWriter,
+    opts: &Options,
+) -> Result<ExitCode> {
+    let lander = Lander {
+        config,
+        reader,
+        writer,
+        opts,
+        done: RefCell::new(BTreeSet::new()),
+    };
+    for _ in 0..MAX_STEPS {
+        let ws = Workspace::scan(root)?;
+        let rows = status::collect(&ws, config, reader, &Fetcher::new(true))?;
+        let step = match lander.step(&ws, &rows) {
+            Err(e) => match e.downcast_ref::<Repeated>() {
+                Some(r) => Step::Stop(Waits::Nobody, r.0.clone()),
+                None => return Err(e),
+            },
+            Ok(step) => step,
+        };
+        match step {
+            Step::Progress => continue,
+            Step::Planned(then) => return Ok(planned(&then)),
+            Step::Stop(waits, msg) => return Ok(exit(waits, &msg, opts.dry_run)),
+            Step::Done if !lander.landed_by_merge(&ws, &rows)? => {
+                println!(
+                    "swl land: nothing to land: no consumer of {} has a merged MR; the workspace \
+                     stays",
+                    ws.root.display()
+                );
+                return Ok(ExitCode::SUCCESS);
+            }
+            Step::Done => {
+                println!("swl land: every MR of the change is merged");
+                if opts.keep {
+                    println!(
+                        "swl land: keeping the workspace {} (--keep)",
+                        ws.root.display()
+                    );
+                } else {
+                    remove_workspace(&ws, config, opts.dry_run)?;
+                }
+                return Ok(ExitCode::SUCCESS);
+            }
+        }
+    }
+    Ok(exit(
+        Waits::Nobody,
+        "too many steps in one run; rerun swl land",
+        opts.dry_run,
+    ))
+}
+
+/// `swl land --from <consumer>#<MR>`: lands in the workspace `swl start
+/// --from` makes (or reuses). A landed MR (as `swl status --from` sees it)
+/// has nothing left to do, unless `--workspace` names one to remove. With
+/// `--dry-run` and no workspace yet, the plan for the shared MRs from the
+/// forge.
+#[allow(clippy::too_many_arguments)]
+pub fn run_from(
+    config: &Config,
+    cwd: &Path,
+    from: &str,
+    workspace: Option<&Path>,
+    reader: &dyn PrReader,
+    writer: &dyn ForgeWriter,
+    swl: &Path,
+    opts: &Options,
+) -> Result<ExitCode> {
+    let (consumer, n) = start::parse_from(from)?;
+    let fetcher = Fetcher::new(true);
+    let rows = status::collect_from(config, from, reader, &fetcher)?;
+    let landed = rows
+        .iter()
+        .any(|r| r.name == consumer && r.follows.is_none() && r.verdict.stage == Stage::Landed);
+    if landed {
+        return match workspace.filter(|w| w.exists()) {
+            Some(ws) => run(ws, config, reader, writer, opts),
+            None => {
+                println!("swl land: {from} has landed: nothing left to do");
+                Ok(ExitCode::SUCCESS)
+            }
+        };
+    }
+    if opts.dry_run {
+        let mr = start::read_consumer_mr(config, &consumer, n, &fetcher)?;
+        let dir: PathBuf = workspace.map_or_else(|| cwd.join(&mr.branch), Path::to_path_buf);
+        if dir.exists() {
+            return run(&dir, config, reader, writer, opts);
+        }
+        println!(
+            "swl land: would run swl start --from {from} (the workspace {})",
+            dir.display()
+        );
+        let lander = Lander {
+            config,
+            reader,
+            writer,
+            opts,
+            done: RefCell::new(BTreeSet::new()),
+        };
+        for mr in shared_entries(&[(consumer.clone(), mr.manifest)]) {
+            match lander.shared(&rows, &mr)? {
+                Step::Done => {}
+                Step::Progress => unreachable!("a dry run writes nothing"),
+                Step::Planned(then) => return Ok(planned(&then)),
+                Step::Stop(waits, msg) => return Ok(exit(waits, &msg, true)),
+            }
+        }
+        println!("swl land: then, in the workspace, finalize, push and merge {from}");
+        return Ok(ExitCode::SUCCESS);
+    }
+    let root = start::run_from(config, cwd, from, workspace, &fetcher, reader, swl)?;
+    run(&root, config, reader, writer, opts)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn manifest(text: &str) -> Manifest {
+        Manifest::parse(text).unwrap()
+    }
+
+    #[test]
+    fn push_rejections() {
+        assert_eq!(
+            push_rejection(" ! [rejected]        abc -> current (non-fast-forward)"),
+            Some(Rejection::Moved)
+        );
+        assert_eq!(
+            push_rejection(" ! [rejected]        abc -> current (fetch first)"),
+            Some(Rejection::Moved)
+        );
+        assert_eq!(
+            push_rejection(
+                "git push failed: remote: current is protected\n ! [remote rejected] abc -> current (pre-receive hook declined)"
+            ),
+            Some(Rejection::Refused(
+                "remote: current is protected; ! [remote rejected] abc -> current (pre-receive hook declined)".into()
+            ))
+        );
+        assert_eq!(
+            push_rejection("fatal: unable to access 'https://x/': Could not resolve host"),
+            None
+        );
+    }
+
+    #[test]
+    fn disposable_files() {
+        let tmp = crate::tempdir::TempDir::new("swl-land-test").unwrap();
+        let d = tmp.path();
+        for (path, ignored, ok) in [
+            (".direnv/", true, true),
+            ("result", true, true),
+            ("result-1", true, true),
+            (".swl/", true, true),
+            ("progress.md", true, false),
+            ("sub/result", true, false),
+            (".direnv/", false, false),
+            (".envrc.local", false, false),
+        ] {
+            assert_eq!(disposable(d, path, ignored), ok, "{path}");
+        }
+        fs::write(d.join(".envrc.local"), format!("{GENERATED_MARKER} x\n")).unwrap();
+        assert!(disposable(d, ".envrc.local", false));
+    }
+
+    #[test]
+    fn shared_entries_nested_first_and_once() {
+        let a = manifest(
+            "[inputs.common]\nrepo = \"swan-lake-common\"\nmr = 24\n\
+             [inputs.\"common/zwanenzang\"]\nrepo = \"zwanenzang\"\nmr = 7\n\
+             [inputs.common-next]\nrepo = \"swan-lake-common\"\nmr = 30\n",
+        );
+        let b = manifest("[inputs.common]\nrepo = \"swan-lake-common\"\nmr = 24\n");
+        let got: Vec<String> = shared_entries(&[("a".into(), a), ("b".into(), b)])
+            .into_iter()
+            .map(|(c, p, e)| format!("{c}: {p} {}#{}", e.repo, e.mr))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                "a: common/zwanenzang zwanenzang#7",
+                "a: common swan-lake-common#24",
+                "a: common-next swan-lake-common#30",
+            ]
+        );
+    }
+}

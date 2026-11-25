@@ -313,14 +313,14 @@ fn direnv_allow(consumers: &[PathBuf]) {
 }
 
 /// Adds the missing checkouts, keeps the existing ones, then `swl env` and
-/// `direnv allow`.
+/// `direnv allow`. Returns the workspace directory.
 pub fn execute(
     config: &Config,
     root: &Path,
     items: &[Item],
     fetcher: &Fetcher,
     swl: &Path,
-) -> Result<()> {
+) -> Result<PathBuf> {
     std::fs::create_dir_all(root).with_context(|| format!("creating {}", root.display()))?;
     let root = root.canonicalize()?;
     let mut summary = Vec::new();
@@ -358,7 +358,7 @@ pub fn execute(
     if let Some(first) = consumers.first() {
         println!("cd {}", first.display());
     }
-    Ok(())
+    Ok(root)
 }
 
 /// `swl start <name> <checkout>...`.
@@ -379,10 +379,10 @@ pub fn run_new(
     let branch = branch.map_or_else(|| name.to_lowercase(), str::to_string);
     let items = new_items(config, checkouts, &branch)?;
     let root = workspace.map_or_else(|| cwd.join(name), Path::to_path_buf);
-    execute(config, &root, &items, fetcher, swl)
+    execute(config, &root, &items, fetcher, swl).map(drop)
 }
 
-/// `swl start --from <consumer>#<MR>`.
+/// `swl start --from <consumer>#<MR>`; returns the workspace directory.
 pub fn run_from(
     config: &Config,
     cwd: &Path,
@@ -391,7 +391,7 @@ pub fn run_from(
     fetcher: &Fetcher,
     reader: &dyn PrReader,
     swl: &Path,
-) -> Result<()> {
+) -> Result<PathBuf> {
     let (consumer, n) = parse_from(from)?;
     let mr = read_consumer_mr(config, &consumer, n, fetcher)?;
     println!(
