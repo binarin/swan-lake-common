@@ -174,6 +174,8 @@ mod tests {
                 head_ref: String::new(),
                 title: String::new(),
                 draft: false,
+                base_ref: None,
+                head_repo: None,
             }))
         }
 

@@ -456,7 +456,7 @@ impl FakeApi {
             "draft": title.to_ascii_uppercase().starts_with("WIP:"),
             "title": title,
             "body": req["body"],
-            "head": { "sha": sha, "ref": head },
+            "head": { "sha": sha, "ref": head, "repo": { "full_name": format!("binarin/{repo}") } },
             "base": { "ref": base },
             "merge_commit_sha": null,
         })
@@ -570,7 +570,8 @@ impl FakeApi {
             "merged": state == "merged",
             "draft": state == "draft",
             "title": if state == "draft" { "WIP: t" } else { "t" },
-            "head": { "sha": head, "ref": head_ref },
+            "head": { "sha": head, "ref": head_ref, "repo": { "full_name": format!("binarin/{repo}") } },
+            "base": { "ref": "master" },
             "merge_commit_sha": merge_commit,
         });
         self.responses.lock().unwrap().insert(

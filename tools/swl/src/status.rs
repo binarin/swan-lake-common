@@ -1583,6 +1583,8 @@ mod tests {
             head_ref: "sl-1-x".into(),
             title: "t".into(),
             draft,
+            base_ref: None,
+            head_repo: None,
         }
     }
 

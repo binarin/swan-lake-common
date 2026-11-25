@@ -1463,3 +1463,84 @@ fn refresh_moves_no_checkout_that_changed_during_the_run() {
         }
     }
 }
+
+impl Change {
+    /// Changes the forge's JSON of `repo#n`.
+    fn patch_pr(&self, repo: &str, n: u64, f: impl FnOnce(&mut serde_json::Value)) {
+        let path = format!("/api/v1/repos/binarin/{repo}/pulls/{n}");
+        let mut responses = self.f.api.responses.lock().unwrap();
+        let mut v: serde_json::Value = serde_json::from_str(&responses[&path]).unwrap();
+        f(&mut v);
+        responses.insert(path, v.to_string());
+    }
+}
+
+#[test]
+fn refresh_rebases_only_the_changes_own_mr_branches_into_the_base() {
+    let t = Change::new("refresh-foreign");
+    let c2 = t.common_head();
+    let mut v = serde_json::Value::Null;
+    t.patch_pr("swan-lake-common", 1, |pr| v = pr.clone());
+    let restore = |t: &Change| t.patch_pr("swan-lake-common", 1, |pr| *pr = v.clone());
+
+    // An MR from a fork that contains its base needs nothing.
+    t.patch_pr("swan-lake-common", 1, |pr| {
+        pr["head"]["repo"]["full_name"] = "someone/swan-lake-common".into()
+    });
+    let log = stdout(&t.refresh(&[]));
+    assert!(
+        log.contains("swan-lake-common#1: sl-0020-land contains origin/master already"),
+        "{log}"
+    );
+
+    // Behind its base, it is not rebased: nor is an MR into another branch,
+    // one whose head branch is a promotion branch, or one whose branch is
+    // not at the forge's head.
+    t.f.commit_file_on_forge("swan-lake-common", "master", "other.txt", "o");
+    let refs = t.forge_refs();
+    let stops = |code: i32, needle: &str| {
+        failed(&t.refresh(&[]), code, needle);
+        assert_eq!(t.forge_refs(), refs);
+        assert_eq!(t.common_head(), c2);
+    };
+    stops(
+        4,
+        "swan-lake-common#1's head branch is in someone/swan-lake-common, not \
+         binarin/swan-lake-common: swl does not rebase an MR from another repo",
+    );
+    restore(&t);
+    t.patch_pr("swan-lake-common", 1, |pr| {
+        pr["base"]["ref"] = "current".into()
+    });
+    stops(
+        4,
+        "swan-lake-common#1 merges into current, not master: swl rebases only MRs into the \
+         repo's base",
+    );
+    restore(&t);
+    t.patch_pr("swan-lake-common", 1, |pr| {
+        pr["head"]["ref"] = "swan-lake-current".into()
+    });
+    stops(
+        4,
+        "swan-lake-common#1: its head branch swan-lake-current is a promotion branch; swl \
+         rewrites only the change's own MR branches",
+    );
+    restore(&t);
+    // The forge's pull ref lags (or leads) the branch.
+    let c1 = t.f.git(&t.common, &["rev-parse", "HEAD^"]);
+    let forge_common = t.f.forge_repo("swan-lake-common");
+    t.f.git(&forge_common, &["update-ref", "refs/pull/1/head", &c1]);
+    let refs = t.forge_refs();
+    failed(
+        &t.refresh(&[]),
+        5,
+        &format!(
+            "swan-lake-common#1: the forge has its head at {}, origin/sl-0020-land is at {}",
+            &c1[..12],
+            &c2[..12]
+        ),
+    );
+    assert_eq!(t.forge_refs(), refs);
+    assert_eq!(t.common_head(), c2);
+}

@@ -20,7 +20,7 @@ use crate::{
     config::Config,
     env,
     finalize::{self, Landing},
-    forge::{PrInfo, PrReader},
+    forge::{PrInfo, PrReader, slug},
     git::{git, git_ok, short, valid_branch},
     land::{
         self, DryRunWriter, Lander, Options, Rejection, Step, push_rejection, say_waits, stop,
@@ -287,6 +287,51 @@ pub(crate) fn refresh(l: &Lander, part: &Part) -> Result<Step> {
             ),
         );
     };
+    let base_ref = format!("refs/remotes/{remote}/{base_branch}");
+    let fetch = |refspec: &str| git(source, &["fetch", "--quiet", &remote, refspec]);
+    fetch(&format!("+refs/heads/{base_branch}:{base_ref}"))?;
+    let base_tip = rev(source, &base_ref)?;
+    // Whether a rebase is needed is the MR head's to say, whatever branch
+    // or repo it comes from.
+    let head_sha = part.info.head_sha.as_str();
+    if rev(source, head_sha).is_err() {
+        let _ = fetch(&format!("refs/pull/{}/head", part.info.number));
+    }
+    if rev(source, head_sha).is_err() {
+        return stop(
+            Waits::Nobody,
+            format!(
+                "{which}: its head {} cannot be fetched from {remote}; rerun {cmd}",
+                short(head_sha)
+            ),
+        );
+    }
+    if is_ancestor(source, &base_tip, head_sha) {
+        return Ok(Step::Done);
+    }
+    let into = part.info.base_ref.as_deref();
+    if into != Some(base_branch) {
+        return stop(
+            Waits::Anyone,
+            format!(
+                "{which} merges into {}, not {base_branch}: swl rebases only MRs into the repo's \
+                 base",
+                into.unwrap_or("a branch the forge does not name")
+            ),
+        );
+    }
+    let own = slug(part.repo);
+    let from = part.info.head_repo.as_deref();
+    if !from.is_some_and(|r| r.eq_ignore_ascii_case(&own)) {
+        return stop(
+            Waits::Anyone,
+            format!(
+                "{which}'s head branch is in {}, not {own}: swl does not rebase an MR from another \
+                 repo",
+                from.unwrap_or("a repo the forge does not name")
+            ),
+        );
+    }
     if let Some(why) = never_rewritten(branch, base_branch) {
         return stop(
             Waits::Anyone,
@@ -302,22 +347,9 @@ pub(crate) fn refresh(l: &Lander, part: &Part) -> Result<Step> {
             format!("{which}: its head branch {branch:?} is not a branch name"),
         );
     }
-    let base_ref = format!("refs/remotes/{remote}/{base_branch}");
     let tracking = format!("{remote}/{branch}");
     let branch_ref = format!("refs/remotes/{tracking}");
-    let fetch = |from: &str, to: &str| {
-        git(
-            source,
-            &[
-                "fetch",
-                "--quiet",
-                &remote,
-                &format!("+refs/heads/{from}:{to}"),
-            ],
-        )
-    };
-    fetch(base_branch, &base_ref)?;
-    if let Err(e) = fetch(branch, &branch_ref) {
+    if let Err(e) = fetch(&format!("+refs/heads/{branch}:{branch_ref}")) {
         return stop(
             Waits::Anyone,
             format!(
@@ -326,17 +358,13 @@ pub(crate) fn refresh(l: &Lander, part: &Part) -> Result<Step> {
             ),
         );
     }
-    let base_tip = rev(source, &base_ref)?;
     let observed = rev(source, &branch_ref)?;
-    if is_ancestor(source, &base_tip, &observed) {
-        return Ok(Step::Done);
-    }
-    if observed != part.info.head_sha {
+    if observed != head_sha {
         return stop(
             Waits::Nobody,
             format!(
                 "{which}: the forge has its head at {}, {tracking} is at {}; rerun {cmd}",
-                short(&part.info.head_sha),
+                short(head_sha),
                 short(&observed)
             ),
         );

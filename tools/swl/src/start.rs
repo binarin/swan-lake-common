@@ -527,6 +527,8 @@ mod tests {
                 head_ref: head_ref.into(),
                 title: String::new(),
                 draft: false,
+                base_ref: None,
+                head_repo: None,
             }))
         }
 

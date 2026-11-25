@@ -69,6 +69,11 @@ pub struct PrInfo {
     pub title: String,
     /// A draft: `draft` in the API, or a `WIP:` title.
     pub draft: bool,
+    /// The branch it merges into, as the API says.
+    pub base_ref: Option<String>,
+    /// The repo of its head branch, `owner/name` (another one for an MR
+    /// from a fork).
+    pub head_repo: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,6 +130,8 @@ impl PrInfo {
             head_ref: s("/head/ref").unwrap_or_default().to_string(),
             title,
             draft,
+            base_ref: s("/base/ref").map(str::to_string),
+            head_repo: s("/head/repo/full_name").map(str::to_string),
         })
     }
 }
@@ -981,6 +988,10 @@ mod tests {
         let open = api(r#"{"number":24,"state":"open","merged":false,"title":"t","draft":false,"head":{"sha":"abc","ref":"sl-1-x"}}"#).unwrap();
         assert_eq!(open.head_ref, "sl-1-x");
         assert!(!open.draft);
+        assert_eq!((open.base_ref, open.head_repo), (None, None));
+        let fork = api(r#"{"number":24,"state":"open","merged":false,"title":"t","head":{"sha":"abc","ref":"b","repo":{"full_name":"someone/fork"}},"base":{"ref":"master"}}"#).unwrap();
+        assert_eq!(fork.base_ref.as_deref(), Some("master"));
+        assert_eq!(fork.head_repo.as_deref(), Some("someone/fork"));
         let wip = api(r#"{"number":24,"state":"open","merged":false,"title":"WIP: t","head":{"sha":"abc","ref":"b"}}"#).unwrap();
         assert!(wip.draft);
         let draft = api(r#"{"number":24,"state":"open","merged":false,"title":"t","draft":true,"head":{"sha":"abc","ref":"b"}}"#).unwrap();
