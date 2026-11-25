@@ -109,6 +109,11 @@ impl Config {
         Ok(toml::from_str(text)?)
     }
 
+    /// The configured repos, by name.
+    pub fn repos(&self) -> impl Iterator<Item = (&str, &RepoConfig)> {
+        self.repos.iter().map(|(name, rc)| (name.as_str(), rc))
+    }
+
     pub fn repo(&self, name: &str) -> Result<&RepoConfig> {
         self.repos.get(name).ok_or_else(|| {
             let read = match &self.source {

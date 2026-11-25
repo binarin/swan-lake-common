@@ -211,6 +211,11 @@ impl<'a> Lander<'a> {
 }
 
 impl Lander<'_> {
+    /// Whether this run wrote anything.
+    pub(crate) fn wrote(&self) -> bool {
+        !self.done.borrow().is_empty()
+    }
+
     /// Says what is (or with `--dry-run` would be) done. `Ok(false)` in a dry
     /// run; a [`Repeated`] error when this run did the same already.
     pub(crate) fn act(&self, key: &str, what: &str) -> Result<bool> {
@@ -1145,6 +1150,10 @@ impl ForgeWriter for DryRunWriter {
     }
 
     fn request_merge(&self, _: &str, _: u64, _: &str, _: MergeWhen) -> Result<MergeOutcome> {
+        bail!("a dry run writes nothing")
+    }
+
+    fn create_pr(&self, _: &str, _: &str, _: &str, _: &str, _: &str) -> Result<PrInfo> {
         bail!("a dry run writes nothing")
     }
 }

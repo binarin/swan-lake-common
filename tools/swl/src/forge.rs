@@ -644,8 +644,8 @@ pub enum MergeWhen {
     ChecksSucceed,
 }
 
-/// The forge writes of `swl land`: marking an MR ready and requesting its
-/// merge.
+/// The forge writes of `swl land` and `swl bump`: marking an MR ready,
+/// opening one, and requesting its merge.
 pub trait ForgeWriter {
     /// Sets the MR's title (a draft is marked ready by dropping `WIP:`).
     fn set_title(&self, repo: &str, number: u64, title: &str) -> Result<()>;
@@ -658,6 +658,16 @@ pub trait ForgeWriter {
         head: &str,
         when: MergeWhen,
     ) -> Result<MergeOutcome>;
+    /// Opens an MR of the branch `head` into `base`; the MR as the forge
+    /// has it.
+    fn create_pr(
+        &self,
+        repo: &str,
+        base: &str,
+        head: &str,
+        title: &str,
+        body: &str,
+    ) -> Result<PrInfo>;
 }
 
 /// The title without a draft prefix (Forgejo's `WIP:` and `[WIP]`).
@@ -685,7 +695,7 @@ impl FjWriter {
         match ForgeReader::fj_token(&base)? {
             Some(token) => Ok(Self { base, token }),
             None => bail!(
-                "swl land writes to the forge with fj's login, and there is none for {FORGE_HOST}: \
+                "swl writes to the forge with fj's login, and there is none for {FORGE_HOST}: \
                  run fj auth login"
             ),
         }
@@ -738,6 +748,28 @@ impl ForgeWriter for FjWriter {
         let body = merge_request_body(head, when);
         let (code, text) = self.send("POST", &path, Some(&body))?;
         merge_outcome(code, &text).with_context(|| format!("POST {path}"))
+    }
+
+    fn create_pr(
+        &self,
+        repo: &str,
+        base: &str,
+        head: &str,
+        title: &str,
+        body: &str,
+    ) -> Result<PrInfo> {
+        let path = format!("repos/{}/pulls", slug(repo));
+        let request =
+            serde_json::json!({ "base": base, "head": head, "title": title, "body": body });
+        match self.send("POST", &path, Some(&request))? {
+            (201, text) => {
+                let v: Value = serde_json::from_str(&text)
+                    .with_context(|| format!("POST {path}: not JSON"))?;
+                PrInfo::from_api(&v)
+            }
+            (401, _) => bail!(LOGIN_REJECTED),
+            (code, text) => bail!("POST {path}: HTTP {code}: {}", text.trim()),
+        }
     }
 }
 

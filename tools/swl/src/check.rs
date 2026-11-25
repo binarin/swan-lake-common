@@ -114,7 +114,7 @@ pub fn lock_change(root: &Path, base: &str) -> Result<Option<String>> {
 }
 
 /// The lock at `rev`, parsed.
-fn lock_at(root: &Path, rev: &str) -> Result<Option<Value>> {
+pub(crate) fn lock_at(root: &Path, rev: &str) -> Result<Option<Value>> {
     let file = format!("{rev}:flake.lock");
     if git_ok(root, &["cat-file", "-e", &file]).is_none() {
         return Ok(None);
@@ -213,7 +213,7 @@ fn node_urls(original: Option<&Value>, locked: Option<&Value>) -> Vec<Option<Str
 
 /// Whether a lock node is `repo`: both its `original` and its `locked`
 /// source name it, so that neither can point elsewhere.
-fn node_names_repo(config: &Config, node: &Value, repo: &str) -> bool {
+pub(crate) fn node_names_repo(config: &Config, node: &Value, repo: &str) -> bool {
     let urls = node_urls(node.get("original"), node.get("locked"));
     sources_name_repo(config, &urls, repo)
 }

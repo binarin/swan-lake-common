@@ -11,7 +11,8 @@ MRs in a manifest, `swl.toml`. `swl publish` pushes the work and writes the
 manifest, CI builds against the MRs' heads (`swl ci env`) and gates MRs and
 master (`swl check`), and `swl finalize` turns landed entries into a lock
 bump. `swl start` sets up the workspace for a change, `swl status` shows
-where it stands, and `swl land` takes it to master. `plan` is not part of
+where it stands, and `swl land` takes it to master. `swl bump` moves
+common's inputs forward and the consumers after it. `plan` is not part of
 swl yet.
 
 ## Workspace layout
@@ -44,6 +45,7 @@ swl check                                 # CI: the MR or master gate
 swl ci env                                # CI: nix wrapper with the MR overrides
 swl finalize [--wait]                     # landed entries -> one lock commit
 swl land [--dry-run] [--keep] [--from swan-lake#12]   # merge, promote, finalize, merge, clean up
+swl bump [--dry-run] [--check]            # common's inputs forward, promoted, a bump MR per consumer
 ```
 
 `ws add`, `env` and `status` use the current directory as the workspace unless
@@ -115,7 +117,7 @@ terminal.
   [Status](#status).
 
 `publish`, `check`, `ci env`, `finalize` and `land` are described under
-[Manifest and landing](#manifest-and-landing).
+[Manifest and landing](#manifest-and-landing), `bump` under [Bump](#bump).
 
 ## Status
 
@@ -752,7 +754,8 @@ title of a draft (`PATCH /repos/{owner}/{repo}/pulls/{n}`) and merge
 requests (`POST /repos/{owner}/{repo}/pulls/{n}/merge`), under the same
 token rules (stdin, no redirect, only the forge).
 A 403 or 405 to a merge request is a refusal (see [Landing](#landing)), not
-a rejected login; a 401 is.
+a rejected login; a 401 is. `bump` reads and writes as `land` does, and
+opens its MRs too (`POST /repos/{owner}/{repo}/pulls`, see [Bump](#bump)).
 
 `check`, `ci env` and `finalize` read MR state anonymously only, also with
 an fj login (`GET /api/v1/repos/binarin/<repo>/pulls/<n>`, through curl),
@@ -766,6 +769,114 @@ and is not enough. `publish` uses `fj` and its login.
 `SWL_FORGE_API` (default `https://forgejo.lynx-lizard.ts.net/api/v1`) and
 `SWL_FORGE_GIT` (default `https://forgejo.lynx-lizard.ts.net`, the base of
 the override URLs) redirect them, for tests.
+
+## Bump
+
+`swl bump [--dry-run] [--check] [--timeout S] [--interval S]` moves
+common's inputs forward to their declared branches, and then each
+consumer's `common` to that. It replaced `scripts/relock-chain.py`. Like
+`land --from` it needs no workspace: it works in scratch worktrees of the
+repos' configured sources (see [Config](#config)), detached at the heads it
+fetched, and removes them. The consumers are the config's repos whose base
+branch locks common: a root input of `swan-lake-common` by both its
+sources, other than the experiment inputs `common-next…`. The branch they
+declare for it (`swan-lake-current`) is the one promoted, and their declared
+source (the GitHub mirror) the one waited for; they must all declare the
+same branch.
+
+1. Common, at its base (`origin/master`): for each root input, the head of
+   the ref its lock node's `original` names (the forks' `swan-lake-current`,
+   `swan-lake-current/nixos-26.05`, …; the default branch without a ref, as
+   for zwanenzang and emacs-niri-awareness), by `git ls-remote`. An input
+   whose head descends from the locked rev moves there. Ancestry is asked
+   as `swl check` asks it: a commit-only fetch for git sources, GitHub's
+   compare API for GitHub ones (`SWL_GITHUB_TOKEN` as there). An input whose
+   head does not descend from the locked rev (a rebased fork), or that
+   cannot be judged (a rev in `flake.nix`, a source that is neither git nor
+   GitHub, offline, rate limited), is not bumped: it is reported with its
+   old and new revs, left at its rev, and the others still move. The moves
+   are locked as `swl check` relocks (`nix flake lock` from the old lock
+   without them, each overridden to its new rev), must change nothing else
+   in the lock, are checked with `nix flake check --no-build` with
+   `--check`, and committed: `swl: bump nixpkgs, zwanenzang`, with the revs
+   in the body (and the inputs left). The commit is pushed to master
+   directly, fast-forward only.
+2. Promotion, as in `land`: `git push origin <rev>:refs/heads/swan-lake-current`
+   from common's source when the branch is an ancestor of master, never
+   forced; then the declared source must have it, polled every
+   `--interval` (default 10 s) for up to `--timeout` (default 300 s).
+3. Each consumer whose common is behind the promoted rev: a bump MR that
+   moves only its common inputs there, a forward move (rule (ii)) that its
+   `swl check` accepts. On the consumer's base, its common inputs are
+   relocked as above, checked as `finalize` checks a landing (nothing else
+   changes, the pin policy) and with `--check`, committed as `swl: bump
+   common to <rev>`, and pushed to the branch `swl-bump-common`. The MR is
+   opened with Forgejo's API (`POST /repos/{owner}/{repo}/pulls`, fj's
+   login), titled like the commit, and merged as `land` merges: directly
+   when its checks are green, scheduled when they are pending, a refusal
+   told by its reason. The consumer's other inputs are not touched. A
+   consumer that stops does not stop the others. A consumer whose common is
+   not behind the promoted rev, but ahead or diverged, is reported and
+   left.
+
+Anyone may run `bump`; it does every step it can and stops at the first
+one the forge refuses. The owner's steps are the push to common's master,
+the promotion and the consumers' merges: like `land`, `bump` tries them,
+and a push that branch protection refuses, or a merge refused as `land`
+tells (`User not allowed to merge PR`, approvals), waits for the owner,
+with the command. For a refused push to master that is `git -C <source>
+push origin <rev>:refs/heads/master`, the commit kept unreferenced in the
+source's objects, or rerun `swl bump` as the owner (which makes it anew).
+So common's master and `swan-lake-current` must be protected against the
+agents' pushes for that boundary to hold. The exit status is `land`'s: 0
+when everything is bumped or there is nothing to bump (and for a dry run),
+3 when a step waits for the owner, 4 for anyone, 5 for nobody, 2 on errors;
+with several consumers stopping, the most urgent of those, in that order.
+
+It is stateless and rerunnable: each run reads common's master and
+promotion branch, the locks, the bump branches, the forge's MRs and the
+mirror, and goes on from there.
+- The promotion branch behind master by bump's own commits only (one
+  parent, only `flake.lock`, a subject `swl: bump `): no new bump, that one
+  is promoted.
+- Behind master by other commits (an unpromoted landing): it stops for the
+  owner and writes nothing. It never promotes someone else's landing as a
+  side effect; promote it (as `swl land` does for its MR) or wait, then
+  rerun. The promotion branch with commits that master lacks stops for the
+  owner too.
+- Common bumped and promoted, or nothing to bump: on to the consumers. A
+  consumer at the promoted rev is done; one with an open bump MR at the
+  right head goes to its merge.
+- Nothing new anywhere: `nothing to bump`, and nothing is written.
+
+`--dry-run` reads as a run does (it fetches the sources, asks `ls-remote`,
+the compare API and the forge), prints the plan and the first write it
+would do, and writes nothing: no worktree, commit, push or forge write, and
+no fj login is needed but for the private consumers' reads.
+
+The branch `swl-bump-common` is swl's own. A run updates it only while it
+has nothing but swl's bump commit: one commit (one parent, only
+`flake.lock`, a subject `swl: bump common to `) on a commit of the
+consumer's base branch, or nothing that branch lacks. When its base or its
+rev is stale, it is rebuilt on the current base and pushed with
+`--force-with-lease` to the head it read (the one push swl may force), and
+its open MR follows, retitled. Anything else on it stops that consumer for
+anyone: delete the branch on the forge, then rerun.
+
+Limits:
+- Every root input of common is judged against its declared ref; there is
+  no list of inputs to bump or skip. A fork moves only to what its
+  `swan-lake-current…` has: promote the fork first.
+- Common has no `swl.toml` yet: nested entries such as `common/zwanenzang`
+  are not read. Bump moves inputs to their branches only.
+- `--check` evaluates each relocked flake (common and every consumer),
+  which takes a lot of memory; it is off by default.
+- Each moved GitHub input asks the compare API once (anonymously 60
+  requests an hour).
+- `swl status` does not show bumps; `bump --dry-run` is the plan.
+- An MR is found by the pull ref at the bump branch's head, as `land` finds
+  a consumer's: before the forge has recorded a push, a rerun may try to
+  open a second MR, which the forge refuses (an error); rerun.
 
 ## Limits
 

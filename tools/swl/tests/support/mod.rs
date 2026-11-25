@@ -624,6 +624,12 @@ impl Forge {
             root,
         };
         *f.api.forge.lock().unwrap() = Some(f.forge.clone());
+        // A fresh store (SWL_TEST_NIX_STORE) gets its database on first use,
+        // which the tests of one binary would race on: one call first.
+        static STORE_READY: std::sync::Once = std::sync::Once::new();
+        STORE_READY.call_once(|| {
+            stdout(&f.nix(&f.root, &["store", "info"]));
+        });
         let fakebin = f.root.join("fakebin");
         fs::create_dir_all(&fakebin).unwrap();
         fs::write(fakebin.join("direnv"), FAKE_DIRENV).unwrap();

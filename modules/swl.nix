@@ -34,8 +34,8 @@ in
         # its store path. From the caller's PATH come fj, for `swl publish`;
         # nix, for `swl env` to make the workspace's GC root of this store
         # path; and direnv, optional, for `swl start` to allow the consumers'
-        # .envrc. `status`, `start` and `land` use fj's login from its keys.json,
-        # not fj itself.
+        # .envrc. `status`, `start`, `land` and `bump` use fj's login from its
+        # keys.json, not fj itself.
         env.SWL_GIT = lib.getExe pkgs.git;
         env.SWL_CURL = lib.getExe pkgs.curl;
         # The tests drive real git and nix on throwaway local flakes, with a

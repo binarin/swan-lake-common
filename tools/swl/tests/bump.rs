@@ -1,0 +1,557 @@
+//! `swl bump` on a disposable forge, over reruns: common's inputs moved
+//! forward (and one that is not left), pushed to master, promoted, and a bump
+//! MR per consumer opened and merged; the owner-only pushes refused, master's
+//! unpromoted commits that are not bump's, and a bump branch with foreign
+//! commits; the bump branch rebuilt on a stale base; `--dry-run`, `--check`
+//! and the no-op rerun.
+//!
+//! Ported from scripts/test-relock-chain.py: its first run (each pin
+//! relocked, committed, pushed and promoted) is `bump_runs_to_the_end_over_reruns`,
+//! which ends in its clean no-op rerun. Its dirty checkout that aborts has no
+//! counterpart: bump never works in a checkout, only in scratch worktrees of
+//! the sources at the forge's heads; what it refuses instead is foreign work
+//! on what it would push (`bump_stops_for_what_is_not_its_own`).
+
+mod support;
+
+use std::{fs, path::PathBuf, process::Output};
+
+use support::{Forge, MergeReply, failed, stdout, text};
+
+/// A pre-receive hook that refuses pushes to `@BRANCH@`, as a protected
+/// branch does for an agent.
+const PROTECT: &str = r#"#!/bin/sh
+while read old new ref; do
+  if [ "$ref" = refs/heads/@BRANCH@ ]; then
+    echo "@BRANCH@ is protected" >&2
+    exit 1
+  fi
+done
+"#;
+
+const COMMON: &str = "swan-lake-common";
+const BRANCH: &str = "swl-bump-common";
+const CONSUMERS: [&str; 2] = ["nixos-config", "swan-lake"];
+
+struct Bump {
+    f: Forge,
+    keys: String,
+}
+
+fn short(rev: &str) -> &str {
+    &rev[..12]
+}
+
+fn out_text(out: &Output) -> String {
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+impl Bump {
+    /// The forge with common (master = current), zwanenzang, and two
+    /// private consumers locked to common's `current`, whose pull refs
+    /// follow their branches.
+    fn new(name: &str) -> Self {
+        let f = Forge::new(name);
+        f.add_consumer("nixos-config");
+        for c in CONSUMERS {
+            f.api.make_private(c);
+            f.follow_pull_refs(c);
+        }
+        let keys = f.login().display().to_string();
+        Self { f, keys }
+    }
+
+    fn bump(&self, extra: &[&str]) -> Output {
+        self.bump_env(extra, &[])
+    }
+
+    fn bump_env(&self, extra: &[&str], env: &[(&str, &str)]) -> Output {
+        let mut args = vec!["bump", "--timeout", "0", "--interval", "1"];
+        args.extend(extra);
+        let mut env = env.to_vec();
+        env.extend([
+            ("SWL_FJ_KEYS", self.keys.as_str()),
+            ("SWL_ALLOW_FILE_URLS", "1"),
+        ]);
+        let out = self.f.swl_env(&self.f.root, &args, &env);
+        assert!(!text(&out).contains(support::TOKEN), "{}", text(&out));
+        out
+    }
+
+    fn rev(&self, repo: &str, refname: &str) -> String {
+        self.f
+            .git(&self.f.forge_repo(repo), &["rev-parse", refname])
+    }
+
+    /// The rev that `repo`'s lock at `rev` locks the root input `input` at.
+    fn locked(&self, repo: &str, rev: &str, input: &str) -> String {
+        let text = self.f.git(
+            &self.f.forge_repo(repo),
+            &["show", &format!("{rev}:flake.lock")],
+        );
+        let lock: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let key = lock["nodes"]["root"]["inputs"][input].as_str().unwrap();
+        lock["nodes"][key]["locked"]["rev"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    fn protect(&self, repo: &str, branch: Option<&str>) {
+        let hook = branch.map(|b| PROTECT.replace("@BRANCH@", b));
+        self.f.hook_opt(repo, "pre-receive", hook.as_deref());
+    }
+
+    /// Every ref of the forge repos.
+    fn forge_refs(&self) -> String {
+        ["zwanenzang", COMMON, "nixos-config", "swan-lake"]
+            .iter()
+            .map(|r| self.f.git(&self.f.forge_repo(r), &["for-each-ref"]))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// No scratch worktree is left in any source.
+    fn no_worktrees_left(&self) {
+        for repo in [COMMON, "nixos-config", "swan-lake"] {
+            let list = self
+                .f
+                .git(&self.f.source(repo), &["worktree", "list", "--porcelain"]);
+            assert_eq!(list.matches("worktree ").count(), 1, "{repo}: {list}");
+        }
+    }
+
+    /// The source of common, as the owner's commands name it.
+    fn common_source(&self) -> String {
+        self.f.source(COMMON).display().to_string()
+    }
+
+    /// A clone of `repo`'s forge repo at `branch`.
+    fn clone_at(&self, repo: &str, branch: &str, name: &str) -> PathBuf {
+        let dir = self.f.clone_elsewhere(repo, name);
+        self.f.git(&dir, &["checkout", "-q", branch]);
+        dir
+    }
+}
+
+#[test]
+fn bump_runs_to_the_end_over_reruns() {
+    let t = Bump::new("bump");
+    let common = t.f.forge_repo(COMMON);
+    let c1 = t.rev(COMMON, "master");
+    let z1 = t.locked(COMMON, &c1, "zwanenzang");
+
+    // Nothing has moved: nothing to bump, nothing written.
+    let log = stdout(&t.bump(&[]));
+    assert!(
+        log.contains("swl bump: common: up to date: zwanenzang"),
+        "{log}"
+    );
+    assert!(log.contains("swl bump: nothing to bump"), "{log}");
+    assert!(t.f.api.writes().is_empty(), "{:?}", t.f.api.writes());
+
+    // zwanenzang moves on. A dry run plans, and writes nothing.
+    let z2 = t.f.commit_on_forge("zwanenzang", "master", "z2");
+    let refs = t.forge_refs();
+    let log = stdout(&t.bump(&["--dry-run"]));
+    for want in [
+        format!(
+            "swl bump: common: zwanenzang {} -> {} (the default branch)",
+            short(&z1),
+            short(&z2)
+        ),
+        format!(
+            "swl bump: would relock zwanenzang on master at {} commit \"swl: bump zwanenzang\" and \
+             push it to origin's master (fast-forward)",
+            short(&c1)
+        ),
+        "then: promote current, wait for its declared source; then the bump MRs of nixos-config, \
+         swan-lake"
+            .to_string(),
+    ] {
+        assert!(log.contains(&want), "{want:?} in\n{log}");
+    }
+    assert_eq!(t.forge_refs(), refs);
+    assert!(t.f.api.writes().is_empty());
+    t.no_worktrees_left();
+
+    // Master is the owner's: the bump waits for them, with the command.
+    t.protect(COMMON, Some("master"));
+    let out = t.bump(&[]);
+    failed(
+        &out,
+        3,
+        &format!(
+            "swl bump: waits for the owner: push common's bump to master: rerun swl bump as the \
+             owner, or git -C {} push origin ",
+            t.common_source()
+        ),
+    );
+    failed(
+        &out,
+        3,
+        "(the push was refused: remote: master is protected",
+    );
+    assert_eq!(t.forge_refs(), refs);
+    t.no_worktrees_left();
+
+    // Master may be pushed, the promotion branch not: master has the bump.
+    t.protect(COMMON, Some("current"));
+    let out = t.bump(&[]);
+    let bumped = t.rev(COMMON, "master");
+    failed(
+        &out,
+        3,
+        &format!(
+            "waits for the owner: promote: git -C {} push origin {bumped}:refs/heads/current (the \
+             push was refused: remote: current is protected",
+            t.common_source()
+        ),
+    );
+    assert!(out_text(&out).contains(&format!(
+        "common: pushed {} to master: swl: bump zwanenzang",
+        short(&bumped)
+    )));
+    assert_eq!(t.rev(COMMON, "master^"), c1);
+    assert_eq!(t.locked(COMMON, &bumped, "zwanenzang"), z2);
+    assert_eq!(t.rev(COMMON, "current"), c1);
+    let files = t.f.git(&common, &["diff", "--name-only", &c1, &bumped]);
+    assert_eq!(files, "flake.lock");
+    // A rerun promotes that bump; it makes no second one.
+    let out = t.bump(&[]);
+    failed(&out, 3, "promote: git -C");
+    assert!(
+        out_text(&out).contains("has swl bump's commit, not promoted to current yet"),
+        "{}",
+        text(&out)
+    );
+    assert_eq!(t.rev(COMMON, "master"), bumped);
+
+    // Promoted; each consumer gets a bump MR, whose merge waits for CI.
+    t.protect(COMMON, None);
+    let out = t.bump(&[]);
+    failed(
+        &out,
+        5,
+        "swl bump: waits for nobody: swan-lake#1 waits for CI, then it merges",
+    );
+    failed(&out, 5, "nixos-config#1 waits for CI, then it merges");
+    assert_eq!(t.rev(COMMON, "current"), bumped);
+    for c in CONSUMERS {
+        let tip = t.rev(c, BRANCH);
+        assert_eq!(t.rev(c, &format!("{BRANCH}^")), t.rev(c, "master"));
+        assert_eq!(t.locked(c, &tip, "lib"), bumped);
+        assert_eq!(
+            t.f.git(&t.f.forge_repo(c), &["log", "-1", "--format=%s", BRANCH]),
+            format!("swl: bump common to {}", short(&bumped))
+        );
+        assert_eq!(t.rev(c, "refs/pull/1/head"), tip);
+        assert!(t.f.api.is_scheduled(c, 1));
+    }
+    let writes = t.f.api.writes();
+    let opened: Vec<&String> = writes.iter().filter(|w| w.contains("/pulls {")).collect();
+    assert_eq!(opened.len(), 2, "{writes:?}");
+    let post: serde_json::Value = serde_json::from_str(
+        opened[1]
+            .strip_prefix("POST /api/v1/repos/binarin/swan-lake/pulls ")
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(post["head"], BRANCH);
+    assert_eq!(post["base"], "master");
+    assert_eq!(
+        post["title"],
+        format!("swl: bump common to {}", short(&bumped))
+    );
+    t.no_worktrees_left();
+
+    // The MR's swl check accepts the bump: a forward move of lib.
+    let mr = t.clone_at("swan-lake", BRANCH, "check-swan-lake");
+    let out = t.f.swl_env(
+        &mr,
+        &["check", "--event", "mr", "--base", "origin/master"],
+        &[("SWL_ALLOW_FILE_URLS", "1")],
+    );
+    let log = stdout(&out);
+    assert!(log.contains("lib: forward move"), "{log}");
+    assert!(log.contains("MR checks passed"), "{log}");
+
+    // CI succeeds on swan-lake's bump, which merges by its schedule; on
+    // nixos-config's too, but its merge is refused: for the owner.
+    let sl_tip = t.rev("swan-lake", BRANCH);
+    t.f.api.set_status("swan-lake", &sl_tip, "success");
+    assert_eq!(t.rev("swan-lake", "master"), sl_tip);
+    let nc_tip = t.rev("nixos-config", BRANCH);
+    t.f.api
+        .set_status_without_event("nixos-config", &nc_tip, "success");
+    let refused = MergeReply::Status(405, "User not allowed to merge PR".into());
+    t.f.api
+        .on_merge("nixos-config", 1, &[refused.clone(), refused]);
+    let out = t.bump(&[]);
+    failed(
+        &out,
+        3,
+        "swl bump: waits for the owner: merge nixos-config#1 (the forge refused: HTTP 405: User not \
+         allowed to merge PR)",
+    );
+    assert!(
+        out_text(&out).contains(&format!(
+            "swan-lake: common is at {} already",
+            short(&bumped)
+        )),
+        "{}",
+        text(&out)
+    );
+
+    // Allowed: merged directly; done.
+    t.f.api.on_merge("nixos-config", 1, &[MergeReply::MergeNow]);
+    let log = stdout(&t.bump(&[]));
+    assert!(log.contains("nixos-config#1 is merged"), "{log}");
+    assert!(
+        log.contains(&format!(
+            "swl bump: done: nixos-config, swan-lake lock common at {}",
+            short(&bumped)
+        )),
+        "{log}"
+    );
+    for c in CONSUMERS {
+        let master = t.rev(c, "master");
+        assert_eq!(t.locked(c, &master, "lib"), bumped);
+    }
+
+    // A clean rerun is a no-op.
+    let refs = t.forge_refs();
+    let writes = t.f.api.writes().len();
+    let log = stdout(&t.bump(&[]));
+    assert!(log.contains("swl bump: nothing to bump"), "{log}");
+    assert_eq!(t.forge_refs(), refs);
+    assert_eq!(t.f.api.writes().len(), writes);
+    t.no_worktrees_left();
+}
+
+/// Common with a second input, zwanenzang's `next`.
+const COMMON_WITH_NEXT: &str = r#"{
+  inputs.zwanenzang.url = "git+file://@FORGE@/binarin/zwanenzang";
+  inputs.zw-next.url = "git+file://@FORGE@/binarin/zwanenzang?ref=next";
+  outputs = { self, ... }: {
+    value = builtins.readFile ./value.txt;
+  };
+}
+"#;
+
+#[test]
+fn bump_leaves_an_input_that_does_not_move_forward() {
+    let t = Bump::new("bump-rebased");
+    // Common pins zwanenzang's `next` too, as of n1.
+    let n1 = t.f.commit_on_forge("zwanenzang", "next", "n1");
+    let seed = t.f.clone_elsewhere(COMMON, "common-next-seed");
+    fs::write(
+        seed.join("flake.nix"),
+        COMMON_WITH_NEXT.replace("@FORGE@", &t.f.forge.display().to_string()),
+    )
+    .unwrap();
+    stdout(&t.f.nix(&seed, &["flake", "lock"]));
+    t.f.git(&seed, &["commit", "-qam", "common: zw-next"]);
+    t.f.git(
+        &seed,
+        &["push", "-q", "origin", "HEAD:master", "HEAD:current"],
+    );
+    let c2 = t.rev(COMMON, "master");
+    let z1 = t.locked(COMMON, &c2, "zwanenzang");
+    assert_eq!(t.locked(COMMON, &c2, "zw-next"), n1);
+    // `next` is rebased: its new head does not descend from n1. Master
+    // moves on.
+    let rebased = t.f.clone_elsewhere("zwanenzang", "zw-rebased");
+    t.f.git(&rebased, &["checkout", "-qB", "next", "origin/master"]);
+    fs::write(rebased.join("value.txt"), "n2").unwrap();
+    t.f.git(&rebased, &["commit", "-qam", "n2"]);
+    t.f.git(&rebased, &["push", "-q", "--force", "origin", "next"]);
+    let n2 = t.rev("zwanenzang", "next");
+    let z2 = t.f.commit_on_forge("zwanenzang", "master", "z2");
+
+    let log = stdout(&t.bump(&["--dry-run", "--check"]));
+    for want in [
+        format!(
+            "common: zwanenzang {} -> {} (the default branch)",
+            short(&z1),
+            short(&z2)
+        ),
+        format!(
+            "common: zw-next: not bumped: {} -> {} (next) is not a forward move, the new rev does \
+             not descend from the locked one; left at {}",
+            short(&n1),
+            short(&n2),
+            short(&n1)
+        ),
+        "would relock zwanenzang on master".to_string(),
+        "checked with nix flake check --no-build".to_string(),
+    ] {
+        assert!(log.contains(&want), "{want:?} in\n{log}");
+    }
+
+    // The rest still bumps, checked; the consumers' bumps too.
+    let out = t.bump_env(&["--check"], &[("SWL_LOG", "swl::cmd=debug")]);
+    failed(&out, 5, "swan-lake#1 waits for CI");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        err.matches("flake check --no-build --no-write-lock-file")
+            .count(),
+        3,
+        "common and both consumers: {err}"
+    );
+    let bumped = t.rev(COMMON, "master");
+    assert_eq!(t.rev(COMMON, "master^"), c2);
+    assert_eq!(t.locked(COMMON, &bumped, "zwanenzang"), z2);
+    assert_eq!(t.locked(COMMON, &bumped, "zw-next"), n1);
+    let body =
+        t.f.git(&t.f.forge_repo(COMMON), &["log", "-1", "--format=%b"]);
+    assert!(
+        body.contains(&format!(
+            "zw-next: left at {}: {} is not a forward move",
+            short(&n1),
+            short(&n2)
+        )),
+        "{body}"
+    );
+    assert_eq!(t.rev(COMMON, "current"), bumped);
+    assert_eq!(t.locked("swan-lake", BRANCH, "lib"), bumped);
+}
+
+#[test]
+fn bump_stops_for_what_is_not_its_own() {
+    let t = Bump::new("bump-foreign");
+    let c1 = t.rev(COMMON, "master");
+
+    // The promotion branch has what master lacks: for the owner.
+    let side = t.f.commit_on_forge(COMMON, "current", "side");
+    failed(
+        &t.bump(&[]),
+        3,
+        &format!(
+            "waits for the owner: common: current at {} has commits that master at {} does not",
+            short(&side),
+            short(&c1)
+        ),
+    );
+    t.f.git(
+        &t.f.forge_repo(COMMON),
+        &["update-ref", "refs/heads/current", &c1],
+    );
+
+    // A landing on master that is not promoted: for the owner, nothing
+    // written.
+    let refs = t.forge_refs();
+    let c2 = t.f.commit_on_forge(COMMON, "master", "c2");
+    let refs_c2 = t.forge_refs();
+    assert_ne!(refs, refs_c2);
+    let out = t.bump(&[]);
+    failed(
+        &out,
+        3,
+        &format!(
+            "waits for the owner: common: master at {} has 1 commit(s) not promoted to current \
+             that are not swl bump's ({} swan-lake-common: c2); promote them first (git -C {} \
+             push origin {c2}:refs/heads/current), then rerun swl bump",
+            short(&c2),
+            &c2[..7],
+            t.common_source()
+        ),
+    );
+    assert_eq!(t.forge_refs(), refs_c2);
+    assert!(t.f.api.writes().is_empty());
+
+    // Promoted by the owner: nothing to bump in common, so straight to the
+    // consumers, which lag.
+    t.f.git(
+        &t.f.forge_repo(COMMON),
+        &["update-ref", "refs/heads/current", &c2],
+    );
+    let out = t.bump(&[]);
+    failed(&out, 5, "swan-lake#1 waits for CI");
+    assert!(
+        out_text(&out).contains(&format!("common: nothing to bump at {}", short(&c2))),
+        "{}",
+        text(&out)
+    );
+    assert_eq!(t.rev(COMMON, "master"), c2);
+    assert_eq!(t.locked("swan-lake", BRANCH, "lib"), c2);
+
+    // Someone else's commit on swan-lake's bump branch: not updated, for
+    // anyone; nixos-config goes on.
+    let theirs = t.f.commit_on_forge("swan-lake", BRANCH, "theirs");
+    let out = t.bump(&[]);
+    failed(
+        &out,
+        4,
+        &format!(
+            "waits for anyone: swan-lake: {BRANCH} at {} has commits other than swl bump's own",
+            short(&theirs)
+        ),
+    );
+    failed(&out, 4, "waits for nobody: nixos-config#1 waits for CI");
+    assert_eq!(t.rev("swan-lake", BRANCH), theirs);
+    t.no_worktrees_left();
+}
+
+#[test]
+fn bump_updates_its_own_branch_and_mr() {
+    let t = Bump::new("bump-stale");
+    t.f.commit_on_forge("zwanenzang", "master", "z2");
+    failed(&t.bump(&[]), 5, "swan-lake#1 waits for CI");
+    let first = t.rev(COMMON, "master");
+    let old_tip = t.rev("swan-lake", BRANCH);
+    let opened =
+        t.f.api
+            .writes()
+            .iter()
+            .filter(|w| w.contains("/pulls {"))
+            .count();
+
+    // The consumer's master moves on, and zwanenzang again: the bump
+    // branch is rebuilt on the new master, with a lease on its old head,
+    // and its MR follows, retitled.
+    let master = t.f.commit_on_forge("swan-lake", "master", "consumer-2");
+    t.f.commit_on_forge("zwanenzang", "master", "z3");
+    let out = t.bump(&[]);
+    failed(&out, 5, "swan-lake#1 waits for CI");
+    assert!(
+        out_text(&out).contains(&format!(
+            "as origin's {BRANCH} (replacing its own commit {})",
+            short(&old_tip)
+        )),
+        "{}",
+        text(&out)
+    );
+    let second = t.rev(COMMON, "master");
+    assert_eq!(t.rev(COMMON, "master^"), first);
+    let tip = t.rev("swan-lake", BRANCH);
+    assert_eq!(t.rev("swan-lake", &format!("{BRANCH}^")), master);
+    assert_eq!(t.locked("swan-lake", &tip, "lib"), second);
+    assert_eq!(t.rev("swan-lake", "refs/pull/1/head"), tip);
+    let writes = t.f.api.writes();
+    assert_eq!(
+        writes.iter().filter(|w| w.contains("/pulls {")).count(),
+        opened,
+        "no new MR: {writes:?}"
+    );
+    assert!(
+        writes.iter().any(|w| w
+            == &format!(
+                "PATCH /api/v1/repos/binarin/swan-lake/pulls/1 {{\"title\":\"swl: bump common to {}\"}}",
+                short(&second)
+            )),
+        "{writes:?}"
+    );
+
+    // CI succeeds on both: merged by their schedules; done.
+    for c in CONSUMERS {
+        let tip = t.rev(c, BRANCH);
+        t.f.api.set_status(c, &tip, "success");
+    }
+    let log = stdout(&t.bump(&[]));
+    assert!(log.contains("swl bump: nothing to bump"), "{log}");
+    for c in CONSUMERS {
+        let master = t.rev(c, "master");
+        assert_eq!(t.locked(c, &master, "lib"), second);
+    }
+}

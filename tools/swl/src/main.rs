@@ -1,4 +1,5 @@
 mod ancestry;
+mod bump;
 mod check;
 mod ci;
 mod config;
@@ -126,6 +127,24 @@ enum Commands {
         /// A published consumer MR, e.g. swan-lake#12: swl start --from it first (or reuse its workspace)
         #[arg(long, value_name = "CONSUMER#MR")]
         from: Option<String>,
+        /// Seconds to wait for the mirror and the forge
+        #[arg(long, default_value_t = 300, value_name = "SECONDS")]
+        timeout: u64,
+        /// Seconds between checks while waiting
+        #[arg(long, default_value_t = 10, value_name = "SECONDS")]
+        interval: u64,
+    },
+    /// Bump common's inputs forward and push that to its master, promote it, then a bump MR per consumer moving common there, merged
+    #[command(
+        after_help = "Exit status: 0 when everything is bumped or there is nothing to bump (and for a dry run), 3 when a step waits for the owner, 4 for anyone, 5 for nobody (CI, a mirror, the forge: rerun later), 2 on errors."
+    )]
+    Bump {
+        /// Print the plan; write nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// Run nix flake check --no-build on each relocked tree before committing it
+        #[arg(long)]
+        check: bool,
         /// Seconds to wait for the mirror and the forge
         #[arg(long, default_value_t = 300, value_name = "SECONDS")]
         timeout: u64,
@@ -354,6 +373,35 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 ),
                 None => land::run(&workspace_dir(workspace)?, &config, &reader, writer, &opts),
             };
+        }
+        Commands::Bump {
+            dry_run,
+            check,
+            timeout,
+            interval,
+        } => {
+            let config = Config::load(config_flag)?;
+            let opts = bump::Options {
+                land: land::Options {
+                    dry_run,
+                    keep: false,
+                    timeout: Duration::from_secs(timeout),
+                    interval: Duration::from_secs(interval),
+                },
+                check,
+            };
+            let writer: Box<dyn forge::ForgeWriter> = if dry_run {
+                Box::new(land::DryRunWriter)
+            } else {
+                Box::new(forge::FjWriter::from_env()?)
+            };
+            return bump::run(
+                &config,
+                &forge::ForgeReader::from_env(),
+                writer.as_ref(),
+                &ancestry::RemoteHistory::from_env(),
+                &opts,
+            );
         }
         Commands::Publish {
             consumer,
