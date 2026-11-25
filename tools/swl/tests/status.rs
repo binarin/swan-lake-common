@@ -259,6 +259,49 @@ fn status_follows_a_change_from_local_to_landed() {
         "owner",
     );
 
+    // A rejected fj login: the private consumer's MR is unknown, the public
+    // common is read anonymously as before.
+    let ws_s = t.ws.display().to_string();
+    let bad = t.f.login_with("bad-keys.json", "wrong-token", None);
+    let out = stdout(&t.f.swl_env(
+        &t.f.root,
+        &["status", "--workspace", &ws_s],
+        &[("SWL_FJ_KEYS", bad.to_str().unwrap())],
+    ));
+    assert_row(
+        &out,
+        consumer,
+        "unknown (fj login rejected: run fj auth login)",
+        "fj auth login",
+        "anyone",
+    );
+    assert_row(
+        &out,
+        common,
+        "CI green",
+        "merge swan-lake-common#1",
+        "owner",
+    );
+    // An expired OAuth login is no login, with one warning.
+    let expired = t.f.login_with(
+        "expired-keys.json",
+        support::TOKEN,
+        Some(serde_json::json!([2000, 1, 0, 0, 0, 0, 0, 0, 0])),
+    );
+    let out = t.f.swl_env(
+        &t.f.root,
+        &["status", "--workspace", &ws_s],
+        &[("SWL_FJ_KEYS", expired.to_str().unwrap())],
+    );
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    assert_eq!(err.matches("not using fj's login").count(), 1, "{err}");
+    assert!(err.contains("expired"), "{err}");
+    assert!(
+        stdout(&out).contains("swan-lake#2: unknown (not readable anonymously, and no fj login"),
+        "{}",
+        support::text(&out)
+    );
+
     // Merged into master, not promoted to `current` yet.
     t.f.git(&forge_common, &["update-ref", "refs/heads/master", &c2]);
     t.f.api.set_pr(
@@ -297,6 +340,25 @@ fn status_follows_a_change_from_local_to_landed() {
     assert_row(&out, "swan-lake-common#1", "promoted", "swl land", "anyone");
     assert_row(&out, consumer, "CI green", "swl land swan-lake", "anyone");
     assert!(out.contains("the head of sl-0010-x"), "{out}");
+    // A consumer MR merged with its entry still in swl.toml (merged by
+    // hand): the entry needs nothing more.
+    t.f.git(
+        &forge_consumer,
+        &["update-ref", "refs/pull/3/head", &consumer_head],
+    );
+    t.f.api.set_pr(
+        "swan-lake",
+        3,
+        "merged",
+        "refs/pull/3/head",
+        &consumer_head,
+        Some(&consumer_head),
+    );
+    let out = t.status_from("swan-lake#3");
+    assert_row(&out, consumer, "landed", "-", "nobody");
+    assert_row(&out, "swan-lake-common#1", "landed", "-", "nobody");
+    assert!(out.contains("  landed in swan-lake"), "{out}");
+    t.f.git(&forge_consumer, &["update-ref", "-d", "refs/pull/3/head"]);
 
     // The landing commit, local, then pushed to the branch.
     stdout(&t.f.swl(&t.consumer, &["finalize"]));
@@ -325,8 +387,25 @@ fn status_follows_a_change_from_local_to_landed() {
         "request merge when checks succeed",
         "owner",
     );
+    // Without a login the MR is not known to be open.
     let out = t.status(false);
-    assert_row(&out, consumer, "landing pushed", "request merge", "owner");
+    assert_row(
+        &out,
+        consumer,
+        "pushed",
+        "check swan-lake#2 on the forge (the landing commit is pushed)",
+        "anyone",
+    );
+    // Until slice 4b, the MR's swl check fails on the lock change.
+    t.f.api.set_status("swan-lake", &landing, "failure");
+    let out = t.status(true);
+    assert_row(
+        &out,
+        consumer,
+        "landing pushed, CI failing",
+        "fix CI",
+        "anyone",
+    );
     // --no-fetch looks up no consumer MR.
     let ws = t.ws.display().to_string();
     let out = stdout(&t.f.swl(&t.f.root, &["status", "--workspace", &ws, "--no-fetch"]));
@@ -349,6 +428,14 @@ fn status_follows_a_change_from_local_to_landed() {
     assert_row(&t.status(false), consumer, "landed", "-", "nobody");
     let out = t.status_from("swan-lake#2");
     assert_row(&out, consumer, "landed", "-", "nobody");
+
+    // The token went only to the private consumer, after a 404.
+    assert!(
+        t.f.authed_requests("swan-lake-common").is_empty(),
+        "{:?}",
+        t.f.api.seen_auth.lock().unwrap()
+    );
+    assert!(!t.f.authed_requests("swan-lake").is_empty());
 }
 
 #[test]

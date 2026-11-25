@@ -21,7 +21,7 @@ use serde_json::Value;
 use crate::{
     ancestry,
     config::Config,
-    forge::{CiState, PrInfo, PrReader, PrState},
+    forge::{CiState, LOGIN_REJECTED, PrInfo, PrReader, PrState},
     git::{git, git_ok},
     lock::Lock,
     manifest::{Entry, MANIFEST_FILE, Manifest},
@@ -64,7 +64,10 @@ pub enum Stage {
     Ci(CiState),
     Merged,
     Promoted,
-    LandingPushed,
+    /// The landing commit is on the open consumer MR's branch.
+    LandingPushed {
+        ci_failing: bool,
+    },
     Landed,
     /// A shared checkout at the locked rev or already in its base.
     NoMrNeeded(String),
@@ -87,7 +90,8 @@ impl fmt::Display for Stage {
             Stage::Ci(CiState::Green) => f.write_str("CI green"),
             Stage::Merged => f.write_str("merged"),
             Stage::Promoted => f.write_str("promoted"),
-            Stage::LandingPushed => f.write_str("landing pushed"),
+            Stage::LandingPushed { ci_failing: false } => f.write_str("landing pushed"),
+            Stage::LandingPushed { ci_failing: true } => f.write_str("landing pushed, CI failing"),
             Stage::Landed => f.write_str("landed"),
             Stage::NoMrNeeded(why) => write!(f, "no MR needed ({why})"),
             Stage::NoChange(why) => write!(f, "no change ({why})"),
@@ -255,10 +259,27 @@ fn merged_verdict(p: &Promotion, consumer: &str) -> Verdict {
     }
 }
 
+/// A forge read that failed: a rejected fj login is for the user to renew.
+fn error_verdict(e: &str) -> Verdict {
+    if e == LOGIN_REJECTED {
+        verdict(
+            Stage::Unknown(e.to_string()),
+            "fj auth login",
+            Waits::Anyone,
+        )
+    } else {
+        verdict(
+            Stage::Unknown(e.to_string()),
+            "rerun swl status",
+            Waits::Nobody,
+        )
+    }
+}
+
 /// The stage of an MR alone, as far as the forge says.
 fn mr_verdict(which: &str, read: &MrRead, consumer: &str) -> Verdict {
     match read {
-        MrRead::Error(e) => verdict(Stage::Unknown(e.clone()), "rerun swl status", Waits::Nobody),
+        MrRead::Error(e) => error_verdict(e),
         MrRead::NotFound(why) => verdict(
             Stage::Unknown(why.clone()),
             format!("check {which} on the forge"),
@@ -390,8 +411,8 @@ pub struct ConsumerFacts {
     pub remote_in_base: bool,
     /// The unpushed commits change flake.lock (a local `finalize` commit).
     pub local_lock_change: bool,
-    /// The remote branch has no pending swl.toml entries and changes
-    /// flake.lock: the landing commit is pushed.
+    /// The remote branch has no pending swl.toml entries, removed some, and
+    /// changes flake.lock: the landing commit is pushed.
     pub landing_pushed: bool,
     /// Overridden inputs whose checkout HEAD is changed and has no entry.
     pub unpublished_inputs: Vec<String>,
@@ -403,7 +424,6 @@ pub struct ConsumerFacts {
 pub fn consumer_verdict(f: &ConsumerFacts) -> Verdict {
     let c = &f.name;
     let landed = || verdict(Stage::Landed, "-", Waits::Nobody);
-    let mr_found = matches!(f.mr, MrFacts::Read { .. });
     if let MrFacts::Read {
         read: MrRead::Merged { .. },
         ..
@@ -426,7 +446,7 @@ pub fn consumer_verdict(f: &ConsumerFacts) -> Verdict {
             )
         };
     };
-    if f.head_in_base && (f.remote_in_base || mr_found) {
+    if f.head_in_base && f.remote_in_base {
         return landed();
     }
     let publish = verdict(
@@ -467,14 +487,54 @@ pub fn consumer_verdict(f: &ConsumerFacts) -> Verdict {
     if !f.unpublished_inputs.is_empty() {
         return publish;
     }
-    if f.landing_pushed {
-        return verdict(
-            Stage::LandingPushed,
-            "request merge when checks succeed",
-            Waits::Owner,
-        );
-    }
     let which = |n: &u64| format!("{c}#{n}");
+    if f.landing_pushed {
+        // Until slice 4b's `swl check` accepts a landing lock change, the
+        // MR's swl check fails on it; the owner merges by hand.
+        return match &f.mr {
+            MrFacts::Read {
+                read: MrRead::Open { ci, .. },
+                ..
+            } => match ci {
+                Ok(Some(CiState::Failing(_))) => verdict(
+                    Stage::LandingPushed { ci_failing: true },
+                    "fix CI",
+                    Waits::Anyone,
+                ),
+                _ => verdict(
+                    Stage::LandingPushed { ci_failing: false },
+                    "request merge when checks succeed",
+                    Waits::Owner,
+                ),
+            },
+            MrFacts::None => verdict(
+                Stage::Pushed,
+                "open the MR (the landing commit is pushed)",
+                Waits::Anyone,
+            ),
+            MrFacts::Read {
+                number,
+                read: MrRead::Closed,
+            } => verdict(
+                Stage::NeedsPublish,
+                format!("reopen {} (the landing commit is pushed)", which(number)),
+                Waits::Anyone,
+            ),
+            MrFacts::Read { number, .. } => verdict(
+                Stage::Pushed,
+                format!(
+                    "check {} on the forge (the landing commit is pushed)",
+                    which(number)
+                ),
+                Waits::Anyone,
+            ),
+            _ => verdict(
+                Stage::Pushed,
+                format!("check the MR of {c} on the forge (the landing commit is pushed)"),
+                Waits::Anyone,
+            ),
+        };
+    }
     let own = match &f.mr {
         MrFacts::None => return publish.with_stage(Stage::Pushed),
         MrFacts::Read { number, read } => match read {
@@ -486,11 +546,16 @@ pub fn consumer_verdict(f: &ConsumerFacts) -> Verdict {
                     Waits::Anyone,
                 );
             }
+            MrRead::Error(e) => error_verdict(e),
             _ => verdict(Stage::Pushed, "-", Waits::Nobody),
         },
         _ => verdict(Stage::Pushed, "-", Waits::Nobody),
     };
-    // A consumer MR with entries waits for them, then lands.
+    // A consumer MR with entries waits for them, then lands; but a draft or
+    // failing CI is its own step first.
+    if own.waits == Waits::Anyone {
+        return own;
+    }
     if let Some((which, v)) = f.entries.iter().find(|(_, v)| !v.landable) {
         return Verdict {
             next: format!("wait for {which} ({})", v.next),
@@ -1018,8 +1083,10 @@ fn shared_row(
     }
 }
 
-/// Whether the commit `at` has no pending swl.toml entries and changes
-/// flake.lock against its merge base with `base`.
+/// Whether the commit `at` is a pushed landing: it has no pending swl.toml
+/// entries, its branch had some (commits since the merge base with `base`
+/// touch swl.toml), and it changes flake.lock against that merge base. So a
+/// plain lock bump is not one.
 fn landing_at(dir: &Path, at: &str, base: &str) -> Result<bool> {
     let file = format!("{at}:{MANIFEST_FILE}");
     if git_ok(dir, &["cat-file", "-e", &file]).is_some() {
@@ -1029,7 +1096,10 @@ fn landing_at(dir: &Path, at: &str, base: &str) -> Result<bool> {
             return Ok(false);
         }
     }
-    lock_changed(dir, at, base)
+    let mb = git(dir, &["merge-base", at, base])?;
+    let range = format!("{mb}..{at}");
+    let had_entries = !git(dir, &["log", "--format=%H", &range, "--", MANIFEST_FILE])?.is_empty();
+    Ok(had_entries && lock_changed(dir, at, base)?)
 }
 
 fn lock_changed(dir: &Path, at: &str, base: &str) -> Result<bool> {
@@ -1160,6 +1230,27 @@ fn entry_verdicts(manifest: &Manifest, rows: &[Row]) -> Vec<(String, Verdict)> {
         .collect()
 }
 
+/// Marks the rows that follow `which` done, when the consumers that name it
+/// have all landed: a merged entry needs nothing more.
+fn finish_landed_entry(rows: &mut [Row], which: &str, consumers: &[&str]) {
+    let landed = |name: &str| {
+        rows.iter()
+            .any(|r| r.name == name && r.follows.is_none() && r.verdict.stage == Stage::Landed)
+    };
+    if consumers.is_empty() || !consumers.iter().all(|c| landed(c)) {
+        return;
+    }
+    for r in rows.iter_mut() {
+        if r.follows.as_deref() == Some(which)
+            && matches!(r.verdict.stage, Stage::Merged | Stage::Promoted)
+        {
+            r.verdict = verdict(Stage::Landed, "-", Waits::Nobody);
+            r.details
+                .push(format!("landed in {}", consumers.join(", ")));
+        }
+    }
+}
+
 /// A row for a manifest entry without a checkout: the MR alone.
 fn mr_row(
     ctx: &Ctx,
@@ -1231,6 +1322,18 @@ pub fn run(
     for c in ws.checkouts.iter().filter(|c| c.is_consumer()) {
         let row = consumer_row(&ctx, &hops, ws, &rows, c);
         rows.push(row);
+    }
+    let mut named: BTreeMap<String, Vec<&str>> = BTreeMap::new();
+    for (consumer, m) in &manifests {
+        for e in m.inputs.values() {
+            named
+                .entry(format!("{}#{}", e.repo, e.mr))
+                .or_default()
+                .push(consumer);
+        }
+    }
+    for (which, consumers) in &named {
+        finish_landed_entry(&mut rows, which, consumers);
     }
     for r in &rows {
         r.print();
@@ -1363,16 +1466,17 @@ pub fn run_from(
         }))
     })();
     rows.push(match row {
-        Ok(verdict) if branches.is_empty() && verdict.stage != Stage::Landed => Row {
+        Ok(v) if branches.is_empty() && v.stage != Stage::Landed => Row {
             name: consumer.clone(),
             follows: None,
-            verdict: Verdict {
-                stage: Stage::Unknown(format!(
+            verdict: verdict(
+                Stage::Unknown(format!(
                     "the MR head {} is the head of no branch: pushed after, or its branch is gone",
                     short(&head)
                 )),
-                ..verdict
-            },
+                format!("check {which} on the forge"),
+                Waits::Anyone,
+            ),
             details,
         },
         Ok(verdict) => Row {
@@ -1383,6 +1487,14 @@ pub fn run_from(
         },
         Err(e) => Row::unknown(&consumer, e, details),
     });
+    let entries: Vec<String> = manifest
+        .inputs
+        .values()
+        .map(|e| format!("{}#{}", e.repo, e.mr))
+        .collect();
+    for which in &entries {
+        finish_landed_entry(&mut rows, which, &[consumer.as_str()]);
+    }
     for r in &rows {
         r.print();
     }
@@ -1706,6 +1818,39 @@ mod tests {
                 Waits::Owner
             )
         );
+        // The landing commit is pushed: only an open MR is `landing pushed`.
+        assert_eq!(
+            cv(ConsumerFacts {
+                landing_pushed: true,
+                ..consumer()
+            }),
+            (
+                "pushed".into(),
+                "open the MR (the landing commit is pushed)".into(),
+                Waits::Anyone
+            )
+        );
+        assert_eq!(
+            cv(ConsumerFacts {
+                landing_pushed: true,
+                mr: open(false, Some(CiState::Failing("failure".into()))),
+                ..consumer()
+            }),
+            (
+                "landing pushed, CI failing".into(),
+                "fix CI".into(),
+                Waits::Anyone
+            )
+        );
+        assert_eq!(
+            cv(ConsumerFacts {
+                landing_pushed: true,
+                mr: read(MrRead::NotFound("private".into())),
+                ..consumer()
+            })
+            .0,
+            "pushed"
+        );
         assert_eq!(
             s(ConsumerFacts {
                 mr: read(MrRead::Merged {
@@ -1715,6 +1860,28 @@ mod tests {
                 ..consumer()
             }),
             "landed"
+        );
+        // A local HEAD in the base does not land an open MR whose branch is
+        // not.
+        assert_eq!(
+            s(ConsumerFacts {
+                head_in_base: true,
+                remote: RemoteBranch::Other,
+                mr: open(false, Some(CiState::Green)),
+                ..consumer()
+            }),
+            "needs publish"
+        );
+        assert_eq!(
+            cv(ConsumerFacts {
+                mr: read(MrRead::Error(LOGIN_REJECTED.into())),
+                ..consumer()
+            }),
+            (
+                format!("unknown ({LOGIN_REJECTED})"),
+                "fj auth login".into(),
+                Waits::Anyone
+            )
         );
         // Without a readable MR, from git: the branch head is in master.
         assert_eq!(
@@ -1752,6 +1919,41 @@ mod tests {
             entries: vec![("swan-lake-common#1".into(), ready)],
             ..f
         };
-        assert_eq!(cv(f).1, "swl land swan-lake (not implemented yet)");
+        assert_eq!(cv(f.clone()).1, "swl land swan-lake (not implemented yet)");
+        // CI pending waits for nobody: deferred too.
+        let pending = ConsumerFacts {
+            mr: open(false, Some(CiState::Pending)),
+            ..f.clone()
+        };
+        assert_eq!(cv(pending).1, "swl land swan-lake (not implemented yet)");
+        // A draft or failing CI is the consumer's own step first.
+        let draft = ConsumerFacts {
+            mr: open(true, Some(CiState::Green)),
+            entries: vec![(
+                "swan-lake-common#1".into(),
+                verdict(Stage::Merged, "promote swan-lake-current", Waits::Owner),
+            )],
+            ..f.clone()
+        };
+        assert_eq!(
+            cv(draft),
+            (
+                "MR open (draft)".into(),
+                "mark swan-lake#1 ready".into(),
+                Waits::Anyone
+            )
+        );
+        let failing = ConsumerFacts {
+            mr: open(false, Some(CiState::Failing("failure".into()))),
+            ..f
+        };
+        assert_eq!(
+            cv(failing),
+            (
+                "CI failing (failure)".into(),
+                "fix it, then swl publish swan-lake".into(),
+                Waits::Anyone
+            )
+        );
     }
 }
