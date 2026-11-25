@@ -818,13 +818,13 @@ impl Bumper<'_> {
                 let refspec = format!("refs/heads/{BUMP_BRANCH}");
                 git(&c.source, &["fetch", "--quiet", &c.remote, &refspec])?;
             }
-            if !self.own_branch(c, tip)? {
+            if let Some(why) = self.foreign_branch(c, tip)? {
                 return stop(
                     Waits::Anyone,
                     format!(
-                        "{name}: {BUMP_BRANCH} at {} has commits other than swl bump's own; swl \
-                         bump updates that branch only while it has nothing but its bump commit: \
-                         delete it on the forge, then rerun {CMD}",
+                        "{name}: {BUMP_BRANCH} at {} {why}; swl bump updates that branch only \
+                         while it has nothing but its bump commit: delete it on the forge, then \
+                         rerun {CMD}",
                         short(tip)
                     ),
                 );
@@ -960,18 +960,32 @@ impl Bumper<'_> {
         }
     }
 
-    /// Whether the bump branch at `tip` has nothing but swl bump's own
-    /// commit on the consumer's base: it is in the base, or it is one own
-    /// commit on a commit of the base.
-    fn own_branch(&self, c: &Consumer, tip: &str) -> Result<bool> {
+    /// Why the bump branch at `tip` is not swl bump's own, if it is not. It
+    /// is when it is in the consumer's base, or when it is one own commit
+    /// on a commit of the base that moves nothing in `flake.lock` but the
+    /// common inputs (`lock_change::verify` against its parent's lock).
+    fn foreign_branch(&self, c: &Consumer, tip: &str) -> Result<Option<String>> {
         if is_ancestor(&c.source, tip, &c.head) {
-            return Ok(true);
+            return Ok(None);
         }
         let commits = git(&c.source, &["rev-list", &format!("{}..{tip}", c.head)])?;
-        if commits.lines().count() != 1 || !own_commit(&c.source, tip, CONSUMER_SUBJECT)? {
-            return Ok(false);
+        let parent = format!("{tip}^");
+        if commits.lines().count() != 1
+            || !own_commit(&c.source, tip, CONSUMER_SUBJECT)?
+            || !is_ancestor(&c.source, &parent, &c.head)
+        {
+            return Ok(Some("has commits other than swl bump's own".into()));
         }
-        Ok(is_ancestor(&c.source, &format!("{tip}^"), &c.head))
+        let (Some(old), Some(new)) = (
+            check::lock_at(&c.source, &parent)?,
+            check::lock_at(&c.source, tip)?,
+        ) else {
+            return Ok(Some("has no flake.lock".into()));
+        };
+        let names: Vec<String> = c.inputs.iter().map(|i| i.name.clone()).collect();
+        Ok(lock_change::verify(&old, &new, &names)
+            .err()
+            .map(|e| format!("has a commit that changes flake.lock beyond common ({e:#})")))
     }
 
     /// The bump commit in the scratch worktree of the consumer's base: its

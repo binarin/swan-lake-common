@@ -857,7 +857,9 @@ no fj login is needed but for the private consumers' reads.
 The branch `swl-bump-common` is swl's own. A run updates it only while it
 has nothing but swl's bump commit: one commit (one parent, only
 `flake.lock`, a subject `swl: bump common to `) on a commit of the
-consumer's base branch, or nothing that branch lacks. When its base or its
+consumer's base branch whose lock change is below the common inputs only
+(nothing else in the lock moves, as `finalize` checks a landing), or
+nothing that branch lacks. When its base or its
 rev is stale, it is rebuilt on the current base and pushed with
 `--force-with-lease` to the head it read (the one push swl may force), and
 its open MR follows, retitled. Anything else on it stops that consumer for

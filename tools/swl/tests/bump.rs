@@ -476,6 +476,43 @@ fn bump_stops_for_what_is_not_its_own() {
     assert_eq!(t.rev(COMMON, "master"), c2);
     assert_eq!(t.locked("swan-lake", BRANCH, "lib"), c2);
 
+    // A commit that looks like bump's own, common at the target, but that
+    // changes more of the lock: not bump's, not merged.
+    let forged = t.f.clone_elsewhere("swan-lake", "forged-bump");
+    t.f.git(&forged, &["checkout", "-qB", BRANCH, "origin/master"]);
+    let mut lock: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(forged.join("flake.lock")).unwrap()).unwrap();
+    let key = lock["nodes"]["root"]["inputs"]["lib"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    lock["nodes"][&key]["locked"]["rev"] = c2.clone().into();
+    lock["nodes"]["stray"] = serde_json::json!({"locked": {"type": "path", "path": "/x"}});
+    fs::write(forged.join("flake.lock"), lock.to_string()).unwrap();
+    let subject = format!("swl: bump common to {}", short(&c2));
+    t.f.git(&forged, &["commit", "-qam", &subject]);
+    t.f.git(&forged, &["push", "-q", "--force", "origin", BRANCH]);
+    let forged_tip = t.rev("swan-lake", BRANCH);
+    let writes = t.f.api.writes().len();
+    let out = t.bump(&[]);
+    failed(
+        &out,
+        4,
+        &format!(
+            "waits for anyone: swan-lake: {BRANCH} at {} has a commit that changes flake.lock \
+             beyond common (unexpected new lock node stray)",
+            short(&forged_tip)
+        ),
+    );
+    assert_eq!(t.rev("swan-lake", BRANCH), forged_tip);
+    assert!(
+        !t.f.api.writes()[writes..]
+            .iter()
+            .any(|w| w.contains("swan-lake/pulls")),
+        "{:?}",
+        t.f.api.writes()
+    );
+
     // Someone else's commit on swan-lake's bump branch: not updated, for
     // anyone; nixos-config goes on.
     let theirs = t.f.commit_on_forge("swan-lake", BRANCH, "theirs");
