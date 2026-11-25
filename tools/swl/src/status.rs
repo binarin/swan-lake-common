@@ -493,12 +493,20 @@ pub fn consumer_verdict(f: &ConsumerFacts) -> Verdict {
         // MR's swl check fails on it; the owner merges by hand.
         return match &f.mr {
             MrFacts::Read {
+                number,
+                read: MrRead::Open { info, .. },
+            } if info.draft => verdict(
+                Stage::MrOpen { draft: true },
+                format!("mark {} ready", which(number)),
+                Waits::Anyone,
+            ),
+            MrFacts::Read {
                 read: MrRead::Open { ci, .. },
                 ..
             } => match ci {
                 Ok(Some(CiState::Failing(_))) => verdict(
                     Stage::LandingPushed { ci_failing: true },
-                    "fix CI",
+                    "fix CI (until slice 4b swl check fails on a landing commit)",
                     Waits::Anyone,
                 ),
                 _ => verdict(
@@ -520,6 +528,10 @@ pub fn consumer_verdict(f: &ConsumerFacts) -> Verdict {
                 format!("reopen {} (the landing commit is pushed)", which(number)),
                 Waits::Anyone,
             ),
+            MrFacts::Read {
+                read: MrRead::Error(e),
+                ..
+            } => error_verdict(e),
             MrFacts::Read { number, .. } => verdict(
                 Stage::Pushed,
                 format!(
@@ -1471,7 +1483,7 @@ pub fn run_from(
             follows: None,
             verdict: verdict(
                 Stage::Unknown(format!(
-                    "the MR head {} is the head of no branch: pushed after, or its branch is gone",
+                    "the MR head {} is the head of no branch: the branch moved on (Forgejo has not updated the MR yet), or its branch is gone",
                     short(&head)
                 )),
                 format!("check {which} on the forge"),
@@ -1838,10 +1850,35 @@ mod tests {
             }),
             (
                 "landing pushed, CI failing".into(),
-                "fix CI".into(),
+                "fix CI (until slice 4b swl check fails on a landing commit)".into(),
                 Waits::Anyone
             )
         );
+        assert_eq!(
+            cv(ConsumerFacts {
+                landing_pushed: true,
+                mr: open(true, Some(CiState::Green)),
+                ..consumer()
+            }),
+            (
+                "MR open (draft)".into(),
+                "mark swan-lake#1 ready".into(),
+                Waits::Anyone
+            )
+        );
+        for (e, next, waits) in [
+            (LOGIN_REJECTED, "fj auth login", Waits::Anyone),
+            ("forge API unreachable", "rerun swl status", Waits::Nobody),
+        ] {
+            assert_eq!(
+                cv(ConsumerFacts {
+                    landing_pushed: true,
+                    mr: read(MrRead::Error(e.into())),
+                    ..consumer()
+                }),
+                (format!("unknown ({e})"), next.into(), waits)
+            );
+        }
         assert_eq!(
             cv(ConsumerFacts {
                 landing_pushed: true,

@@ -396,6 +396,53 @@ fn status_follows_a_change_from_local_to_landed() {
         "check swan-lake#2 on the forge (the landing commit is pushed)",
         "anyone",
     );
+    // A rejected login: unknown, not `pushed`.
+    let out = stdout(&t.f.swl_env(
+        &t.f.root,
+        &["status", "--workspace", &ws_s],
+        &[("SWL_FJ_KEYS", bad.to_str().unwrap())],
+    ));
+    assert_row(
+        &out,
+        consumer,
+        "unknown (fj login rejected: run fj auth login)",
+        "fj auth login",
+        "anyone",
+    );
+    // A draft MR is marked ready first.
+    t.f.api
+        .set_pr("swan-lake", 2, "draft", "sl-0010-x", &landing, None);
+    let out = t.status(true);
+    assert_row(
+        &out,
+        consumer,
+        "MR open (draft)",
+        "mark swan-lake#2 ready",
+        "anyone",
+    );
+    t.f.api
+        .set_pr("swan-lake", 2, "open", "sl-0010-x", &landing, None);
+    // An MR whose head is no branch's any more: check it on the forge.
+    t.f.git(
+        &forge_consumer,
+        &["update-ref", "refs/pull/5/head", &consumer_head],
+    );
+    t.f.api
+        .set_pr("swan-lake", 5, "open", "sl-0010-x", &consumer_head, None);
+    let out = t.status_from("swan-lake#5");
+    let r = row(&out, consumer);
+    assert!(r.starts_with("swan-lake  unknown (the MR head "), "{out}");
+    assert!(
+        r.contains(
+            "the branch moved on (Forgejo has not updated the MR yet), or its branch is gone)"
+        ),
+        "{out}"
+    );
+    assert!(
+        r.ends_with("next: check swan-lake#5 on the forge  waits: anyone"),
+        "{out}"
+    );
+    t.f.git(&forge_consumer, &["update-ref", "-d", "refs/pull/5/head"]);
     // Until slice 4b, the MR's swl check fails on the lock change.
     t.f.api.set_status("swan-lake", &landing, "failure");
     let out = t.status(true);
@@ -403,7 +450,7 @@ fn status_follows_a_change_from_local_to_landed() {
         &out,
         consumer,
         "landing pushed, CI failing",
-        "fix CI",
+        "fix CI (until slice 4b swl check fails on a landing commit)",
         "anyone",
     );
     // --no-fetch looks up no consumer MR.
