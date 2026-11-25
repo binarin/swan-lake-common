@@ -61,8 +61,9 @@ swl finalize [--wait]                     # landed entries -> one lock commit
 - `start --from CONSUMER#MR [--workspace DIR] [--no-fetch]` joins a
   published change, for example on another machine. With git (consumer repos
   are private), it reads `refs/pull/MR/head` from the consumer source's
-  remote and the one branch at that head; with none (the MR was merged and
-  its branch deleted, or the branch moved on) or several, it refuses. It
+  remote and the one branch at that head, other than the base branch; with
+  none (the MR was merged, its branch deleted, or the branch moved on) or
+  several, it refuses. It
   fetches that head and reads its `swl.toml`. The workspace is `DIR`
   (default `./<consumer branch>`): the consumer on its branch, tracking the
   remote's, and for each entry `[inputs.<path>] repo, mr` the checkout

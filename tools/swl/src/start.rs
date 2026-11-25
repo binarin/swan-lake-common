@@ -57,8 +57,14 @@ pub fn parse_ls_remote(text: &str) -> Vec<(String, String)> {
 }
 
 /// The head of `refs/pull/<n>/head` and the one branch at that head, from
-/// `ls-remote` lines.
-pub fn mr_branch(refs: &[(String, String)], repo: &str, n: u64) -> Result<(String, String)> {
+/// `ls-remote` lines. The base branch is not a candidate: an MR whose head
+/// it is was merged.
+pub fn mr_branch(
+    refs: &[(String, String)],
+    repo: &str,
+    n: u64,
+    base_branch: &str,
+) -> Result<(String, String)> {
     let pull = format!("refs/pull/{n}/head");
     let Some((head, _)) = refs.iter().find(|(_, r)| *r == pull) else {
         bail!("{repo}#{n}: no {pull} on the forge: no such MR");
@@ -68,8 +74,17 @@ pub fn mr_branch(refs: &[(String, String)], repo: &str, n: u64) -> Result<(Strin
         .filter(|(sha, _)| sha == head)
         .filter_map(|(_, r)| r.strip_prefix("refs/heads/"))
         .collect();
-    match branches.as_slice() {
+    let topics: Vec<&str> = branches
+        .iter()
+        .copied()
+        .filter(|b| *b != base_branch)
+        .collect();
+    match topics.as_slice() {
         [b] => Ok((head.clone(), b.to_string())),
+        [] if branches.contains(&base_branch) => bail!(
+            "{repo}#{n}: its head {} is the head of {base_branch}: the MR is merged; nothing to join",
+            &head[..head.len().min(12)]
+        ),
         [] => bail!(
             "{repo}#{n}: its head {} is not the head of any branch: the MR was merged and its \
              branch deleted, or the branch moved on; nothing to join",
@@ -126,7 +141,9 @@ pub fn read_consumer_mr(
     let pull = format!("refs/pull/{n}/head");
     let refs = git(&source, &["ls-remote", &remote, &pull, "refs/heads/*"])
         .with_context(|| format!("reading {consumer}#{n} from {remote}"))?;
-    let (head, branch) = mr_branch(&parse_ls_remote(&refs), consumer, n)?;
+    let base = config.base_for(consumer);
+    let base_branch = base.split_once('/').map_or(base, |(_, b)| b);
+    let (head, branch) = mr_branch(&parse_ls_remote(&refs), consumer, n, base_branch)?;
     fetcher.fetch(&source, &remote)?;
     let present =
         |sha: &str| git_ok(&source, &["cat-file", "-e", &format!("{sha}^{{commit}}")]).is_some();
@@ -410,20 +427,45 @@ mod tests {
         let text = "aaa\trefs/heads/master\nbbb\trefs/heads/sl-1-x\nbbb\trefs/pull/3/head\nccc\trefs/pull/2/head\n";
         let r = parse_ls_remote(text);
         assert_eq!(
-            mr_branch(&r, "swan-lake", 3).unwrap(),
+            mr_branch(&r, "swan-lake", 3, "master").unwrap(),
             ("bbb".into(), "sl-1-x".into())
         );
-        let e = mr_branch(&r, "swan-lake", 2).unwrap_err().to_string();
+        let e = mr_branch(&r, "swan-lake", 2, "master")
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("not the head of any branch"), "{e}");
-        let e = mr_branch(&r, "swan-lake", 9).unwrap_err().to_string();
+        let e = mr_branch(&r, "swan-lake", 9, "master")
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("no such MR"), "{e}");
         let two = refs(&[
             ("bbb", "refs/heads/a"),
             ("bbb", "refs/heads/b"),
             ("bbb", "refs/pull/3/head"),
         ]);
-        let e = mr_branch(&two, "swan-lake", 3).unwrap_err().to_string();
+        let e = mr_branch(&two, "swan-lake", 3, "master")
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("several branches (a, b)"), "{e}");
+        let merged = refs(&[
+            ("aaa", "refs/heads/master"),
+            ("aaa", "refs/heads/sl-1-x"),
+            ("aaa", "refs/pull/4/head"),
+            ("bbb", "refs/pull/5/head"),
+            ("bbb", "refs/heads/master"),
+        ]);
+        // A branch at master's head is still joinable; master itself is not.
+        assert_eq!(
+            mr_branch(&merged, "swan-lake", 4, "master").unwrap().1,
+            "sl-1-x"
+        );
+        let e = mr_branch(&merged, "swan-lake", 5, "master")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.ends_with("is the head of master: the MR is merged; nothing to join"),
+            "{e}"
+        );
     }
 
     #[test]

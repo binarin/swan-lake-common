@@ -215,6 +215,17 @@ fn start_from_joins_an_open_and_a_merged_mr() {
         2,
         "not the head of any branch",
     );
+    // Merged by a fast-forward: its head is master's, not a branch to join.
+    f.git(
+        &f.forge_repo("swan-lake"),
+        &["update-ref", "refs/pull/7/head", &master],
+    );
+    failed(
+        &f.swl_env(&work, &["start", "--from", "swan-lake#7"], &login),
+        2,
+        "is the head of master: the MR is merged",
+    );
+    assert!(!work.join("master").exists());
     failed(
         &f.swl_env(&work, &["start", "--from", "swan-lake#9"], &login),
         2,
