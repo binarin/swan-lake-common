@@ -16,7 +16,7 @@ use clap::ValueEnum;
 use crate::{
     ci::CI_MARKER,
     config::Config,
-    env::GENERATED_MARKER,
+    env::{GENERATED_MARKER, store_dir},
     nix_args::{InstallablesCall, NixCall, classify_nix, nh_lock_flag},
     workspace::{Override, Workspace, find_flake_dir},
 };
@@ -277,12 +277,6 @@ fn overrides_for_dirs(ws: &Workspace, config: &Config, dirs: &[PathBuf]) -> Resu
         }
     }
     Ok(out)
-}
-
-fn store_dir() -> PathBuf {
-    env::var_os("NIX_STORE_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/nix/store"))
 }
 
 /// A store path installable, such as `/nix/store/…-x.drv^out` or a `result`
