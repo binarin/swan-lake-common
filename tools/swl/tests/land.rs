@@ -1544,3 +1544,40 @@ fn refresh_rebases_only_the_changes_own_mr_branches_into_the_base() {
     assert_eq!(t.forge_refs(), refs);
     assert_eq!(t.common_head(), c2);
 }
+
+#[test]
+fn refresh_refuses_a_branch_with_merge_commits() {
+    let t = Change::new("refresh-merges");
+    let c2 = t.common_head();
+    // A merge on the branch, as the forge's "update branch" makes one.
+    t.f.git(&t.common, &["switch", "-qc", "side", "HEAD^"]);
+    fs::write(t.common.join("side.txt"), "s").unwrap();
+    t.f.git(&t.common, &["add", "side.txt"]);
+    t.f.git(&t.common, &["commit", "-qm", "side"]);
+    t.f.git(&t.common, &["switch", "-q", "sl-0020-land"]);
+    t.f.git(
+        &t.common,
+        &["merge", "-q", "--no-ff", "-m", "merge side", "side"],
+    );
+    t.f.git(&t.common, &["push", "-q", "origin", "sl-0020-land"]);
+    let merge = t.common_head();
+    t.f.commit_file_on_forge("swan-lake-common", "master", "other.txt", "o");
+    let refs = t.forge_refs();
+    failed(
+        &t.refresh(&["--dry-run"]),
+        0,
+        &format!(
+            "and it has merge commits, which a rebase would not keep (nor what they resolve): {} \
+             merge side; rebase it by hand",
+            &merge[..7]
+        ),
+    );
+    failed(
+        &t.refresh(&[]),
+        4,
+        "merge side; rebase it by hand, push it, then rerun swl refresh",
+    );
+    assert_eq!(t.forge_refs(), refs);
+    assert_eq!(t.common_head(), merge);
+    assert_ne!(merge, c2);
+}

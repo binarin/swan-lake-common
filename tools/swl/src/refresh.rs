@@ -392,10 +392,19 @@ pub(crate) fn refresh(l: &Lander, part: &Part) -> Result<Step> {
         true => rev(source, &format!("{observed}^"))?,
         false => observed.clone(),
     };
-    let count = git(
-        source,
-        &["rev-list", "--count", &format!("{base_tip}..{start}")],
-    )?;
+    let range = format!("{base_tip}..{start}");
+    let merges = git(source, &["log", "--merges", "--format=%h %s", &range])?;
+    if !merges.is_empty() {
+        return stop(
+            Waits::Anyone,
+            format!(
+                "{behind}, and it has merge commits, which a rebase would not keep (nor what they \
+                 resolve): {}; rebase it by hand, push it, then rerun {cmd}",
+                merges.lines().collect::<Vec<_>>().join(", ")
+            ),
+        );
+    }
+    let count = git(source, &["rev-list", "--count", &range])?;
     let lease = format!("--force-with-lease=refs/heads/{branch}:{observed}");
     let what = format!(
         "rebase {branch} of {which} ({count} commit{}{}) onto {base} at {}{}, and push it with \
