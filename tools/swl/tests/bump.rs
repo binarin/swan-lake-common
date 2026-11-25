@@ -284,9 +284,19 @@ fn bump_runs_to_the_end_over_reruns() {
     assert!(log.contains("lib: forward move"), "{log}");
     assert!(log.contains("MR checks passed"), "{log}");
 
+    // The forge lags with swan-lake#1's pull ref: the MR is found by its
+    // branch in the list of open MRs, not opened again.
+    let sl_tip = t.rev("swan-lake", BRANCH);
+    let sl_forge = t.f.forge_repo("swan-lake");
+    t.f.git(&sl_forge, &["update-ref", "-d", "refs/pull/1/head"]);
+    let out = t.bump(&[]);
+    failed(&out, 5, "swan-lake#1 waits for CI, then it merges");
+    let opened = |w: &Vec<String>| w.iter().filter(|w| w.contains("/pulls {")).count();
+    assert_eq!(opened(&t.f.api.writes()), 2, "{:?}", t.f.api.writes());
+    t.f.git(&sl_forge, &["update-ref", "refs/pull/1/head", &sl_tip]);
+
     // CI succeeds on swan-lake's bump, which merges by its schedule; on
     // nixos-config's too, but its merge is refused: for the owner.
-    let sl_tip = t.rev("swan-lake", BRANCH);
     t.f.api.set_status("swan-lake", &sl_tip, "success");
     assert_eq!(t.rev("swan-lake", "master"), sl_tip);
     let nc_tip = t.rev("nixos-config", BRANCH);
@@ -582,6 +592,35 @@ fn bump_updates_its_own_branch_and_mr() {
             .iter()
             .filter(|w| w.contains("/pulls {"))
             .count();
+
+    // The owner closed swan-lake's bump MR: no new one for the same head,
+    // the owner decides.
+    let pr_path = "/api/v1/repos/binarin/swan-lake/pulls/1";
+    let open_pr = t.f.api.responses.lock().unwrap()[pr_path].clone();
+    t.f.api
+        .set_pr("swan-lake", 1, "closed", BRANCH, &old_tip, None);
+    failed(
+        &t.bump(&[]),
+        3,
+        &format!(
+            "waits for the owner: swan-lake#1, the bump MR of {BRANCH} at {}, was closed without \
+             merging",
+            short(&old_tip)
+        ),
+    );
+    let now =
+        t.f.api
+            .writes()
+            .iter()
+            .filter(|w| w.contains("/pulls {"))
+            .count();
+    assert_eq!(now, opened);
+    // Reopened.
+    t.f.api
+        .responses
+        .lock()
+        .unwrap()
+        .insert(pr_path.into(), open_pr);
 
     // The consumer's master moves on, and zwanenzang again: the bump
     // branch is rebuilt on the new master, with a lease on its old head,

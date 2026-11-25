@@ -164,6 +164,12 @@ pub const NOT_FOUND: &str = "no such MR (or the repo is not public)";
 pub trait PrReader {
     fn pr(&self, repo: &str, number: u64) -> Result<Option<PrInfo>>;
     fn commit_status(&self, repo: &str, sha: &str) -> Result<Option<CiState>>;
+    /// The open MR whose head is the branch `branch`, from the forge's list of
+    /// open MRs; for a pull ref that lags behind a push.
+    fn open_pr_from(&self, repo: &str, branch: &str) -> Result<Option<PrInfo>> {
+        let _ = (repo, branch);
+        bail!("this reader does not list MRs")
+    }
     /// What a 404 means for this reader.
     fn not_found(&self) -> &'static str {
         NOT_FOUND
@@ -320,6 +326,43 @@ fn read_commit_status(
     }
 }
 
+/// The open MR of `branch`, from `GET /repos/{owner}/{repo}/pulls?state=open`,
+/// page by page.
+fn read_open_pr_from(
+    base: &str,
+    token: Option<&str>,
+    repo: &str,
+    branch: &str,
+    hint: &str,
+) -> Result<Option<PrInfo>> {
+    const LIMIT: usize = 50;
+    for page in 1..=20 {
+        let path = format!(
+            "repos/{}/pulls?state=open&limit={LIMIT}&page={page}",
+            slug(repo)
+        );
+        let prs = match api_get(base, &path, token)? {
+            (200, body) => serde_json::from_str::<Value>(&body)
+                .with_context(|| format!("GET {path}: not JSON"))?,
+            (404, _) => return Ok(None),
+            (code, _) => return Err(http_error(&path, code, token, hint)),
+        };
+        let prs = prs
+            .as_array()
+            .ok_or_else(|| anyhow!("GET {path}: not a list"))?;
+        if let Some(pr) = prs
+            .iter()
+            .find(|pr| pr.pointer("/head/ref").and_then(Value::as_str) == Some(branch))
+        {
+            return PrInfo::from_api(pr).map(Some);
+        }
+        if prs.len() < LIMIT {
+            break;
+        }
+    }
+    Ok(None)
+}
+
 /// The anonymous Forgejo API, through curl. The manifest repos must be
 /// public for this to work.
 pub struct AnonApi {
@@ -341,6 +384,10 @@ impl PrReader for AnonApi {
 
     fn commit_status(&self, repo: &str, sha: &str) -> Result<Option<CiState>> {
         read_commit_status(&self.base, None, repo, sha, ANON_HINT)
+    }
+
+    fn open_pr_from(&self, repo: &str, branch: &str) -> Result<Option<PrInfo>> {
+        read_open_pr_from(&self.base, None, repo, branch, ANON_HINT)
     }
 }
 
@@ -547,6 +594,13 @@ impl PrReader for ForgeReader {
         self.read(
             || self.anon.commit_status(repo, sha),
             |t| read_commit_status(&self.anon.base, Some(t), repo, sha, AUTH_HINT),
+        )
+    }
+
+    fn open_pr_from(&self, repo: &str, branch: &str) -> Result<Option<PrInfo>> {
+        self.read(
+            || self.anon.open_pr_from(repo, branch),
+            |t| read_open_pr_from(&self.anon.base, Some(t), repo, branch, AUTH_HINT),
         )
     }
 

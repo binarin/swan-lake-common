@@ -866,7 +866,10 @@ rev is stale, it is rebuilt on the current base and pushed with
 `--force-with-lease` to the head it read (the one push swl may force), and
 its open MR follows, retitled and its description updated (`PATCH
 /repos/{owner}/{repo}/pulls/{n}`). Anything else on it stops that consumer for
-anyone: delete the branch on the forge, then rerun.
+anyone: delete the branch on the forge, then rerun. When the newest bump MR
+at the branch's (current) head was closed without merging, no other is
+opened for that head: it waits for the owner, to reopen it or delete the
+branch.
 
 Limits:
 - Every root input of common is judged against its declared ref; there is
@@ -880,8 +883,10 @@ Limits:
   requests an hour).
 - `swl status` does not show bumps; `bump --dry-run` is the plan.
 - An MR is found by the pull ref at the bump branch's head, as `land` finds
-  a consumer's: before the forge has recorded a push, a rerun may try to
-  open a second MR, which the forge refuses (an error); rerun.
+  a consumer's, else in the forge's list of open MRs (`GET
+  /repos/{owner}/{repo}/pulls?state=open`, by its head branch) before one is
+  opened; one that the pull ref does not show at the pushed head yet waits
+  for nobody: rerun.
 
 ## Limits
 

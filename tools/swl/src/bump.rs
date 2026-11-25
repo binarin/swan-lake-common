@@ -726,9 +726,11 @@ impl Bumper<'_> {
         }
     }
 
-    /// The open bump MR whose head is `sha`, by the forge's pull refs.
-    fn open_mr_at(&self, c: &Consumer, sha: &str) -> Result<Option<PrInfo>> {
+    /// The bump MRs (of [`BUMP_BRANCH`]) whose head is `sha`, by the forge's
+    /// pull refs, newest first.
+    fn mrs_at(&self, c: &Consumer, sha: &str) -> Result<Vec<PrInfo>> {
         let refs = git(&c.source, &["ls-remote", &c.remote, "refs/pull/*/head"])?;
+        let mut out = Vec::new();
         for (at, refname) in start::parse_ls_remote(&refs) {
             let n = refname
                 .strip_prefix("refs/pull/")
@@ -738,13 +740,13 @@ impl Bumper<'_> {
                 continue;
             };
             if let Some(info) = self.reader.pr(&c.name, n)?
-                && info.state == PrState::Open
                 && info.head_ref == BUMP_BRANCH
             {
-                return Ok(Some(info));
+                out.push(info);
             }
         }
-        Ok(None)
+        out.sort_by_key(|i| std::cmp::Reverse(i.number));
+        Ok(out)
     }
 
     /// Step 3 for one consumer: its bump MR to `target`, pushed, opened and
@@ -864,7 +866,22 @@ impl Bumper<'_> {
                         .iter()
                         .all(|i| locked_rev(&l, &i.name).as_deref() == Some(target))
                 });
-            mr = self.open_mr_at(c, tip)?;
+            let mrs = self.mrs_at(c, tip)?;
+            mr = mrs.iter().find(|i| i.state == PrState::Open).cloned();
+            if let (true, None, Some(newest)) = (up_to_date, &mr, mrs.first())
+                && newest.state == PrState::ClosedUnmerged
+            {
+                return stop(
+                    Waits::Owner,
+                    format!(
+                        "{name}#{}, the bump MR of {BUMP_BRANCH} at {}, was closed without \
+                         merging: reopen it, or delete {BUMP_BRANCH} on the forge for a new one; \
+                         then rerun {CMD}",
+                        newest.number,
+                        short(tip)
+                    ),
+                );
+            }
         }
         tracing::debug!(?tip, up_to_date, mr = ?mr.as_ref().map(|m| m.number), "the bump branch");
         let mut head = tip.clone().unwrap_or_default();
@@ -925,6 +942,10 @@ impl Bumper<'_> {
                 }
             }
             _scratch = Some(scratch);
+        }
+        // A pull ref that lags behind a push hides the MR: ask the list.
+        if mr.is_none() {
+            mr = self.reader.open_pr_from(name, BUMP_BRANCH)?;
         }
         let info = match mr {
             Some(info) => match self.reader.pr(name, info.number)? {

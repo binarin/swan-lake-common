@@ -202,6 +202,12 @@ impl FakeApi {
         let no_status = path
             .ends_with("/status")
             .then(|| r#"{"state":"","sha":"","total_count":0,"statuses":null}"#.to_string());
+        if let Some(query) = path
+            .strip_prefix(&format!("/api/v1/repos/binarin/{repo}/pulls?"))
+            .filter(|_| allowed)
+        {
+            return ("200 OK".into(), self.list_prs(&repo, query));
+        }
         let found = allowed
             .then(|| {
                 self.responses
@@ -220,6 +226,45 @@ impl FakeApi {
                 r#"{"message":"not found"}"#.to_string(),
             ),
         }
+    }
+
+    /// `GET .../pulls?state=open&limit=L&page=P`: the open MRs by number, as
+    /// Forgejo pages them.
+    fn list_prs(&self, repo: &str, query: &str) -> String {
+        let param = |k: &str| {
+            query
+                .split('&')
+                .find_map(|p| p.strip_prefix(&format!("{k}=")))
+                .map(str::to_string)
+        };
+        let limit: usize = param("limit").and_then(|l| l.parse().ok()).unwrap_or(30);
+        let page: usize = param("page").and_then(|p| p.parse().ok()).unwrap_or(1);
+        let prefix = format!("/api/v1/repos/binarin/{repo}/pulls/");
+        let prs: Vec<(String, String)> = self
+            .responses
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(p, _)| {
+                p.strip_prefix(&prefix)
+                    .is_some_and(|n| n.parse::<u64>().is_ok())
+            })
+            .map(|(p, b)| (p.clone(), b.clone()))
+            .collect();
+        let mut open: Vec<serde_json::Value> = prs
+            .into_iter()
+            .map(|(p, b)| serde_json::from_str(&self.live(&p, repo, b)).unwrap())
+            .filter(|v: &serde_json::Value| {
+                v["state"] == "open" && param("state").is_none_or(|s| s == "open")
+            })
+            .collect();
+        open.sort_by_key(|v| v["number"].as_u64());
+        let page: Vec<_> = open
+            .into_iter()
+            .skip((page - 1) * limit)
+            .take(limit)
+            .collect();
+        serde_json::Value::Array(page).to_string()
     }
 
     /// An open MR's head as the forge has it, with `follow_pull_refs`.
