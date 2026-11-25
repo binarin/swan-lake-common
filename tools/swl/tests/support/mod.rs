@@ -70,7 +70,8 @@ pub struct Seen {
 pub enum MergeReply {
     /// Merges now, as Forgejo's fast-forward-only merge does: the base
     /// branch moves to the head, the head branch is deleted, the MR is
-    /// merged. 409 when the head is not the asked `head_commit_id`, or not a
+    /// merged. 409 when the head is not the asked `head_commit_id`; 500
+    /// with an empty message, as Forgejo 17 answers, when it is not a
     /// fast-forward of master.
     MergeNow,
     /// 201: scheduled to merge when checks succeed (409 "already scheduled"
@@ -82,6 +83,10 @@ pub enum MergeReply {
     /// green without a status event that would merge it: the race of CI
     /// finishing as the merge is scheduled.
     ScheduleAsChecksTurnGreen,
+    /// Master gets a new commit, then the merge is answered as
+    /// [`MergeReply::MergeNow`]: the race of the base moving as the merge is
+    /// requested.
+    BaseMovesFirst,
     /// Any other answer.
     Status(u16, String),
 }
@@ -362,6 +367,33 @@ impl FakeApi {
                 }
                 ("201 Created".into(), String::new())
             }
+            MergeReply::BaseMovesFirst => {
+                let forge = self
+                    .forge
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .expect("the forge is set");
+                let dir = forge.join("binarin").join(repo);
+                let moved = git_in(
+                    &dir,
+                    &[
+                        "-c",
+                        "user.name=fake forge",
+                        "-c",
+                        "user.email=forge@example.org",
+                        "commit-tree",
+                        "master^{tree}",
+                        "-p",
+                        "master",
+                        "-m",
+                        "moved",
+                    ],
+                )
+                .unwrap();
+                git_in(&dir, &["update-ref", "refs/heads/master", &moved]).unwrap();
+                self.merge_pr(pr_path, repo, req["head_commit_id"].as_str())
+            }
             MergeReply::Status(code, msg) => message(code, "Status", &msg),
             MergeReply::MergeNow => self.merge_pr(pr_path, repo, req["head_commit_id"].as_str()),
         }
@@ -465,7 +497,8 @@ impl FakeApi {
             .expect("the forge is set");
         let dir = forge.join("binarin").join(repo);
         if git_in(&dir, &["merge-base", "--is-ancestor", "master", &head]).is_none() {
-            return message(409, "Conflict", "Not fast-forward: the base moved");
+            // Forgejo 17's answer to a fast-forward-only merge it cannot do.
+            return message(500, "Internal Server Error", "");
         }
         git_in(&dir, &["update-ref", "refs/heads/master", &head]).unwrap();
         if let Some(branch) = v["head"]["ref"].as_str() {

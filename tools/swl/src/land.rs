@@ -337,6 +337,67 @@ impl Lander<'_> {
         }
     }
 
+    /// Why `info`'s head is not mergeable by fast-forward into `repo`'s
+    /// base, told by git in the repo's source after fetching the base
+    /// branch: `None` when the head contains the base's tip, or when that
+    /// cannot be told (a repo not in the config, a base without a remote, a
+    /// head that cannot be fetched).
+    pub(crate) fn base_missing(&self, repo: &str, info: &PrInfo) -> Option<String> {
+        let rc = self.config.repo(repo).ok()?;
+        let (src, base) = (&rc.source, rc.base());
+        let remote = base_remote(src, base).ok()??;
+        let branch = base.split_once('/').map_or(base, |(_, b)| b);
+        let tracking = format!("refs/remotes/{remote}/{branch}");
+        let known = |r: &str| {
+            git_ok(
+                src,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    &format!("{r}^{{commit}}"),
+                ],
+            )
+        };
+        let refspec = format!("+refs/heads/{branch}:{tracking}");
+        if let Err(e) = git(src, &["fetch", "--quiet", &remote, &refspec]) {
+            tracing::debug!(error = %format!("{e:#}"), "fetching the base before a merge");
+            return None;
+        }
+        if known(&info.head_sha).is_none() {
+            let pull = format!("refs/pull/{}/head", info.number);
+            let _ = git(src, &["fetch", "--quiet", &remote, &pull]);
+        }
+        let tip = known(&tracking)?;
+        known(&info.head_sha)?;
+        let contains = git_ok(src, &["merge-base", "--is-ancestor", &tip, &info.head_sha]);
+        tracing::debug!(%repo, head = %info.head_sha, %tip, contains = contains.is_some(), "the MR head against its base");
+        contains.is_none().then(|| {
+            format!(
+                "its head {} does not contain {base} at {}",
+                short(&info.head_sha),
+                short(&tip)
+            )
+        })
+    }
+
+    /// Requests the merge of `info`'s head. Forgejo answers a 500 to a
+    /// fast-forward-only merge it cannot do: when git shows that the head
+    /// does not contain the base, that is [`MergeOutcome::NotFastForward`],
+    /// else an error.
+    fn request_merge(&self, repo: &str, info: &PrInfo, when: MergeWhen) -> Result<MergeOutcome> {
+        let outcome = self
+            .writer
+            .request_merge(repo, info.number, &info.head_sha, when)?;
+        let MergeOutcome::ServerError(why) = outcome else {
+            return Ok(outcome);
+        };
+        match self.base_missing(repo, info) {
+            Some(missing) => Ok(MergeOutcome::NotFastForward(format!("{why}; {missing}"))),
+            None => bail!("merge request of {repo}#{}: {why}", info.number),
+        }
+    }
+
     /// The combined commit status of an MR head, read now; `None` when it
     /// cannot be read.
     fn ci_now(&self, repo: &str, head: &str) -> Option<CiState> {
@@ -352,7 +413,9 @@ impl Lander<'_> {
     /// scheduled on checks that are green already, it never merges. So a
     /// green MR is merged directly, and so is one that turns green right
     /// after its merge was scheduled. A direct merge that branch protection
-    /// refuses leaves the schedule in place, or makes one.
+    /// refuses leaves the schedule in place, or makes one. Nothing is
+    /// requested for a head that git shows does not contain the base: that
+    /// merge cannot be a fast-forward.
     pub(crate) fn merge(
         &self,
         which: &str,
@@ -369,6 +432,10 @@ impl Lander<'_> {
                 format!("{which}: CI failing ({s}); fix it, then rerun {cmd}"),
             );
         }
+        if let Some(why) = self.base_missing(repo, info) {
+            let outcome = MergeOutcome::NotFastForward(why);
+            return self.merge_answer(which, repo, info, outcome, rebase);
+        }
         if let Some(step) = self.mark_ready(which, repo, info)? {
             return Ok(step);
         }
@@ -378,12 +445,7 @@ impl Lander<'_> {
         if !self.act(&format!("merge {which}"), &schedule_what(which, info))? {
             return self.dry_stop(&format!("{which} merges when its checks succeed"));
         }
-        let outcome = self.writer.request_merge(
-            repo,
-            info.number,
-            &info.head_sha,
-            MergeWhen::ChecksSucceed,
-        )?;
+        let outcome = self.request_merge(repo, info, MergeWhen::ChecksSucceed)?;
         if outcome == MergeOutcome::Scheduled {
             if self.ci_now(repo, &info.head_sha) == Some(CiState::Green) {
                 style::say(
@@ -428,9 +490,7 @@ impl Lander<'_> {
         if !self.act(&format!("merge now {which}"), &what)? {
             return self.dry_stop(&format!("{which} is merged"));
         }
-        let outcome =
-            self.writer
-                .request_merge(repo, info.number, &info.head_sha, MergeWhen::Now)?;
+        let outcome = self.request_merge(repo, info, MergeWhen::Now)?;
         match &outcome {
             MergeOutcome::Scheduled => stop(
                 Waits::Nobody,
@@ -456,9 +516,7 @@ impl Lander<'_> {
     /// what came of it, for the message.
     fn schedule_after_refusal(&self, which: &str, repo: &str, info: &PrInfo) -> Result<String> {
         self.act(&format!("merge {which}"), &schedule_what(which, info))?;
-        let answer =
-            self.writer
-                .request_merge(repo, info.number, &info.head_sha, MergeWhen::ChecksSucceed);
+        let answer = self.request_merge(repo, info, MergeWhen::ChecksSucceed);
         Ok(match answer {
             Ok(MergeOutcome::Scheduled) => {
                 "its merge is scheduled for when its checks succeed".to_string()
@@ -552,6 +610,7 @@ impl Lander<'_> {
                 Waits::Nobody,
                 format!("{which}: the forge is not ready ({why}); rerun {cmd}"),
             ),
+            MergeOutcome::ServerError(why) => bail!("{which}: merge request: {why}"),
         }
     }
 

@@ -634,6 +634,10 @@ pub enum MergeOutcome {
     HeadMoved(String),
     /// The forge is not ready (still checking mergeability); try again.
     TryLater(String),
+    /// HTTP 500: what Forgejo (17) answers to a fast-forward-only merge of
+    /// a head that does not contain the base, with an empty message. The
+    /// caller tells it by git ancestry ([`crate::land::Lander`]).
+    ServerError(String),
 }
 
 /// The outcome of a merge request from Forgejo's answer: 200 merged, 201
@@ -641,12 +645,12 @@ pub enum MergeOutcome {
 /// A 405 of branch protection (`not allowed to merge [reason: …]`) is told
 /// by its reason, as Forgejo's source words it (not verified against a
 /// running Forgejo): required status checks, a head behind the base,
-/// approvals and reviews; anything else is a refusal.
+/// approvals and reviews; anything else is a refusal. A 500 is
+/// [`MergeOutcome::ServerError`].
 pub fn merge_outcome(code: u16, body: &str) -> Result<MergeOutcome> {
     let message = serde_json::from_str::<Value>(body)
         .ok()
         .and_then(|v| v.get("message")?.as_str().map(|m| m.trim().to_string()))
-        .filter(|m| !m.is_empty())
         .unwrap_or_else(|| body.trim().to_string());
     let lower = message.to_ascii_lowercase();
     let why = if message.is_empty() {
@@ -683,6 +687,7 @@ pub fn merge_outcome(code: u16, body: &str) -> Result<MergeOutcome> {
         }
         401 => bail!(LOGIN_REJECTED),
         403 | 405 => MergeOutcome::Refused(why),
+        500 => MergeOutcome::ServerError(why),
         _ => bail!("merge request: {why}"),
     })
 }
@@ -1126,7 +1131,11 @@ mod tests {
             merge_outcome(401, "").unwrap_err().to_string(),
             LOGIN_REJECTED
         );
-        assert!(merge_outcome(500, "boom").is_err());
+        assert_eq!(
+            o(500, r#"{"message":""}"#),
+            MergeOutcome::ServerError("HTTP 500".into())
+        );
+        assert!(merge_outcome(502, "boom").is_err());
     }
 
     #[test]

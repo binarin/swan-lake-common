@@ -878,3 +878,64 @@ fn land_merges_directly_when_the_checks_turn_green_as_the_merge_is_scheduled() {
         ]
     );
 }
+
+#[test]
+fn land_reads_a_500_to_a_fast_forward_merge_by_ancestry() {
+    let t = Change::new("land-500");
+    let c2 = t.common_head();
+    t.f.api.set_status("swan-lake-common", &c2, "success");
+    let forge_common = t.f.forge_repo("swan-lake-common");
+
+    // A 500 to a head that contains the base: an error, as the forge said.
+    t.f.api.on_merge(
+        "swan-lake-common",
+        1,
+        &[MergeReply::Status(500, String::new())],
+    );
+    failed(
+        &t.land(&[]),
+        2,
+        "merge request of swan-lake-common#1: HTTP 500",
+    );
+
+    // The base moves as the merge is requested: Forgejo's 500 is told as
+    // not fast-forward by the head that no longer contains master.
+    t.f.api
+        .on_merge("swan-lake-common", 1, &[MergeReply::BaseMovesFirst]);
+    let out = t.land(&[]);
+    let moved = t.f.git(&forge_common, &["rev-parse", "master"]);
+    failed(
+        &out,
+        4,
+        &format!(
+            "swan-lake-common#1 is not mergeable by fast-forward: HTTP 500; its head {} does not \
+             contain origin/master at {})",
+            &c2[..12],
+            &moved[..12]
+        ),
+    );
+    assert_eq!(
+        t.writes_since(0),
+        [
+            "PATCH /api/v1/repos/binarin/swan-lake-common/pulls/1".to_string(),
+            format!("POST {COMMON_MERGE} now"),
+            format!("POST {COMMON_MERGE} now"),
+        ]
+    );
+
+    // Known behind the base, the head is not asked to merge at all.
+    let writes = t.f.api.writes().len();
+    let out = t.land(&[]);
+    failed(
+        &out,
+        4,
+        &format!(
+            "(swan-lake-common#1 is not mergeable by fast-forward: its head {} does not contain \
+             origin/master at {})",
+            &c2[..12],
+            &moved[..12]
+        ),
+    );
+    assert_eq!(t.f.api.writes().len(), writes, "{:?}", t.f.api.writes());
+    assert_eq!(t.f.git(&forge_common, &["rev-parse", "master"]), moved);
+}

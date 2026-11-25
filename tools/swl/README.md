@@ -656,6 +656,17 @@ whom. Rerun it to continue. The steps:
    moved (409, rerun). A scheduled merge is different: Forgejo merges the
    head that gets the success event, which need not be the head read.
 
+   No merge is requested, now or scheduled, for a head that cannot be a
+   fast-forward: first the base branch is fetched into the repo's source
+   (`+refs/heads/<branch>:refs/remotes/<remote>/<branch>`, and the MR's
+   pull ref when its head is not there), and a head that does not contain
+   the base's tip is not mergeable by fast-forward, as below. Forgejo
+   (17) answers a fast-forward-only merge that it cannot do with HTTP 500
+   and an empty message; after a 500 the base is fetched again, and a head
+   that does not contain it is not mergeable by fast-forward. Any other 500
+   is an error. When the ancestry cannot be told (a repo not in the
+   config, a base without a remote), the merge is requested as before.
+
    Forgejo (17.0.1) starts a scheduled merge only on a later commit status
    event: scheduled while the checks are green already, it answers
    "scheduled" and never merges. So `land` merges a green MR directly, and
@@ -921,7 +932,8 @@ Limits:
 - `land` follows one change in one workspace, step by step: an MR that waits
   for CI stops the run, also when later MRs could proceed. It knows a
   merge's outcome from Forgejo's answer (200 merged, 201 scheduled, 409
-  conflict, 403/405 refused, the reasons of a 405) and messages; a
+  conflict, 403/405 refused, the reasons of a 405, a 500 by git
+  ancestry) and messages; a
   scheduled auto-merge that fails shows as the MR still open on the next
   run. These answers, Forgejo's scheduled merge that waits for a status
   event, and the schedule that a direct merge deletes, are tested against
