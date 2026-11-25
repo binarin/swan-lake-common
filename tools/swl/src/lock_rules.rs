@@ -96,14 +96,14 @@ pub fn removed_entries(
 pub struct Declaration {
     /// The ref; `None` for the default branch.
     pub branch: Option<String>,
-    /// HEAD's declaration differs from the merge base's (a new input has
-    /// none there, and is not changed).
+    /// HEAD's declaration differs from the merge base's: also absent there,
+    /// but for a new input.
     pub changed: bool,
 }
 
-/// The declaration of a root input in HEAD's `flake.nix`, or why it cannot
-/// be read.
-pub type Declared<'a> = &'a dyn Fn(&str) -> Result<Declaration, String>;
+/// The declaration of a root input in HEAD's `flake.nix`, for an input new
+/// in the lock or not, or why it cannot be read.
+pub type Declared<'a> = &'a dyn Fn(&str, bool) -> Result<Declaration, String>;
 
 /// The lock nix makes from a reference lock with `(input, flake ref)`
 /// overrides, or why it cannot.
@@ -374,8 +374,15 @@ impl Rules<'_> {
 
     /// The new rev of `root` is in the branch its `flake.nix` declaration
     /// names.
-    fn declared_branch(&self, root: &str, rev: &str, source: &Source, out: &mut Judgement) {
-        let decl = match (self.declared)(root) {
+    fn declared_branch(
+        &self,
+        root: &str,
+        new: bool,
+        rev: &str,
+        source: &Source,
+        out: &mut Judgement,
+    ) {
+        let decl = match (self.declared)(root, new) {
             Ok(d) => d,
             Err(e) => {
                 out.errors.push(format!(
@@ -467,7 +474,7 @@ impl Rules<'_> {
         }
         self.merged_in(root, landed, out);
         match locked_at(self.new, root) {
-            Ok((source, rev)) => self.declared_branch(root, &rev, &source, out),
+            Ok((source, rev)) => self.declared_branch(root, true, &rev, &source, out),
             Err(e) => out.errors.push(format!("{root}: {e}")),
         }
     }
@@ -508,7 +515,7 @@ impl Rules<'_> {
                 }
             }
         }
-        self.declared_branch(root, &new_rev, &source, out);
+        self.declared_branch(root, false, &new_rev, &source, out);
     }
 
     /// The lock below the moved inputs is what nix locks for them at their
@@ -699,7 +706,7 @@ mod tests {
         h
     }
 
-    fn declared(name: &str) -> Result<Declaration, String> {
+    fn declared(name: &str, _new: bool) -> Result<Declaration, String> {
         let branch = match name {
             "common" | "common-next" => "swan-lake-current",
             "nixpkgs" => "nixos-unstable",
@@ -1062,8 +1069,8 @@ mod tests {
         let old = lock();
         let mut new = lock();
         set_rev(&mut new, "nixpkgs", '2');
-        let changed = |name: &str| {
-            declared(name).map(|d| Declaration {
+        let changed = |name: &str, new: bool| {
+            declared(name, new).map(|d| Declaration {
                 changed: name == "nixpkgs",
                 ..d
             })
@@ -1087,6 +1094,41 @@ mod tests {
             "flake.nix changes the declaration of nixpkgs; change the declaration and the lock in \
              separate MRs",
         );
+    }
+
+    /// Only an input new in the lock is asked for as new: a moved one that
+    /// the merge base did not declare must count as changed.
+    #[test]
+    fn declarations_are_asked_for_as_new_only_for_added_inputs() {
+        let old = lock();
+        let mut new = lock();
+        set_rev(&mut new, "nixpkgs", '2');
+        new["nodes"]["root"]["inputs"]["common-next"] = json!("next");
+        new["nodes"]["next"] = new["nodes"]["common"].clone();
+        new["nodes"]["next"]["locked"]["rev"] = json!(rev('b'));
+        let asked = RefCell::new(Vec::new());
+        let declared = |name: &str, is_new: bool| {
+            asked.borrow_mut().push(format!("{name} {is_new}"));
+            declared(name, is_new)
+        };
+        let removed: BTreeMap<String, Entry> =
+            [("common-next".to_string(), entry("swan-lake-common", 24))].into();
+        let api = Api([(24, merged('c'))].into());
+        let relock = |_: &Value, _: &[(String, String)]| Ok(new.clone());
+        let j = Rules {
+            old: &old,
+            new: &new,
+            removed: &removed,
+            declared: &declared,
+            api: &api,
+            history: &history(),
+            names_repo: &names_repo,
+            relock: &relock,
+        }
+        .judge()
+        .unwrap();
+        ok(&j);
+        assert_eq!(*asked.borrow(), ["common-next true", "nixpkgs false"]);
     }
 
     #[test]

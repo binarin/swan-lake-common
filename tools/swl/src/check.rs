@@ -134,16 +134,28 @@ fn base_declarations(root: &Path, mb: &str, nix: &Nix) -> Result<BTreeMap<String
     nix.declarations(tmp.path())
 }
 
+/// Whether HEAD's evaluated declaration of an input (URL, ref, nested input
+/// overrides and follows) is not the merge base's. Absent at the merge base
+/// is a change, but for an input `new` in the lock.
+fn declaration_changed(base: Option<&Value>, head: &Value, new: bool) -> bool {
+    match base {
+        Some(old) => old != head,
+        None => !new,
+    }
+}
+
 /// A root input's declaration in HEAD's `flake.nix`: its ref, and whether
-/// the whole evaluated declaration (URL, ref, nested input overrides and
-/// follows) differs from the merge base's. An input the merge base does not
-/// declare is new, not changed; a merge base that cannot be read is a
-/// difference.
+/// it changed from the merge base's (`declaration_changed`). A merge base
+/// whose `flake.nix` cannot be read is an error with its reason.
 fn declaration(
     decls: &mut Decls,
     base: &Result<BTreeMap<String, Value>, String>,
     input: &str,
+    new: bool,
 ) -> Result<lock_rules::Declaration, String> {
+    let base = base
+        .as_ref()
+        .map_err(|e| format!("cannot read the merge base's flake.nix: {e}"))?;
     let (nix, d) = decls.get().map_err(|e| format!("{e:#}"))?;
     let decl = d
         .get(input)
@@ -155,9 +167,7 @@ fn declaration(
     };
     Ok(lock_rules::Declaration {
         branch: attrs.get("ref").and_then(Value::as_str).map(str::to_string),
-        changed: base
-            .as_ref()
-            .map_or(true, |b| b.get(input).is_some_and(|old| old != decl)),
+        changed: declaration_changed(base.get(input), decl, new),
     })
 }
 
@@ -217,13 +227,13 @@ fn check_lock_change(
     out.notes.extend(notes);
     let decls = std::cell::RefCell::new(decls);
     let base = std::cell::OnceCell::new();
-    let declared = |input: &str| {
+    let declared = |input: &str, new: bool| {
         let mut d = decls.borrow_mut();
         let base = base.get_or_init(|| {
             let (nix, _) = d.get().map_err(|e| format!("{e:#}"))?;
             base_declarations(root, mb, nix).map_err(|e| format!("{e:#}"))
         });
-        declaration(&mut d, base, input)
+        declaration(&mut d, base, input, new)
     };
     let relock = |reference: &Value, overrides: &[(String, String)]| {
         let mut d = decls.borrow_mut();
@@ -523,6 +533,19 @@ mod tests {
         );
         assert!(e(&[("GITHUB_EVENT_NAME", "schedule")]).is_err());
         assert!(e(&[]).is_err());
+    }
+
+    #[test]
+    fn a_declaration_absent_at_the_merge_base_is_new_only_for_a_new_input() {
+        let decl = serde_json::json!({"url": "github:binarin/swan-lake-common"});
+        let other = serde_json::json!({"url": "github:binarin/swan-lake-common", "flake": true});
+        assert!(!declaration_changed(Some(&decl), &decl, false));
+        assert!(declaration_changed(Some(&decl), &other, false));
+        assert!(declaration_changed(Some(&decl), &other, true));
+        // A moved input the merge base did not declare (an implicit
+        // registry input then): declaring it now is a change.
+        assert!(declaration_changed(None, &decl, false));
+        assert!(!declaration_changed(None, &decl, true));
     }
 
     #[test]

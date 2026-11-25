@@ -423,7 +423,10 @@ Exit status 1 with one line per problem.
       ref, `flake`, and nested `inputs.<input>.inputs.*` overrides and
       follows) must be the merge base's: a moved input whose declaration
       changes fails the check; change the declaration and the lock in
-      separate MRs. A new input has no declaration at the merge base.
+      separate MRs. Only an input new in the lock may lack a declaration at
+      the merge base; a moved one that had none there (an implicit input)
+      counts as changed. A merge base `flake.nix` that cannot be evaluated
+      fails the check with its error.
 
     Besides, no root input was removed, only a landing adds one, a
     reformatted lock is not a change, nothing else in the lock changed
