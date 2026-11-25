@@ -645,9 +645,11 @@ whom. Rerun it to continue. The steps:
    checkout in the workspace (or, in a `--from` dry run, without a
    workspace) needs none. Its CI is then pending, so its merge is scheduled
    below.
-   When the checkout does not allow it (changes or untracked files, another
-   branch, a HEAD other than the remote branch's) or the rebase conflicts,
-   it waits for anyone, with the reason; nothing is merged. A draft (`WIP:`
+   When the MR is not the change's own (into another branch, from a fork),
+   the checkout does not allow it (changes or untracked files, another
+   branch, a HEAD other than the remote branch's), the branch has merge
+   commits, or the rebase conflicts, it waits for anyone, with the reason;
+   nothing is merged. A draft (`WIP:`
    title) is marked ready (its title without the prefix); a draft without
    that prefix is for anyone to mark ready on the forge. Then it is merged
    with Forgejo's API,
@@ -774,48 +776,67 @@ entries name (nested input paths first), then the consumers' own MRs. It
 reads the state as `swl status` does; an MR that is not open is not a part
 of it. Per MR:
 
-1. The base branch and the MR's branch (its head on the forge) are fetched
-   into the repo's source (`+refs/heads/<b>:refs/remotes/<remote>/<b>`). A
-   branch that contains the base's tip is up to date: nothing to do. A
-   remote branch at another head than the forge's MR waits for nobody:
-   rerun.
-2. Its workspace checkout must be clean (`git status --porcelain`: no
-   changes and no untracked files, but swl's generated `.envrc.local`,
-   `.direnv/`, `.swl/` and top-level `result*`), on the MR's branch, and at
-   the remote branch head (nothing unpushed, nothing new on the remote).
-   Otherwise it waits for anyone, with the reason; nothing is written. A
-   shared MR without a checkout in the workspace needs none.
-3. In a scratch worktree of the source, detached at the head, `git rebase
-   <base tip>` (without the repo's hooks, `--no-autosquash`,
-   `--no-update-refs`; merge commits are not kept). A conflict is aborted
-   (`git rebase --abort`) and waits for anyone, naming the repo, the commit
-   and the conflicting files; the checkout and the remote branch are left
-   as they were. A branch with nothing left after the rebase (all of it in
-   the base) waits for anyone: close the MR.
-4. `git push --force-with-lease=refs/heads/<branch>:<head read> <remote>
+1. The base branch is fetched into the repo's source
+   (`+refs/heads/<b>:refs/remotes/<remote>/<b>`), and the MR's head (its
+   pull ref, when the source lacks it). A head that contains the base's tip
+   is up to date: nothing to do, whatever its branch or repo.
+2. Else the MR must be the change's own: into the repo's base branch (the
+   forge's `base.ref`), from the repo itself (`head.repo`, not a fork), on
+   a branch swl may rewrite (below); and its branch, fetched likewise, must
+   be at the forge's head (else it waits for nobody: rerun). It must have
+   no merge commits since the base: a rebase would drop them, and what they
+   resolve, so it waits for anyone, naming them; rebase it by hand.
+3. Its workspace checkout must be clean (`git status --porcelain`: no
+   changes and no untracked files but swl's generated `.envrc.local`, as
+   for removing a landed checkout), on the MR's branch, and at the remote
+   branch head (nothing unpushed, nothing new on the remote). Otherwise it
+   waits for anyone, with the reason; nothing is written. A shared MR
+   without a checkout in the workspace needs none.
+4. In a scratch worktree of the source, detached at the head, `git rebase
+   <base tip>` (`--no-autosquash`, `--no-update-refs`). A conflict is
+   aborted (`git rebase --abort`) and waits for anyone, naming the repo,
+   the commit and the conflicting files; the checkout and the remote branch
+   are left as they were. A branch with nothing left after the rebase (all
+   of it in the base) waits for anyone: close the MR.
+5. `git push --force-with-lease=refs/heads/<branch>:<head read> <remote>
    <new head>:refs/heads/<branch>`. A lease that no longer holds (someone
    pushed meanwhile) waits for nobody: nothing was changed, rerun (which
    then stops for the checkout that lacks the new commits). A push that the
-   forge refuses (a protected branch) waits for the owner.
-5. The checkout is moved to the pushed head (`git reset --keep`), and
-   `swl env` runs again when `flake.lock` moved, so that the overrides and
-   the dev shell follow; then it waits up to `--timeout` (default 300 s)
-   for the forge's pull ref to show the new head. The push reruns the MR's
-   CI: `swl status` shows it as `CI pending`, and `swl land` schedules its
-   merge.
+   forge refuses (a protected branch) waits for the owner. The scratch
+   worktree, the rebase, a finalize commit and the push run without the
+   source's hooks.
+6. The checkout is checked again and moved to the pushed head: its branch
+   by compare-and-swap from the head read (`git update-ref`), then, when it
+   is checked out there, its index and working tree (`git read-tree -m -u`,
+   which overwrites no change). When the checkout changed during the run
+   (new commits, changes, another branch), it is not moved and it waits for
+   anyone, with the commands to do it by hand; the push stays. Without a
+   checkout, the source's own local branch follows likewise when it was at
+   the head read and no worktree has it; else it is left, with a warning
+   (a later push of it would not be a fast-forward). `swl env` runs again
+   when `flake.lock` moved, so that the overrides and the dev shell follow
+   (a failure is a warning); then it waits up to `--timeout` (default
+   300 s) for the forge's pull ref to show the new head. The push reruns
+   the MR's CI: `swl status` shows it as `CI pending`, and `swl land`
+   schedules its merge.
 
-A consumer branch whose tip is swl's own landing commit (one parent, a
-subject `swl: land `, a change to `swl.toml` and `flake.lock` only, on a
-commit whose `swl.toml` has entries), behind a base whose `flake.lock` moved
-since the merge base (a `swl bump`), is rebased without it, and in the same
-scratch worktree finalized anew (as `swl finalize` does, without hooks, on
-a temporary branch) before the one push. So no pushed consumer head lacks
-a landing: the consumer MR's merge, scheduled by an earlier `swl land`,
-could otherwise merge a head that still has `swl.toml` and the old lock.
-When the landing cannot be made anew (an entry not satisfied, nix fails),
-it waits for anyone and nothing is pushed. A base whose lock did not move
-keeps the landing as it is. A `flake.lock` conflict in any other commit
-is a conflict as above.
+A consumer branch whose tip is swl's own landing commit, behind a base
+whose `flake.lock` moved since the merge base (a `swl bump`), is rebased
+without it, and in the same scratch worktree finalized anew (as `swl
+finalize` does, on a temporary branch deleted afterwards) before the one
+push. So no pushed consumer head lacks a landing: the consumer MR's merge,
+scheduled by an earlier `swl land`, could otherwise merge a head that still
+has `swl.toml` and the old lock. A commit is swl's landing when it has one
+parent, a subject `swl: land `, a change to `swl.toml` and `flake.lock`
+only, removes entries from its parent's `swl.toml` and changes none of the
+others, and its lock moves nothing but those entries' root inputs (checked
+as `finalize` checks its relock). Made anew, it must land exactly the
+entries it landed (a partial landing stays partial) and leave the same
+`swl.toml`; when it cannot (an entry no longer satisfied, more of them
+satisfied now, nix fails), it waits for anyone and nothing is pushed. A
+base whose lock did not move keeps the landing as it is. Any other commit,
+one that only looks like a landing included, is rebased as it is; a
+`flake.lock` conflict there is a conflict as above.
 
 swl never rewrites a base branch (the repo's, `master`, `main`), a
 promotion branch (`swan-lake-current`, `swan-lake-current/…`) or
@@ -1029,7 +1050,8 @@ Limits:
   event, and the schedule that a direct merge deletes, are tested against
   the fake forge of the tests only, not against Forgejo itself.
 - `refresh` (and `land`'s rebase) knows a protected MR branch only from a
-  refused push. It rebases with the user's git identity and signing
+  refused push. It refuses branches with merge commits rather than
+  linearizing them. It rebases with the user's git identity and signing
   configuration, as a rebase by hand does. A consumer's CI that ran against
   a shared MR's old head is not rerun by the shared MR's push. `status`
   does not show that a branch is behind its base; `refresh --dry-run`
