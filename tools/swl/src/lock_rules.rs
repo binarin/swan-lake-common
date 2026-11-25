@@ -96,7 +96,8 @@ pub fn removed_entries(
 pub struct Declaration {
     /// The ref; `None` for the default branch.
     pub branch: Option<String>,
-    /// HEAD's declaration differs from the merge base's.
+    /// HEAD's declaration differs from the merge base's (a new input has
+    /// none there, and is not changed).
     pub changed: bool,
 }
 
@@ -384,9 +385,11 @@ impl Rules<'_> {
             }
         };
         if decl.changed {
-            out.notes.push(format!(
-                "{root}: flake.nix changes its declaration; the branch is read from HEAD's"
+            out.errors.push(format!(
+                "flake.nix changes the declaration of {root}; change the declaration and the lock \
+                 in separate MRs"
             ));
+            return;
         }
         let which = decl
             .branch
@@ -1052,6 +1055,38 @@ mod tests {
             &h,
         );
         assert!(asked.is_empty());
+    }
+
+    #[test]
+    fn a_moved_input_keeps_its_declaration() {
+        let old = lock();
+        let mut new = lock();
+        set_rev(&mut new, "nixpkgs", '2');
+        let changed = |name: &str| {
+            declared(name).map(|d| Declaration {
+                changed: name == "nixpkgs",
+                ..d
+            })
+        };
+        let api = Api(BTreeMap::new());
+        let relock = |_: &Value, _: &[(String, String)]| Ok(new.clone());
+        let j = Rules {
+            old: &old,
+            new: &new,
+            removed: &BTreeMap::new(),
+            declared: &changed,
+            api: &api,
+            history: &history(),
+            names_repo: &names_repo,
+            relock: &relock,
+        }
+        .judge()
+        .unwrap();
+        fails(
+            &j,
+            "flake.nix changes the declaration of nixpkgs; change the declaration and the lock in \
+             separate MRs",
+        );
     }
 
     #[test]

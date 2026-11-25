@@ -135,8 +135,10 @@ fn base_declarations(root: &Path, mb: &str, nix: &Nix) -> Result<BTreeMap<String
 }
 
 /// A root input's declaration in HEAD's `flake.nix`: its ref, and whether
-/// it differs from the merge base's (`base`, which cannot be read is a
-/// difference).
+/// the whole evaluated declaration (URL, ref, nested input overrides and
+/// follows) differs from the merge base's. An input the merge base does not
+/// declare is new, not changed; a merge base that cannot be read is a
+/// difference.
 fn declaration(
     decls: &mut Decls,
     base: &Result<BTreeMap<String, Value>, String>,
@@ -153,7 +155,9 @@ fn declaration(
     };
     Ok(lock_rules::Declaration {
         branch: attrs.get("ref").and_then(Value::as_str).map(str::to_string),
-        changed: base.as_ref().map_or(true, |b| b.get(input) != Some(decl)),
+        changed: base
+            .as_ref()
+            .map_or(true, |b| b.get(input).is_some_and(|old| old != decl)),
     })
 }
 

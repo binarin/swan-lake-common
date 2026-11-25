@@ -939,6 +939,22 @@ fn check_accepts_forward_moves_and_refuses_backwards() {
         "is not a forward move",
     );
 
+    // The bump with a change to lib's declaration: separate MRs.
+    w.git(&w.consumer, &["reset", "-q", "--hard", &bump]);
+    let flake = fs::read_to_string(w.consumer.join("flake.nix")).unwrap();
+    fs::write(
+        w.consumer.join("flake.nix"),
+        flake.replacen("{\n", "{\n  inputs.lib.flake = true;\n", 1),
+    )
+    .unwrap();
+    w.git(&w.consumer, &["commit", "-qam", "lib: declare flake"]);
+    failed(
+        &w.swl(&w.consumer, &check, &[]),
+        1,
+        "flake.nix changes the declaration of lib; change the declaration and the lock in separate MRs",
+    );
+    w.git(&w.consumer, &["reset", "-q", "--hard", &bump]);
+
     // A nested node below the bumped input that nix would not lock so.
     w.git(&w.consumer, &["reset", "-q", "--hard", &bump]);
     let tampered = tamper_nested_hash(&w.consumer);

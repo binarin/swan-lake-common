@@ -419,8 +419,11 @@ Exit status 1 with one line per problem.
       `lastModified` and `revCount`), and the new rev descends from the old
       one and is in the branch the input's `flake.nix` declaration names
       (promoted, e.g. `swan-lake-current`; the default branch without a
-      ref). The declaration is read from HEAD's `flake.nix`; when it differs
-      from the merge base's, a note says so.
+      ref). Its `flake.nix` declaration (the evaluated `inputs.<input>`: URL,
+      ref, `flake`, and nested `inputs.<input>.inputs.*` overrides and
+      follows) must be the merge base's: a moved input whose declaration
+      changes fails the check; change the declaration and the lock in
+      separate MRs. A new input has no declaration at the merge base.
 
     Besides, no root input was removed, only a landing adds one, a
     reformatted lock is not a change, nothing else in the lock changed
