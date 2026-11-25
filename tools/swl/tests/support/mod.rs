@@ -794,6 +794,7 @@ impl Forge {
             "SWL_FORGE_GIT",
             "SWL_FJ_KEYS",
             "SWL_GITHUB_TOKEN",
+            "SWL_LOG",
             "NIX_STORE_DIR",
         ] {
             c.env_remove(var);

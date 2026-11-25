@@ -11,11 +11,7 @@ pub const GIT: &str = match option_env!("SWL_GIT") {
 /// Runs git in `dir`; stdout without the trailing newline, or an error with
 /// git's stderr.
 pub fn git(dir: &Path, args: &[&str]) -> Result<String> {
-    let out = Command::new(GIT)
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
+    let out = crate::logging::output(Command::new(GIT).arg("-C").arg(dir).args(args))
         .with_context(|| format!("running {GIT}"))?;
     if !out.status.success() {
         bail!(
@@ -48,12 +44,13 @@ pub fn is_rev(s: &str) -> bool {
 pub fn valid_branch(name: &str) -> bool {
     !name.is_empty()
         && !name.starts_with('-')
-        && std::process::Command::new(GIT)
-            .args(["check-ref-format", "--branch", name])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success())
+        && crate::logging::status(
+            Command::new(GIT)
+                .args(["check-ref-format", "--branch", name])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null()),
+        )
+        .is_ok_and(|s| s.success())
 }
 
 #[cfg(test)]

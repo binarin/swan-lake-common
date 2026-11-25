@@ -189,6 +189,21 @@ landing as `pushed`. A login the forge rejects makes the row
 then shows a row per `swl.toml` entry at its head and the consumer row. A
 cross-repo list of all open changes is not part of swl.
 
+## Diagnostics
+
+`SWL_LOG` sets what swl logs on stderr, as a `tracing` filter: `debug`,
+`swl::forge=trace`, `swl::cmd=debug,swl::land=debug`. The default is
+`warn`. At debug: every external command (git, nix, curl, fj, direnv) with
+its arguments, exit status and duration (target `swl::cmd`); each forge or
+GitHub API request with its method, URL, whether it carried fj's token, and
+the HTTP status (`swl::forge`; the answer's body at trace); and the
+decisions of `status` (each row's stage, next step and waits) and `land`
+(per pass, per MR and consumer). The token never appears: it goes to curl
+on stdin, which is not logged, and arguments that look like credentials
+(an `Authorization` header, a password in a URL, the value of an
+`access-tokens` option) are scrubbed. The shims (`swl shim`, `swl ci
+shim`) log nothing unless `SWL_LOG` is set; `SWL_SHIM_LOG` is separate.
+
 ## Config
 
 The repos config is `--config FILE`, else `$SWL_CONFIG`, else
@@ -281,8 +296,10 @@ warning: the files are written anyway.
 
 The shim finds the real tool on `PATH`. It skips the workspace's `.swl/bin`
 and any other file that carries the generated marker. It prints nothing on
-stderr except when it refuses a call (exit 1) or fails (`swl: …`, exit 2). Set `SWL_SHIM_LOG=FILE` to append one
-line per call: the tool, the action and the arguments.
+stderr except when it refuses a call (exit 1) or fails (`swl: …`, exit 2), or
+when `SWL_LOG` asks for diagnostics (see [Diagnostics](#diagnostics)). Set
+`SWL_SHIM_LOG=FILE` to append one line per call: the tool, the action and the
+arguments.
 
 `nix`:
 - Subcommands that take installables and lock flags get the overrides,

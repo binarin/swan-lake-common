@@ -137,6 +137,10 @@ impl Change {
     }
 
     fn land(&self, extra: &[&str]) -> Output {
+        self.land_env(extra, &[])
+    }
+
+    fn land_env(&self, extra: &[&str], env: &[(&str, &str)]) -> Output {
         let ws = self.ws.display().to_string();
         let mut args = vec![
             "land",
@@ -148,9 +152,9 @@ impl Change {
             "1",
         ];
         args.extend(extra);
-        let out = self
-            .f
-            .swl_env(&self.f.root, &args, &[("SWL_FJ_KEYS", &self.keys)]);
+        let mut env = env.to_vec();
+        env.push(("SWL_FJ_KEYS", &self.keys));
+        let out = self.f.swl_env(&self.f.root, &args, &env);
         assert!(!text(&out).contains(support::TOKEN), "{}", text(&out));
         out
     }
@@ -586,7 +590,19 @@ fn land_merges_an_mr_with_green_checks_directly() {
     assert!(t.f.api.writes().is_empty(), "{:?}", t.f.api.writes());
 
     // A plain merge, after cancelling whatever may be scheduled (nothing).
-    let out = t.land(&[]);
+    // With SWL_LOG=debug, the writes and the decisions on stderr, without
+    // the token (which `land` checks).
+    let out = t.land_env(&[], &[("SWL_LOG", "debug")]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    for want in [
+        &format!("DELETE http://127.0.0.1:{}{COMMON_MERGE}", t.f.api.port),
+        "status=404",
+        "no scheduled merge to cancel",
+        "the pass ends",
+        "authed=true",
+    ] {
+        assert!(err.contains(want), "{want:?} in {err}");
+    }
     let log = out_text(&out);
     assert!(log.contains("swan-lake-common#1 is merged"), "{log}");
     assert!(!log.contains("swan-lake-common#1 waits for CI"), "{log}");

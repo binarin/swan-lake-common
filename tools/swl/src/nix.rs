@@ -53,10 +53,7 @@ impl Nix {
 
     /// Runs nix with `args`; stdout, or an error with nix's stderr.
     pub fn run(&self, args: &[&str]) -> Result<String> {
-        let out = self
-            .command()
-            .args(args)
-            .output()
+        let out = crate::logging::output(self.command().args(args))
             .with_context(|| format!("running {}", self.bin.display()))?;
         if !out.status.success() {
             bail!(

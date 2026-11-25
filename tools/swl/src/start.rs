@@ -299,11 +299,12 @@ fn direnv_allow(consumers: &[PathBuf]) {
         return;
     };
     for dir in consumers {
-        let status = Command::new(&direnv)
-            .arg("allow")
-            .arg(dir)
-            .stdin(Stdio::null())
-            .status();
+        let status = crate::logging::status(
+            Command::new(&direnv)
+                .arg("allow")
+                .arg(dir)
+                .stdin(Stdio::null()),
+        );
         match status {
             Ok(s) if s.success() => println!("direnv allow {}", dir.display()),
             Ok(s) => eprintln!("swl start: warning: direnv allow {} {s}", dir.display()),

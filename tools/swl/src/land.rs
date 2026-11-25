@@ -230,6 +230,7 @@ impl Lander<'_> {
     /// Steps 1 and 2 for one shared MR.
     fn shared(&self, rows: &[Row], (consumer, path, e): &SharedMr) -> Result<Step> {
         let which = format!("{}#{}", e.repo, e.mr);
+        let _span = tracing::debug_span!("shared", %which, %path).entered();
         let Some(row) = rows
             .iter()
             .find(|r| r.follows.as_deref() == Some(which.as_str()))
@@ -311,6 +312,7 @@ impl Lander<'_> {
     /// one that turns green right after its merge was scheduled too.
     fn merge(&self, which: &str, repo: &str, info: &PrInfo, republish: &str) -> Result<Step> {
         let ci = self.ci_now(repo, &info.head_sha);
+        tracing::debug!(%which, ?ci, "the head's combined commit status before merging");
         if let Some(CiState::Failing(s)) = &ci {
             return stop(
                 Waits::Anyone,
@@ -370,7 +372,9 @@ impl Lander<'_> {
             CancelOutcome::Cancelled => {
                 println!("swl land: cancelled the scheduled merge of {which}")
             }
-            CancelOutcome::NothingScheduled => {}
+            CancelOutcome::NothingScheduled => {
+                tracing::debug!(%which, "no scheduled merge to cancel")
+            }
             CancelOutcome::Refused(why) => {
                 return stop(
                     Waits::Owner,
@@ -538,6 +542,7 @@ impl Lander<'_> {
 
     /// Step 3 for one consumer checkout.
     fn consumer(&self, rows: &[Row], c: &Checkout) -> Result<Step> {
+        let _span = tracing::debug_span!("consumer", name = %c.name).entered();
         let Some(row) = rows
             .iter()
             .find(|r| r.name == c.name && r.follows.is_none())
@@ -979,7 +984,8 @@ pub fn run(
         opts,
         done: RefCell::new(BTreeSet::new()),
     };
-    for _ in 0..MAX_STEPS {
+    for pass in 0..MAX_STEPS {
+        let _span = tracing::debug_span!("land", pass).entered();
         let ws = Workspace::scan(root)?;
         let rows = status::collect(&ws, config, reader, &Fetcher::new(true))?;
         let step = match lander.step(&ws, &rows) {
@@ -989,6 +995,7 @@ pub fn run(
             },
             Ok(step) => step,
         };
+        tracing::debug!(?step, "the pass ends");
         match step {
             Step::Progress => continue,
             Step::Planned(then) => return Ok(planned(&then)),

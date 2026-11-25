@@ -11,6 +11,7 @@ mod land;
 mod lock;
 mod lock_change;
 mod lock_rules;
+mod logging;
 mod manifest;
 mod nix;
 mod nix_args;
@@ -411,7 +412,17 @@ fn run(cli: Cli) -> Result<ExitCode> {
 }
 
 fn main() -> ExitCode {
-    match run(Cli::parse()) {
+    let cli = Cli::parse();
+    // The shims stay silent on stderr unless SWL_LOG asks for diagnostics.
+    let shim = matches!(
+        cli.command,
+        Commands::Shim { .. }
+            | Commands::Ci {
+                command: CiCommands::Shim { .. }
+            }
+    );
+    logging::init(shim, logging::stderr_ansi());
+    match run(cli) {
         Ok(code) => code,
         Err(e) => {
             eprintln!("swl: {e:#}");

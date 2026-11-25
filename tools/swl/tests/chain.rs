@@ -147,7 +147,8 @@ impl Chain {
             .env("GIT_COMMITTER_NAME", "swl test")
             .env("GIT_COMMITTER_EMAIL", "swl@example.org")
             .env("SWL_CONFIG", self.root.join("repos.toml"))
-            .env("SWL_SHIM_LOG", &self.log);
+            .env("SWL_SHIM_LOG", &self.log)
+            .env_remove("SWL_LOG");
     }
 
     fn git(&self, dir: &Path, args: &[&str]) -> String {
@@ -378,6 +379,21 @@ fn three_level_chain_through_the_wrappers() {
         t.log_lines(),
         [format!("nix store-paths path-info {self_path}")]
     );
+    // The shim adds nothing to the tool's stderr; with SWL_LOG, what it runs.
+    let out = t.shimmed(&consumer, "nix", &["path-info", &self_path]);
+    let real = t.real_nix(&consumer, &["path-info", &self_path]);
+    assert_eq!(out.stderr, real.stderr, "{}", text(&out));
+    let mut c = Command::new("nix");
+    t.env(&mut c, &t.shim_path);
+    let out = c
+        .env("SWL_LOG", "debug")
+        .current_dir(&consumer)
+        .args(["path-info", &self_path])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("exec ") && err.contains("path-info"), "{err}");
+    t.log_lines();
 
     // Lock-writing commands and flags are refused while overrides apply.
     refused(&t.shimmed(&consumer, "nix", &["flake", "lock"]));

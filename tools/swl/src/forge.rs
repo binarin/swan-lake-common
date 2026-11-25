@@ -214,13 +214,13 @@ pub fn http(req: &Request) -> Result<(u16, String)> {
         Some(_) => cmd.args(["--config", "-"]),
         None => cmd.arg("--location"),
     };
-    let mut child = cmd
-        .arg(url)
+    cmd.arg(url)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("running {CURL}"))?;
+        .stderr(Stdio::piped());
+    let line = crate::logging::command_line(&cmd);
+    let started = std::time::Instant::now();
+    let mut child = cmd.spawn().with_context(|| format!("running {CURL}"))?;
     let mut stdin = child.stdin.take().expect("piped");
     if let Some(token) = req.token {
         let token = token.replace('\\', "\\\\").replace('"', "\\\"");
@@ -228,9 +228,9 @@ pub fn http(req: &Request) -> Result<(u16, String)> {
             .context("passing the token to curl")?;
     }
     drop(stdin);
-    let out = child
-        .wait_with_output()
-        .with_context(|| format!("running {CURL}"))?;
+    let out = child.wait_with_output();
+    crate::logging::finished(&line, started, out.as_ref().map(|o| &o.status));
+    let out = out.with_context(|| format!("running {CURL}"))?;
     if !out.status.success() {
         bail!(
             "{} unreachable: {} {url}: {}",
@@ -241,10 +241,20 @@ pub fn http(req: &Request) -> Result<(u16, String)> {
     }
     let text = String::from_utf8_lossy(&out.stdout);
     let (body, code) = text.rsplit_once('\n').unwrap_or(("", &text));
-    let code = code
+    let code: u16 = code
         .trim()
         .parse()
         .with_context(|| format!("{} {url}: no HTTP status", req.method))?;
+    tracing::debug!(
+        target: "swl::forge",
+        api = req.what,
+        authed = req.token.is_some(),
+        status = code,
+        "{} {}",
+        req.method,
+        crate::logging::scrub(url)
+    );
+    tracing::trace!(target: "swl::forge", "{} {}: {body}", req.method, crate::logging::scrub(url));
     Ok((code, body.to_string()))
 }
 
@@ -757,13 +767,14 @@ pub struct Fj;
 
 impl Fj {
     fn run(&self, args: &[&str]) -> Result<String> {
-        let out = Command::new("fj")
-            .arg("-H")
-            .arg(FORGE_HOST)
-            .args(args)
-            .stdin(Stdio::null())
-            .output()
-            .context("running fj (the Forgejo CLI) from PATH")?;
+        let out = crate::logging::output(
+            Command::new("fj")
+                .arg("-H")
+                .arg(FORGE_HOST)
+                .args(args)
+                .stdin(Stdio::null()),
+        )
+        .context("running fj (the Forgejo CLI) from PATH")?;
         if !out.status.success() {
             bail!(
                 "fj {} failed: {}",

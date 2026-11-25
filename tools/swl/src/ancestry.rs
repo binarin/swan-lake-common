@@ -300,24 +300,29 @@ fn read_all<R: Read + Send + 'static>(pipe: Option<R>) -> thread::JoinHandle<Str
 
 /// `(exit code, stdout, stderr)` of git, killed after [`TIMEOUT`].
 fn run_output(args: &[&str]) -> Result<(i32, String, String), String> {
-    let mut child = Command::new(GIT)
-        .args(args)
+    let mut cmd = Command::new(GIT);
+    cmd.args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_NO_LAZY_FETCH", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("running {GIT}: {e}"))?;
+        .stderr(Stdio::piped());
+    let line = crate::logging::command_line(&cmd);
+    let started = Instant::now();
+    let mut child = cmd.spawn().map_err(|e| format!("running {GIT}: {e}"))?;
     let out_reader = read_all(child.stdout.take());
     let reader = read_all(child.stderr.take());
     let deadline = Instant::now() + TIMEOUT;
     let status = loop {
         match child.try_wait() {
-            Ok(Some(status)) => break status,
+            Ok(Some(status)) => {
+                crate::logging::finished(&line, started, Ok(&status));
+                break status;
+            }
             Ok(None) if Instant::now() >= deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
+                tracing::debug!(target: "swl::cmd", ms = started.elapsed().as_millis(), "timed out: {line}");
                 // The subcommand, after `-C <dir>` if given.
                 let what = args.get(if args.first() == Some(&"-C") { 2 } else { 0 });
                 return Err(format!("git {} timed out", what.unwrap_or(&"")));

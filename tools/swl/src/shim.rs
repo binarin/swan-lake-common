@@ -164,6 +164,7 @@ fn exec(real: &Path, args: &[OsString]) -> anyhow::Error {
     if let Some(name) = real.file_name() {
         cmd.arg0(name);
     }
+    tracing::debug!(target: "swl::cmd", "exec {}", crate::logging::command_line(&cmd));
     anyhow!(cmd.exec()).context(format!("running {}", real.display()))
 }
 

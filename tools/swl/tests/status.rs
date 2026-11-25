@@ -220,6 +220,26 @@ fn status_follows_a_change_from_local_to_landed() {
             || a.as_deref() == Some(&format!("token {}", support::TOKEN))),
         "{seen:?}"
     );
+    // SWL_LOG=debug: the commands, the forge requests and the verdicts on
+    // stderr, never the token; stdout as without it.
+    let ws_s = t.ws.display().to_string();
+    let debug = t.f.swl_env(
+        &t.f.root,
+        &["status", "--workspace", &ws_s],
+        &[("SWL_FJ_KEYS", &t.keys), ("SWL_LOG", "debug")],
+    );
+    let err = String::from_utf8_lossy(&debug.stderr);
+    assert!(!err.contains(support::TOKEN), "{err}");
+    assert!(
+        err.contains("swl::cmd") && err.contains(" rev-parse "),
+        "{err}"
+    );
+    assert!(
+        err.contains("swl::forge") && err.contains("authed=true") && err.contains("status=200"),
+        "{err}"
+    );
+    assert!(err.contains("stage=CI green"), "{err}");
+    assert_eq!(stdout(&debug), out);
 
     // Ready, CI pending, then green.
     t.f.api

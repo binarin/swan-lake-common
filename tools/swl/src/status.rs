@@ -630,6 +630,21 @@ impl Row {
         }
     }
 
+    /// Logs the row's verdict, at debug.
+    fn log(&self) {
+        let v = &self.verdict;
+        tracing::debug!(
+            target: "swl::status",
+            row = %self.name,
+            follows = ?self.follows,
+            stage = %v.stage,
+            next = %v.next,
+            waits = %v.waits,
+            landable = v.landable,
+            "verdict"
+        );
+    }
+
     fn print(&self) {
         let v = &self.verdict;
         println!(
@@ -999,6 +1014,7 @@ fn shared_row(
     c: &Checkout,
     repo: &str,
 ) -> Row {
+    let _span = tracing::debug_span!("checkout", name = %c.name).entered();
     let mut details = Vec::new();
     let input = c.shared.as_ref().map_or("", |(_, i)| i.as_str());
     let result = (|| -> Result<(Verdict, Option<String>, SharedFacts)> {
@@ -1135,6 +1151,7 @@ fn entry_lines(manifest: &Manifest) -> String {
 }
 
 fn consumer_row(ctx: &Ctx, hops: &[Hop], ws: &Workspace, rows: &[Row], c: &Checkout) -> Row {
+    let _span = tracing::debug_span!("checkout", name = %c.name).entered();
     let mut details = Vec::new();
     let result = (|| -> Result<ConsumerFacts> {
         details.push(head_line(&c.dir)?);
@@ -1369,6 +1386,7 @@ pub fn collect(
     for (which, consumers) in &named {
         finish_landed_entry(&mut rows, which, consumers);
     }
+    rows.iter().for_each(Row::log);
     Ok(rows)
 }
 
@@ -1542,6 +1560,7 @@ pub fn collect_from(
     for which in &entries {
         finish_landed_entry(&mut rows, which, &[consumer.as_str()]);
     }
+    rows.iter().for_each(Row::log);
     Ok(rows)
 }
 
