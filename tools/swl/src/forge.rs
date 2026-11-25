@@ -129,14 +129,41 @@ impl PrInfo {
     }
 }
 
+/// The combined commit status of a revision, as CI reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CiState {
+    /// No status reported (yet).
+    None,
+    Pending,
+    /// `failure`, `error` or another state that is not a success.
+    Failing(String),
+    Green,
+}
+
+impl CiState {
+    /// Parses `GET /repos/{owner}/{repo}/commits/{sha}/status`.
+    pub fn from_api(v: &Value) -> Self {
+        let state = v.get("state").and_then(Value::as_str).unwrap_or("");
+        let count = v.get("total_count").and_then(Value::as_u64).unwrap_or(0);
+        match state {
+            _ if count == 0 => CiState::None,
+            "" | "pending" => CiState::Pending,
+            "success" => CiState::Green,
+            other => CiState::Failing(other.to_string()),
+        }
+    }
+}
+
 /// What a 404 from the anonymous API means: Forgejo answers 404 for a
 /// private repo too.
 pub const NOT_FOUND: &str = "no such MR (or the repo is not public)";
 
-/// Reads MR state. `Ok(None)` is a 404: no such MR, or a repo this reader may not see; an error is a forge that
+/// Reads MR state and commit status. `Ok(None)` is a 404: no such MR or
+/// revision, or a repo this reader may not see; an error is a forge that
 /// could not be asked.
 pub trait PrReader {
     fn pr(&self, repo: &str, number: u64) -> Result<Option<PrInfo>>;
+    fn commit_status(&self, repo: &str, sha: &str) -> Result<Option<CiState>>;
     /// What a 404 means for this reader.
     fn not_found(&self) -> &'static str {
         NOT_FOUND
@@ -195,7 +222,7 @@ fn api_get(base: &str, path: &str, token: Option<&str>) -> Result<(u16, String)>
     Ok((code, body.to_string()))
 }
 
-/// An MR through [`api_get`]; `hint` explains other HTTP statuses.
+/// The reads over [`api_get`]; `hint` explains other HTTP statuses.
 fn read_pr(
     base: &str,
     token: Option<&str>,
@@ -209,6 +236,25 @@ fn read_pr(
             let v: Value =
                 serde_json::from_str(&body).with_context(|| format!("GET {path}: not JSON"))?;
             PrInfo::from_api(&v).map(Some)
+        }
+        (404, _) => Ok(None),
+        (code, _) => bail!("GET {path}: HTTP {code} ({hint})"),
+    }
+}
+
+fn read_commit_status(
+    base: &str,
+    token: Option<&str>,
+    repo: &str,
+    sha: &str,
+    hint: &str,
+) -> Result<Option<CiState>> {
+    let path = format!("repos/{}/commits/{sha}/status", slug(repo));
+    match api_get(base, &path, token)? {
+        (200, body) => {
+            let v: Value =
+                serde_json::from_str(&body).with_context(|| format!("GET {path}: not JSON"))?;
+            Ok(Some(CiState::from_api(&v)))
         }
         (404, _) => Ok(None),
         (code, _) => bail!("GET {path}: HTTP {code} ({hint})"),
@@ -245,6 +291,10 @@ const ANON_HINT: &str = "the repo must be public; see the swl README";
 impl PrReader for AnonApi {
     fn pr(&self, repo: &str, number: u64) -> Result<Option<PrInfo>> {
         read_pr(&self.base, None, repo, number, ANON_HINT)
+    }
+
+    fn commit_status(&self, repo: &str, sha: &str) -> Result<Option<CiState>> {
+        read_commit_status(&self.base, None, repo, sha, ANON_HINT)
     }
 
     fn not_found(&self) -> &'static str {
@@ -322,6 +372,10 @@ impl AuthApi {
 impl PrReader for AuthApi {
     fn pr(&self, repo: &str, number: u64) -> Result<Option<PrInfo>> {
         read_pr(&self.base, Some(&self.token), repo, number, AUTH_HINT)
+    }
+
+    fn commit_status(&self, repo: &str, sha: &str) -> Result<Option<CiState>> {
+        read_commit_status(&self.base, Some(&self.token), repo, sha, AUTH_HINT)
     }
 
     fn not_found(&self) -> &'static str {
@@ -485,6 +539,24 @@ mod tests {
         assert!(wip.draft);
         let draft = api(r#"{"number":24,"state":"open","merged":false,"title":"t","draft":true,"head":{"sha":"abc","ref":"b"}}"#).unwrap();
         assert!(draft.draft);
+    }
+
+    #[test]
+    fn combined_commit_status() {
+        let ci = |json: &str| CiState::from_api(&serde_json::from_str(json).unwrap());
+        assert_eq!(
+            ci(r#"{"state":"","sha":"","total_count":0,"statuses":null}"#),
+            CiState::None
+        );
+        assert_eq!(
+            ci(r#"{"state":"pending","total_count":2}"#),
+            CiState::Pending
+        );
+        assert_eq!(ci(r#"{"state":"success","total_count":4}"#), CiState::Green);
+        assert_eq!(
+            ci(r#"{"state":"failure","total_count":4}"#),
+            CiState::Failing("failure".into())
+        );
     }
 
     #[test]

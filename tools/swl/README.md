@@ -10,7 +10,8 @@ A consumer branch that depends on unmerged shared-repo changes names their
 MRs in a manifest, `swl.toml`. `swl publish` pushes the work and writes the
 manifest, CI builds against the MRs' heads (`swl ci env`) and gates MRs and
 master (`swl check`), and `swl finalize` turns landed entries into a lock
-bump. `plan` and `land` (the lander) are not part of swl yet.
+bump. `swl start` sets up the workspace for a change, and `swl status` shows
+where it stands. `plan` and `land` (the lander) are not part of swl yet.
 
 ## Workspace layout
 
@@ -35,7 +36,7 @@ swl start --from swan-lake#12             # join a published consumer MR
 swl ws add swan-lake                      # fetch, worktree detached at the base, then env
 swl ws add swan-lake-common@common --branch sl-0036-x
 swl env                                   # .envrc.local per consumer, and the wrappers
-swl status                                # local state of the shared checkouts
+swl status [--from swan-lake#12]          # where the change stands, and the next step
 swl shim nix --workspace <ws> -- ARGS…    # what the wrappers run
 swl publish swan-lake                     # push, open MRs, write swl.toml
 swl check                                 # CI: the MR or master gate
@@ -96,14 +97,88 @@ swl finalize [--wait]                     # landed entries -> one lock commit
   overrides per consumer, and warns when a consumer's `.envrc` does not source
   `.envrc.local` into `use_flake_args`. Rerun it after adding or removing
   checkouts, or after a checkout's `flake.lock` changes.
-- `status` prints, for each shared checkout, its input, HEAD, branch, and
-  whether it is dirty (tracked changes only, as `git+file:` sees them). It then
-  prints one line for each flake in the workspace that it overrides: the input
-  path, the rev that flake's own `flake.lock` locks, and ahead/behind of HEAD
-  against that rev. It uses local git only.
+- `status [--no-fetch]` shows where the workspace's change stands; see
+  [Status](#status).
 
 `publish`, `check`, `ci env` and `finalize` are described under
 [Manifest and landing](#manifest-and-landing).
+
+## Status
+
+`swl status [--workspace DIR] [--no-fetch]` for a workspace, and
+`swl status --from CONSUMER#MR [--no-fetch]` for a published change without
+one. It prints one row per shared checkout, per `swl.toml` entry that no
+checkout follows, and per consumer:
+
+```
+swan-lake-common@common  CI green  next: merge swan-lake-common#24  waits: owner
+  input common  HEAD 72f1eec  sl-0060-foo  clean
+  swan-lake: common locked 9477137, ahead 2, behind 0
+  swan-lake-common#24: open, sl-0060-foo at 72f1eec824d6, CI green
+swan-lake  CI green  next: wait for swan-lake-common#24 (merge swan-lake-common#24)  waits: owner
+  HEAD 1c0ffee  sl-0060-foo  clean
+  swl.toml: common swan-lake-common#24
+  swan-lake#31: open, sl-0060-foo at 1c0ffee00000, CI green
+```
+
+A row is the checkout or MR, its stage, the next step and who it waits for:
+`owner` (merging, promoting, requesting a merge), `anyone` (whoever works on
+the change), or `nobody` (CI, a mirror, or nothing to do). The detail lines
+below it are the local facts:
+- `input <input>  HEAD <rev>  <branch>  clean|dirty` for a shared checkout,
+  and for a consumer the same without the input (the consumer line). Dirty
+  counts tracked changes only, as `git+file:` sees them.
+- Under a shared checkout, one line per flake in the workspace that it
+  overrides: the input path, the rev that flake's own `flake.lock` locks
+  there, and HEAD ahead/behind of that rev.
+- Under a consumer, its `swl.toml` entries, and the overridden inputs that
+  are changed without an entry.
+- Where the remote branch is, when it is not at HEAD, and what the forge says
+  about the MR: open (draft), its head and CI; or merged, whether the merge
+  commit is in the branch the consumer's `flake.nix` declares, and whether the
+  declared source (for common the GitHub mirror) has it.
+
+The stages, in order:
+
+| stage | shared checkout | consumer |
+|---|---|---|
+| `local` | its branch is not on the remote (or detached with commits not in the base) | likewise |
+| `needs publish` | the remote branch is behind HEAD, or no consumer's `swl.toml` names an MR for it, or a consumer that overrides it has no entry, or the MR was closed | the branch has unpushed commits, or an overridden input's checkout differs from the lock without an entry |
+| `pushed` | pushed, but the MR cannot be read | pushed, no MR yet (or it cannot be read) |
+| `MR open`, `MR open (draft)` | the `swl.toml` entry's MR is open; a draft has a `WIP:` title or `draft` set | the MR whose `refs/pull/N/head` is the branch head |
+| `CI pending`, `CI failing`, `CI green` | the combined commit status of the MR head | likewise |
+| `merged` | the MR is merged (its merge commit) | |
+| `promoted` | the merge commit is in the declared branch on the forge (`swan-lake-current` for common; an input without a ref is promoted when merged) | |
+| `landing pushed` | | the remote branch has no pending `swl.toml` entries and changes `flake.lock` |
+| `landed` | | the MR is merged, or the branch head is in the base |
+
+A shared checkout without an MR whose HEAD is in the rev each consumer locks,
+or already in its base, is `no MR needed`; a consumer whose HEAD is in its
+base is `no change`. A consumer MR with entries is not merged on its own: its
+next step waits for the entries' rows, then is `swl land` (not implemented
+yet; see the landing procedure below).
+
+The next steps are `swl publish <consumer>` (anyone), `mark <repo>#N ready`
+(anyone), wait for CI (nobody), `merge <repo>#N` (owner),
+`promote <branch>` (owner), `swl land` (anyone), and
+`request merge when checks succeed` (owner) once the landing is pushed.
+
+By default `status` fetches each checkout's remote (as `ws add` does, once per
+source) so that the stages are current, and finds a consumer's MR with
+`git ls-remote <remote> 'refs/pull/*/head'`; the mirror check fetches commit
+history only. `--no-fetch` uses the refs already known and looks up no
+consumer MR. A forge, network or git error makes that row
+`unknown (<reason>)`; it is never an error of the command.
+
+MR state and CI come from the forge API with fj's login (see
+[Forge access](#forge-access)). A repo that cannot be read (private, and no
+login) falls back to git: the branch on the remote, `landing pushed` from the
+branch's contents, and `landed` when its head is in the base; its MR shows
+as `unknown (not readable anonymously, and no fj login: …)`.
+
+`--from CONSUMER#MR` reads the consumer MR as `start --from` does (with git),
+then shows a row per `swl.toml` entry at its head and the consumer row. A
+cross-repo list of all open changes is not part of swl.
 
 ## Config
 
@@ -427,14 +502,16 @@ then push to master; `swl publish` refuses to push it.
 
 ### Forge access
 
-`start --from` reads MR state with the login of `fj`: the token for
+`status` and `start --from` read MR state and commit status with the login
+of `fj`: the token for
 `forgejo.lynx-lizard.ts.net` in fj's `keys.json`
 (`$XDG_DATA_HOME/forgejo-cli/keys.json`, default
 `~/.local/share/forgejo-cli/keys.json`; `SWL_FJ_KEYS` overrides the path).
-That covers private repos. It only reads: the token goes to curl on stdin,
-never on a command line or into the output, and only to the forge (or a
-loopback test server). Without a login it reads anonymously. swl has no
-token configuration of its own.
+That covers the private consumer repos. They only read: the token goes to
+curl on stdin, never on a command line or into the output, and only to the
+forge (or a loopback test server). Without a login they read anonymously,
+and what that cannot see is `unknown`. swl has no token configuration of
+its own.
 
 `check`, `ci env` and `finalize` read MR state anonymously
 (`GET /api/v1/repos/binarin/<repo>/pulls/<n>`, through curl) and CI fetches
@@ -476,3 +553,12 @@ the override URLs) redirect them, for tests.
   the whole commit history of a large fork such as nixpkgs.
 - `finalize` relocks a root input as a whole: nested entries land when the
   parent (common) has bumped and promoted them.
+- `status` knows a shared MR only through a consumer's `swl.toml` entry: an
+  MR opened by hand without one shows as `needs publish`. A consumer's MR is
+  the pull ref at its branch head, so a push that Forgejo has not recorded
+  yet hides it for a moment.
+- `status --from` reads the declared branch of a nested entry
+  (`common/zwanenzang`) from its parent entry's MR; without a parent entry
+  the promotion is `unknown`.
+- `start` keeps an existing checkout as it is, also on another branch; it
+  says so, and switching is left to you.

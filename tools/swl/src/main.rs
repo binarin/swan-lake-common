@@ -88,11 +88,17 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
-    /// Show the shared checkouts against the revs the workspace's flakes lock
+    /// Where the change stands: per checkout or MR its stage, the next step and who it waits for
     Status {
         /// Workspace directory [default: current directory]
-        #[arg(long, value_name = "DIR")]
+        #[arg(long, value_name = "DIR", conflicts_with = "from")]
         workspace: Option<PathBuf>,
+        /// A published consumer MR, e.g. swan-lake#12, without a workspace
+        #[arg(long, value_name = "CONSUMER#MR")]
+        from: Option<String>,
+        /// Do not fetch; use the refs already known
+        #[arg(long)]
+        no_fetch: bool,
     },
     /// Push a consumer's changed shared checkouts and the consumer, open their MRs, and record them in swl.toml
     Publish {
@@ -261,9 +267,23 @@ fn run(cli: Cli) -> Result<ExitCode> {
             let ws = Workspace::scan(&workspace_dir(workspace)?)?;
             env::run(&ws, &config, &current_exe()?, force)?;
         }
-        Commands::Status { workspace } => {
+        Commands::Status {
+            workspace,
+            from,
+            no_fetch,
+        } => {
             let config = Config::load(config_flag)?;
-            status::run(&Workspace::scan(&workspace_dir(workspace)?)?, &config)?;
+            let fetcher = ws_add::Fetcher::new(!no_fetch);
+            let reader = forge::interactive_reader();
+            match from {
+                Some(from) => status::run_from(&config, &from, reader.as_ref(), &fetcher)?,
+                None => status::run(
+                    &Workspace::scan(&workspace_dir(workspace)?)?,
+                    &config,
+                    reader.as_ref(),
+                    &fetcher,
+                )?,
+            }
         }
         Commands::Publish {
             consumer,

@@ -378,7 +378,7 @@ pub fn run_from(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::forge::PrInfo;
+    use crate::forge::{CiState, PrInfo};
 
     fn refs(lines: &[(&str, &str)]) -> Vec<(String, String)> {
         lines
@@ -461,6 +461,10 @@ mod tests {
                 title: String::new(),
                 draft: false,
             }))
+        }
+
+        fn commit_status(&self, _: &str, _: &str) -> Result<Option<CiState>> {
+            Ok(None)
         }
     }
 

@@ -162,6 +162,10 @@ mod tests {
                 draft: false,
             }))
         }
+
+        fn commit_status(&self, _: &str, _: &str) -> Result<Option<crate::forge::CiState>> {
+            Ok(None)
+        }
     }
 
     fn manifest(entries: &[(&str, &str, u64)]) -> Manifest {

@@ -443,9 +443,10 @@ fn three_level_chain_through_the_wrappers() {
     let common_rev = t.git(&common_src, &["rev-parse", "--short", "HEAD"]);
     let zw_rev = t.git(&t.src.join("zwanenzang"), &["rev-parse", "--short", "HEAD"]);
     for line in [
-        format!("swan-lake-common@common  input common  {common_rev}  feature  dirty"),
+        "swan-lake-common@common  local  next: commit the changes, then swl publish swan-lake  waits: anyone".to_string(),
+        format!("  input common  HEAD {common_rev}  feature  dirty"),
         format!("  swan-lake: common locked {common_rev}, ahead 0, behind 0"),
-        format!("zwanenzang@zwanenzang  input zwanenzang  {zw_rev}  detached  dirty"),
+        format!("  input zwanenzang  HEAD {zw_rev}  detached  dirty"),
         format!("  swan-lake: common/zwanenzang locked {zw_rev}, ahead 0, behind 0"),
         format!("  swan-lake-common@common: zwanenzang locked {zw_rev}, ahead 0, behind 0"),
     ] {
