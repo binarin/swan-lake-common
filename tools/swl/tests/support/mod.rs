@@ -8,9 +8,9 @@
 #![allow(dead_code)]
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     env, fs,
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, Read, Write},
     net::TcpListener,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
@@ -52,15 +52,58 @@ pub const TOKEN: &str = "test-token-0123";
 /// The path and Authorization header of each request.
 type SeenAuth = Arc<Mutex<Vec<(String, Option<String>)>>>;
 
+/// One request to the fake API.
+#[derive(Clone, Debug)]
+pub struct Seen {
+    pub method: String,
+    pub path: String,
+    pub auth: Option<String>,
+    pub body: String,
+}
+
+/// What the fake answers to the next merge request of an MR.
+#[derive(Clone, Debug)]
+pub enum MergeReply {
+    /// Merges now, as Forgejo's fast-forward-only merge does: the base
+    /// branch moves to the head, the head branch is deleted, the MR is
+    /// merged. 409 when the head is not the asked `head_commit_id`, or not a
+    /// fast-forward of master.
+    MergeNow,
+    /// 201: scheduled to merge when checks succeed.
+    Schedule,
+    /// Any other answer.
+    Status(u16, String),
+}
+
 /// GET responses by path; anything else is 404. Paths under a private repo
 /// answer only with `Authorization: token TOKEN`, as Forgejo does; any other
-/// token is a 401.
+/// token is a 401. Writes (`PATCH .../pulls/N` for the title, `POST
+/// .../pulls/N/merge`) need the token, and merges answer as programmed with
+/// [`FakeApi::on_merge`].
 #[derive(Clone, Default)]
 pub struct FakeApi {
     pub port: u16,
     pub responses: Arc<Mutex<BTreeMap<String, String>>>,
     pub private: Arc<Mutex<BTreeSet<String>>>,
     pub seen_auth: SeenAuth,
+    pub requests: Arc<Mutex<Vec<Seen>>>,
+    pub merge_replies: Arc<Mutex<BTreeMap<String, VecDeque<MergeReply>>>>,
+    /// The forge's bare repos, `<forge>/binarin/<repo>`, for merges and,
+    /// with `follow_pull_refs`, the heads of open MRs.
+    pub forge: Arc<Mutex<Option<PathBuf>>>,
+    pub follow_pull_refs: Arc<Mutex<bool>>,
+}
+
+fn git_in(dir: &Path, args: &[&str]) -> Option<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 impl FakeApi {
@@ -70,11 +113,7 @@ impl FakeApi {
             port: listener.local_addr().unwrap().port(),
             ..Default::default()
         };
-        let (responses, private, seen) = (
-            api.responses.clone(),
-            api.private.clone(),
-            api.seen_auth.clone(),
-        );
+        let server = api.clone();
         thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { continue };
@@ -82,42 +121,38 @@ impl FakeApi {
                 let mut request = String::new();
                 reader.read_line(&mut request).ok();
                 let mut auth = None;
+                let mut length = 0;
                 loop {
                     let mut line = String::new();
                     if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
                         break;
                     }
-                    if let Some((k, v)) = line.split_once(':')
-                        && k.eq_ignore_ascii_case("authorization")
-                    {
-                        auth = Some(v.trim().to_string());
+                    if let Some((k, v)) = line.split_once(':') {
+                        if k.eq_ignore_ascii_case("authorization") {
+                            auth = Some(v.trim().to_string());
+                        } else if k.eq_ignore_ascii_case("content-length") {
+                            length = v.trim().parse().unwrap_or(0);
+                        }
                     }
                 }
-                let path = request.split_whitespace().nth(1).unwrap_or("").to_string();
-                seen.lock().unwrap().push((path.clone(), auth.clone()));
-                let repo = path
-                    .strip_prefix("/api/v1/repos/binarin/")
-                    .and_then(|r| r.split('/').next())
-                    .unwrap_or("")
-                    .to_string();
-                let good = auth.as_deref() == Some(&format!("token {TOKEN}"));
-                let allowed = !private.lock().unwrap().contains(&repo) || good;
-                // Like Forgejo, a commit without statuses has an empty
-                // combined status, not a 404.
-                let no_status = path.ends_with("/status").then(|| {
-                    r#"{"state":"","sha":"","total_count":0,"statuses":null}"#.to_string()
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).ok();
+                let body = String::from_utf8_lossy(&body).into_owned();
+                let mut words = request.split_whitespace();
+                let method = words.next().unwrap_or("").to_string();
+                let path = words.next().unwrap_or("").to_string();
+                server
+                    .seen_auth
+                    .lock()
+                    .unwrap()
+                    .push((path.clone(), auth.clone()));
+                server.requests.lock().unwrap().push(Seen {
+                    method: method.clone(),
+                    path: path.clone(),
+                    auth: auth.clone(),
+                    body: body.clone(),
                 });
-                let found = allowed
-                    .then(|| responses.lock().unwrap().get(&path).cloned().or(no_status))
-                    .flatten();
-                let (status, body) = match found {
-                    _ if auth.is_some() && !good => (
-                        "401 Unauthorized",
-                        r#"{"message":"invalid token"}"#.to_string(),
-                    ),
-                    Some(b) => ("200 OK", b),
-                    None => ("404 Not Found", r#"{"message":"not found"}"#.to_string()),
-                };
+                let (status, body) = server.answer(&method, &path, auth.as_deref(), &body);
                 let _ = write!(
                     stream,
                     "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -128,12 +163,182 @@ impl FakeApi {
         api
     }
 
+    fn answer(&self, method: &str, path: &str, auth: Option<&str>, body: &str) -> (String, String) {
+        let repo = path
+            .strip_prefix("/api/v1/repos/binarin/")
+            .and_then(|r| r.split('/').next())
+            .unwrap_or("")
+            .to_string();
+        let good = auth == Some(&format!("token {TOKEN}"));
+        let status = |code: u16, text: &str| (code.to_string() + " " + text, String::new());
+        if auth.is_some() && !good {
+            return (
+                "401 Unauthorized".into(),
+                r#"{"message":"invalid token"}"#.into(),
+            );
+        }
+        if method != "GET" {
+            if !good {
+                return status(401, "Unauthorized");
+            }
+            return self.write(method, path, &repo, body);
+        }
+        let allowed = !self.private.lock().unwrap().contains(&repo) || good;
+        // Like Forgejo, a commit without statuses has an empty
+        // combined status, not a 404.
+        let no_status = path
+            .ends_with("/status")
+            .then(|| r#"{"state":"","sha":"","total_count":0,"statuses":null}"#.to_string());
+        let found = allowed
+            .then(|| {
+                self.responses
+                    .lock()
+                    .unwrap()
+                    .get(path)
+                    .cloned()
+                    .map(|b| self.live(path, &repo, b))
+                    .or(no_status)
+            })
+            .flatten();
+        match found {
+            Some(b) => ("200 OK".into(), b),
+            None => (
+                "404 Not Found".into(),
+                r#"{"message":"not found"}"#.to_string(),
+            ),
+        }
+    }
+
+    /// An open MR's head as the forge has it, with `follow_pull_refs`.
+    fn live(&self, path: &str, repo: &str, body: String) -> String {
+        let Some(n) = path.rsplit_once("/pulls/").map(|(_, n)| n.to_string()) else {
+            return body;
+        };
+        let forge = self.forge.lock().unwrap().clone();
+        let Some(forge) = forge.filter(|_| *self.follow_pull_refs.lock().unwrap()) else {
+            return body;
+        };
+        let mut v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        if v["state"] == "open"
+            && let Some(head) = git_in(
+                &forge.join("binarin").join(repo),
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "-q",
+                    &format!("refs/pull/{n}/head"),
+                ],
+            )
+        {
+            v["head"]["sha"] = head.into();
+        }
+        v.to_string()
+    }
+
+    fn write(&self, method: &str, path: &str, repo: &str, body: &str) -> (String, String) {
+        let req: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+        let not_found = || {
+            (
+                "404 Not Found".to_string(),
+                r#"{"message":"not found"}"#.to_string(),
+            )
+        };
+        if method == "PATCH" {
+            let mut responses = self.responses.lock().unwrap();
+            let Some(pr) = responses.get_mut(path) else {
+                return not_found();
+            };
+            let mut v: serde_json::Value = serde_json::from_str(pr).unwrap();
+            let title = req["title"].as_str().unwrap_or("").to_string();
+            v["draft"] = title.to_ascii_uppercase().starts_with("WIP:").into();
+            v["title"] = title.into();
+            *pr = v.to_string();
+            return ("201 Created".into(), pr.clone());
+        }
+        let Some(pr_path) = path.strip_suffix("/merge").filter(|_| method == "POST") else {
+            return not_found();
+        };
+        let reply = self
+            .merge_replies
+            .lock()
+            .unwrap()
+            .get_mut(pr_path)
+            .and_then(VecDeque::pop_front);
+        let message = |code: u16, text: &str, msg: &str| {
+            (
+                format!("{code} {text}"),
+                serde_json::json!({ "message": msg }).to_string(),
+            )
+        };
+        match reply {
+            None => not_found(),
+            Some(MergeReply::Schedule) => ("201 Created".into(), String::new()),
+            Some(MergeReply::Status(code, msg)) => message(code, "Status", &msg),
+            Some(MergeReply::MergeNow) => {
+                let Some(pr) = self.responses.lock().unwrap().get(pr_path).cloned() else {
+                    return not_found();
+                };
+                let mut v: serde_json::Value =
+                    serde_json::from_str(&self.live(pr_path, repo, pr)).unwrap();
+                let head = v["head"]["sha"].as_str().unwrap_or("").to_string();
+                if req["head_commit_id"].as_str() != Some(head.as_str()) {
+                    return message(409, "Conflict", "head out of date");
+                }
+                let forge = self
+                    .forge
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .expect("the forge is set");
+                let dir = forge.join("binarin").join(repo);
+                if git_in(&dir, &["merge-base", "--is-ancestor", "master", &head]).is_none() {
+                    return message(409, "Conflict", "Not fast-forward: the base moved");
+                }
+                git_in(&dir, &["update-ref", "refs/heads/master", &head]).unwrap();
+                if let Some(branch) = v["head"]["ref"].as_str() {
+                    git_in(&dir, &["update-ref", "-d", &format!("refs/heads/{branch}")]);
+                }
+                let n = v["number"].clone();
+                v["state"] = "closed".into();
+                v["merged"] = true.into();
+                v["merge_commit_sha"] = head.into();
+                v["head"]["ref"] = format!("refs/pull/{n}/head").into();
+                self.responses
+                    .lock()
+                    .unwrap()
+                    .insert(pr_path.to_string(), v.to_string());
+                ("200 OK".into(), String::new())
+            }
+        }
+    }
+
     pub fn base(&self) -> String {
         format!("http://127.0.0.1:{}/api/v1", self.port)
     }
 
     pub fn make_private(&self, repo: &str) {
         self.private.lock().unwrap().insert(repo.to_string());
+    }
+
+    /// The answers to the next merge requests of `repo#n`, in order.
+    pub fn on_merge(&self, repo: &str, n: u64, replies: &[MergeReply]) {
+        self.merge_replies
+            .lock()
+            .unwrap()
+            .entry(format!("/api/v1/repos/binarin/{repo}/pulls/{n}"))
+            .or_default()
+            .extend(replies.iter().cloned());
+    }
+
+    /// The requests other than GET: `METHOD path body`.
+    pub fn writes(&self) -> Vec<String> {
+        self.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.method != "GET")
+            .map(|r| format!("{} {} {}", r.method, r.path, r.body))
+            .collect()
     }
 
     /// An MR: `state` is `open`, `draft`, `merged` or `closed`.
@@ -224,6 +429,16 @@ pub struct Forge {
     pub direnv_log: PathBuf,
 }
 
+/// A post-receive hook: a pushed branch moves the pull refs at its old head.
+const FOLLOW_PULL_REFS: &str = r#"#!/bin/sh
+while read old new ref; do
+  git for-each-ref --format='%(objectname) %(refname)' 'refs/pull/*/head' |
+  while read sha r; do
+    if [ "$sha" = "$old" ]; then git update-ref "$r" "$new"; fi
+  done
+done
+"#;
+
 /// A fake `direnv` that logs its calls.
 const FAKE_DIRENV: &str = "#!/bin/sh\necho \"$*\" >> \"$DIRENV_LOG\"\n";
 
@@ -252,6 +467,7 @@ impl Forge {
             nix_config,
             root,
         };
+        *f.api.forge.lock().unwrap() = Some(f.forge.clone());
         let fakebin = f.root.join("fakebin");
         fs::create_dir_all(&fakebin).unwrap();
         fs::write(fakebin.join("direnv"), FAKE_DIRENV).unwrap();
@@ -388,6 +604,32 @@ impl Forge {
         sha
     }
 
+    /// Makes the forge repo of `repo` move an MR's `refs/pull/N/head` with
+    /// pushes to its branch, as Forgejo does, and the fake API report open
+    /// MRs at those heads.
+    pub fn follow_pull_refs(&self, repo: &str) {
+        self.hook(repo, "post-receive", FOLLOW_PULL_REFS);
+        *self.api.follow_pull_refs.lock().unwrap() = true;
+    }
+
+    /// Installs (or with `None` removes) a hook in the forge repo.
+    pub fn hook_opt(&self, repo: &str, name: &str, script: Option<&str>) {
+        let path = self.forge_repo(repo).join("hooks").join(name);
+        match script {
+            Some(s) => {
+                fs::write(&path, s).unwrap();
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            None => {
+                let _ = fs::remove_file(&path);
+            }
+        }
+    }
+
+    pub fn hook(&self, repo: &str, name: &str, script: &str) {
+        self.hook_opt(repo, name, Some(script));
+    }
+
     /// A fake fj login: keys.json with the token the fake API wants.
     pub fn login(&self) -> PathBuf {
         self.login_with("fj-keys.json", TOKEN, None)
@@ -440,6 +682,7 @@ impl Forge {
             "SWL_FORGE_API",
             "SWL_FORGE_GIT",
             "SWL_FJ_KEYS",
+            "SWL_GITHUB_TOKEN",
             "NIX_STORE_DIR",
         ] {
             c.env_remove(var);
@@ -458,7 +701,9 @@ impl Forge {
             .env("GIT_COMMITTER_EMAIL", "swl@example.org")
             .env("SWL_CONFIG", self.root.join("repos.toml"))
             .env("DIRENV_LOG", &self.direnv_log)
-            .env("SWL_FORGE_API", self.api.base());
+            .env("SWL_FORGE_API", self.api.base())
+            // No GitHub source here: nothing may ask the real API.
+            .env("SWL_GITHUB_API", "http://127.0.0.1:9");
     }
 
     pub fn git(&self, dir: &Path, args: &[&str]) -> String {
