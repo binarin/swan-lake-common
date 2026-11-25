@@ -22,7 +22,7 @@ use crate::{
     ancestry,
     config::Config,
     forge::{CiState, LOGIN_REJECTED, PrInfo, PrReader, PrState},
-    git::{git, git_ok},
+    git::{git, git_ok, short},
     lock::Lock,
     manifest::{Entry, MANIFEST_FILE, Manifest},
     nix::Nix,
@@ -196,10 +196,6 @@ pub struct SharedFacts {
     /// Consumers that use a changed HEAD without a swl.toml entry for it.
     pub missing_entry: Vec<String>,
     pub mr: MrFacts,
-}
-
-fn short(rev: &str) -> &str {
-    &rev[..rev.len().min(12)]
 }
 
 fn open_verdict(
@@ -910,7 +906,7 @@ fn head_line(dir: &Path) -> Result<String> {
 }
 
 fn compare(dir: &Path, locked: &str) -> String {
-    let short = &locked[..locked.len().min(7)];
+    let short = locked.get(..7).unwrap_or(locked);
     if git_ok(dir, &["cat-file", "-e", &format!("{locked}^{{commit}}")]).is_none() {
         return format!("locked {short}, not in the local repo");
     }

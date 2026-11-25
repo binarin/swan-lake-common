@@ -32,3 +32,22 @@ pub fn git(dir: &Path, args: &[&str]) -> Result<String> {
 pub fn git_ok(dir: &Path, args: &[&str]) -> Option<String> {
     git(dir, args).ok()
 }
+
+/// The first 12 characters of a revision, for messages; never splits a
+/// character, whatever the input.
+pub fn short(rev: &str) -> &str {
+    rev.get(..12).unwrap_or(rev)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_revisions() {
+        assert_eq!(short("0123456789abcdef"), "0123456789ab");
+        assert_eq!(short("abc"), "abc");
+        // A multi-byte character across byte 12 is not split.
+        assert_eq!(short("aaaaaaaaaaaé"), "aaaaaaaaaaaé");
+    }
+}

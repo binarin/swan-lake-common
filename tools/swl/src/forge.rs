@@ -86,7 +86,7 @@ impl PrState {
         match self {
             PrState::Open => "open".into(),
             PrState::Merged { merge_commit } => {
-                format!("merged as {}", &merge_commit[..merge_commit.len().min(12)])
+                format!("merged as {}", crate::git::short(merge_commit))
             }
             PrState::ClosedUnmerged => "closed without merging".into(),
         }

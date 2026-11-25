@@ -17,7 +17,7 @@ use serde_json::Value;
 use crate::{
     ancestry,
     forge::{PrReader, PrState},
-    git::{git, git_ok},
+    git::{git, git_ok, short},
     lock_change,
     manifest::{Entry, MANIFEST_FILE, Manifest},
     nix::Nix,
@@ -65,10 +65,6 @@ pub fn roots_to_relock(statuses: &BTreeMap<String, Status>) -> Vec<String> {
         .map(|(p, _)| root_of(p))
         .collect();
     roots.into_iter().map(str::to_string).collect()
-}
-
-fn short(rev: &str) -> &str {
-    &rev[..rev.len().min(12)]
 }
 
 /// Whether the entry at `path`, merged as `merge_commit`, is in what the

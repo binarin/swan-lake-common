@@ -11,7 +11,7 @@ use serde_json::Value;
 use crate::{
     config::Config,
     forge::{PrReader, PrState},
-    git::{git, git_ok},
+    git::{git, git_ok, short},
     lock::{Lock, attrs_url},
     manifest::{Entry, MANIFEST_FILE, Manifest},
     nix::Nix,
@@ -82,7 +82,7 @@ pub fn lock_change(root: &Path, base: &str) -> Result<Option<String>> {
             "flake.lock differs from the merge base {} with {base}: an MR must not change \
              flake.lock; name pending shared-repo MRs in {MANIFEST_FILE}, and lock changes land \
              through swl finalize",
-            &mb[..mb.len().min(12)]
+            short(&mb)
         )
     }))
 }
@@ -215,7 +215,7 @@ pub fn check_mr(
                     entry.repo,
                     entry.mr,
                     pr.state.describe(),
-                    &pr.head_sha[..pr.head_sha.len().min(12)]
+                    short(&pr.head_sha)
                 ));
                 out.notes.extend(note);
             }
@@ -250,8 +250,10 @@ pub fn check_master(root: &Path, nix: &Nix) -> Result<Outcome> {
             .notes
             .push("no common input: the pin policy does not apply".into()),
         Ok(Some(pins)) => {
-            out.notes
-                .push(format!("common is canonical at {}", &pins.common_rev[..12]));
+            out.notes.push(format!(
+                "common is canonical at {}",
+                short(&pins.common_rev)
+            ));
             for (name, locked) in &pins.next {
                 out.notes
                     .push(pin_policy::next_report(name, locked, &pins.common_rev));

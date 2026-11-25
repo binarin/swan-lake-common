@@ -300,8 +300,8 @@ pub fn check_next_locked(name: &str, original: &Value, locked: &Value) -> Result
 /// Informational: offline is "cannot determine", not a failure.
 pub fn next_report(name: &str, locked: &Value, common_rev: &str) -> String {
     let rev = str_of(locked, "rev").unwrap_or("");
-    let subject = format!("{name} {}", &rev[..rev.len().min(12)]);
-    let common = &common_rev[..common_rev.len().min(12)];
+    let subject = format!("{name} {}", crate::git::short(rev));
+    let common = crate::git::short(common_rev);
     if rev == common_rev {
         return format!("{subject} equals the locked common revision");
     }

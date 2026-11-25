@@ -195,7 +195,7 @@ pub fn add(
                 source,
                 &["worktree", "add", "--quiet", "--detach", &dest_str, at],
             )?;
-            format!("detached at {}", &at[..at.len().min(12)])
+            format!("detached at {}", crate::git::short(at))
         }
         Start::Branch(b) if rev(source, &format!("refs/heads/{b}")).is_some() => {
             let how = existing_branch(source, remote.as_deref(), b)?;

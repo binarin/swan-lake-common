@@ -13,7 +13,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use crate::{
     config::Config,
     forge::{PrReader, PrState},
-    git::{git, git_ok},
+    git::{git, git_ok, short},
     manifest::{MANIFEST_FILE, Manifest},
     shim::find_real_tool,
     workspace::parse_shared_name,
@@ -83,17 +83,17 @@ pub fn mr_branch(
         [b] => Ok((head.clone(), b.to_string())),
         [] if branches.contains(&base_branch) => bail!(
             "{repo}#{n}: its head {} is the head of {base_branch}: the MR is merged; nothing to join",
-            &head[..head.len().min(12)]
+            short(head)
         ),
         [] => bail!(
             "{repo}#{n}: its head {} is not the head of any branch: the MR was merged and its \
              branch deleted, or the branch moved on; nothing to join",
-            &head[..head.len().min(12)]
+            short(head)
         ),
         many => bail!(
             "{repo}#{n}: its head {} is the head of several branches ({}); use swl start with \
              --branch instead",
-            &head[..head.len().min(12)],
+            short(head),
             many.join(", ")
         ),
     }
@@ -193,7 +193,7 @@ pub fn from_items(consumer: &str, mr: &ConsumerMr, reader: &dyn PrReader) -> Res
             PrState::Merged { merge_commit } => {
                 let note = format!(
                     "{which} is merged; detached at its merge commit {}",
-                    &merge_commit[..merge_commit.len().min(12)]
+                    short(&merge_commit)
                 );
                 (Target::Detached(merge_commit), Some(note))
             }
@@ -266,16 +266,16 @@ fn keep(dest: &Path, source: &Path, target: &Target) -> Result<String> {
         );
     }
     let (branch, head) = describe_head(dest)?;
-    let short = &head[..head.len().min(12)];
+    let at = short(&head);
     Ok(match (target, branch) {
         (Target::Branch(b), Some(cur)) if *b == cur => format!("kept, on {cur}"),
         (Target::Branch(b), Some(cur)) => format!("kept, on {cur}, not {b}; not changed"),
-        (Target::Branch(b), None) => format!("kept, detached at {short}, not on {b}; not changed"),
-        (Target::Detached(rev), _) if *rev == head => format!("kept, detached at {short}"),
+        (Target::Branch(b), None) => format!("kept, detached at {at}, not on {b}; not changed"),
+        (Target::Detached(rev), _) if *rev == head => format!("kept, detached at {at}"),
         (Target::Detached(rev), branch) => format!(
-            "kept, at {} {short}, not {}; not changed",
+            "kept, at {} {at}, not {}; not changed",
             branch.as_deref().unwrap_or("detached"),
-            &rev[..rev.len().min(12)]
+            short(rev)
         ),
     })
 }
@@ -341,7 +341,7 @@ pub fn execute(
             }
         }
         let (branch, head) = describe_head(&dest)?;
-        let at = branch.unwrap_or_else(|| format!("detached at {}", &head[..head.len().min(12)]));
+        let at = branch.unwrap_or_else(|| format!("detached at {}", short(&head)));
         summary.push(format!("  {}  {at}", item.name));
     }
     ws_add::env_after_add(config, &root, swl, "the checkouts were")?;
@@ -397,7 +397,7 @@ pub fn run_from(
     println!(
         "{consumer}#{n}: branch {} at {}",
         mr.branch,
-        &mr.head[..mr.head.len().min(12)]
+        short(&mr.head)
     );
     let items = from_items(&consumer, &mr, reader)?;
     for item in &items[1..] {

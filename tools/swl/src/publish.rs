@@ -83,7 +83,7 @@ fn publishable(c: &Checkout, base: &str) -> Result<Branch> {
             "{}: origin's {name} is at {}, which HEAD does not contain; a push would not be a \
              fast-forward (swl never force-pushes): fetch and rebase or merge first",
             c.name,
-            &r[..r.len().min(12)]
+            crate::git::short(r)
         );
     }
     Ok(Branch {
@@ -102,7 +102,12 @@ fn push(c: &Checkout, b: &Branch) -> Result<()> {
     }
     let refspec = format!("refs/heads/{0}:refs/heads/{0}", b.name);
     git(&c.dir, &["push", "--quiet", "origin", &refspec])?;
-    println!("{}: pushed {} ({})", c.name, b.name, &b.head[..12]);
+    println!(
+        "{}: pushed {} ({})",
+        c.name,
+        b.name,
+        crate::git::short(&b.head)
+    );
     Ok(())
 }
 
