@@ -200,7 +200,9 @@ fn relock(
 }
 
 /// Writes the relocked lock into the worktree, checks it with `nix flake
-/// check --no-build` if asked, and commits it; the new HEAD.
+/// check --no-build` if asked, and commits it; the new HEAD. The source's
+/// hooks are not run: they are for its checkouts, which may have tools
+/// that a scratch worktree lacks, and the lock is checked here.
 fn commit_lock(
     nix: &Nix,
     dir: &Path,
@@ -226,6 +228,7 @@ fn commit_lock(
         &[
             "commit",
             "--quiet",
+            "--no-verify",
             "-m",
             subject,
             "-m",
@@ -766,6 +769,19 @@ impl Bumper<'_> {
                     format!(
                         "{name}: {} locks {}, which {COMMON_REPO} does not have; not bumped",
                         i.name,
+                        short(&i.rev)
+                    ),
+                );
+            } else if is_ancestor(common_src, target, &i.rev) {
+                style::say(
+                    CMD,
+                    Tone::Warn,
+                    format!(
+                        "{name}: not bumped: {} locks {}, which is ahead of the promoted {}; left \
+                         at {}",
+                        i.name,
+                        short(&i.rev),
+                        short(target),
                         short(&i.rev)
                     ),
                 );

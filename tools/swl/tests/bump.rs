@@ -14,7 +14,7 @@
 
 mod support;
 
-use std::{fs, path::PathBuf, process::Output};
+use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf, process::Output};
 
 use support::{Forge, MergeReply, failed, stdout, text};
 
@@ -56,6 +56,14 @@ impl Bump {
         for c in CONSUMERS {
             f.api.make_private(c);
             f.follow_pull_refs(c);
+        }
+        // The sources' hooks are for their checkouts: bump's commits in
+        // scratch worktrees skip them.
+        for repo in [COMMON, "nixos-config", "swan-lake"] {
+            let hook = f.source(repo).join("hooks/pre-commit");
+            fs::create_dir_all(hook.parent().unwrap()).unwrap();
+            fs::write(&hook, "#!/bin/sh\necho no hooks here >&2\nexit 1\n").unwrap();
+            fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
         }
         let keys = f.login().display().to_string();
         Self { f, keys }
@@ -436,6 +444,37 @@ fn bump_stops_for_what_is_not_its_own() {
     t.f.git(
         &t.f.forge_repo(COMMON),
         &["update-ref", "refs/heads/current", &c1],
+    );
+
+    // A consumer that locks a common ahead of the promoted one: left, and
+    // said so.
+    let ahead = t.f.commit_on_forge(COMMON, "feature", "ahead");
+    let nc_master = t.rev("nixos-config", "master");
+    let nc = t.f.clone_elsewhere("nixos-config", "nc-ahead");
+    let mut lock: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(nc.join("flake.lock")).unwrap()).unwrap();
+    let key = lock["nodes"]["root"]["inputs"]["lib"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    lock["nodes"][&key]["locked"]["rev"] = ahead.clone().into();
+    fs::write(nc.join("flake.lock"), lock.to_string()).unwrap();
+    t.f.git(&nc, &["commit", "-qam", "lib ahead"]);
+    t.f.git(&nc, &["push", "-q", "origin", "HEAD:master"]);
+    let log = stdout(&t.bump(&[]));
+    assert!(
+        log.contains(&format!(
+            "nixos-config: not bumped: lib locks {}, which is ahead of the promoted {}; left at {}",
+            short(&ahead),
+            short(&c1),
+            short(&ahead)
+        )),
+        "{log}"
+    );
+    assert!(log.contains("nothing to bump"), "{log}");
+    t.f.git(
+        &t.f.forge_repo("nixos-config"),
+        &["update-ref", "refs/heads/master", &nc_master],
     );
 
     // A landing on master that is not promoted: for the owner, nothing
