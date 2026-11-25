@@ -89,8 +89,8 @@ pub enum MergeReply {
 /// GET responses by path; anything else is 404. Paths under a private repo
 /// answer only with `Authorization: token TOKEN`, as Forgejo does; any other
 /// token is a 401. Writes (`PATCH .../pulls/N` for the title, `POST
-/// .../pulls/N/merge`) need the token, and merges answer as programmed with
-/// [`FakeApi::on_merge`].
+/// .../pulls` to open an MR, `POST .../pulls/N/merge`) need the token, and
+/// merges answer as programmed with [`FakeApi::on_merge`].
 #[derive(Clone, Default)]
 pub struct FakeApi {
     pub port: u16,
@@ -268,6 +268,9 @@ impl FakeApi {
             *pr = v.to_string();
             return ("201 Created".into(), pr.clone());
         }
+        if method == "POST" && path == format!("/api/v1/repos/binarin/{repo}/pulls") {
+            return self.open_pr(repo, &req);
+        }
         let Some(pr_path) = path.strip_suffix("/merge") else {
             return not_found();
         };
@@ -313,6 +316,72 @@ impl FakeApi {
             MergeReply::Status(code, msg) => message(code, "Status", &msg),
             MergeReply::MergeNow => self.merge_pr(pr_path, repo, req["head_commit_id"].as_str()),
         }
+    }
+
+    /// Opens an MR as Forgejo's `POST /repos/{owner}/{repo}/pulls` does: the
+    /// next number, `refs/pull/N/head` at the head branch, 201 with the MR;
+    /// 409 when an open MR of that head and base exists, 404 without the
+    /// head branch.
+    fn open_pr(&self, repo: &str, req: &serde_json::Value) -> (String, String) {
+        let message = |code: &str, msg: &str| {
+            (
+                code.to_string(),
+                serde_json::json!({ "message": msg }).to_string(),
+            )
+        };
+        let (head, base) = (
+            req["head"].as_str().unwrap_or(""),
+            req["base"].as_str().unwrap_or(""),
+        );
+        let prefix = format!("/api/v1/repos/binarin/{repo}/pulls/");
+        let mut responses = self.responses.lock().unwrap();
+        let mut last = 0;
+        for (path, body) in responses.iter() {
+            let Some(n) = path
+                .strip_prefix(&prefix)
+                .and_then(|n| n.parse::<u64>().ok())
+            else {
+                continue;
+            };
+            last = last.max(n);
+            let v: serde_json::Value = serde_json::from_str(body).unwrap();
+            if v["state"] == "open" && v["head"]["ref"] == head && v["base"]["ref"] == base {
+                return message(
+                    "409 Conflict",
+                    "pull request already exists for these targets",
+                );
+            }
+        }
+        let forge = self
+            .forge
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the forge is set");
+        let dir = forge.join("binarin").join(repo);
+        let Some(sha) = git_in(
+            &dir,
+            &["rev-parse", "--verify", "-q", &format!("refs/heads/{head}")],
+        ) else {
+            return message("404 Not Found", "head branch not found");
+        };
+        let n = last + 1;
+        git_in(&dir, &["update-ref", &format!("refs/pull/{n}/head"), &sha]).unwrap();
+        let title = req["title"].as_str().unwrap_or("");
+        let body = serde_json::json!({
+            "number": n,
+            "state": "open",
+            "merged": false,
+            "draft": title.to_ascii_uppercase().starts_with("WIP:"),
+            "title": title,
+            "body": req["body"],
+            "head": { "sha": sha, "ref": head },
+            "base": { "ref": base },
+            "merge_commit_sha": null,
+        })
+        .to_string();
+        responses.insert(format!("{prefix}{n}"), body.clone());
+        ("201 Created".into(), body)
     }
 
     /// The head of the MR at the API path `pr_path`, as the forge has it.
@@ -611,6 +680,39 @@ impl Forge {
             f.git(&source, &["fetch", "-q", "origin"]);
         }
         f
+    }
+
+    /// Another consumer like swan-lake, locked to common's `current`, on the
+    /// forge, with its source and its `[repos.<repo>]` in the config.
+    pub fn add_consumer(&self, repo: &str) {
+        let seed = self.root.join("seed").join(repo);
+        self.seed(&seed, CONSUMER_FLAKE, &format!("{repo}-1"));
+        stdout(&self.nix(&seed, &["flake", "lock"]));
+        self.git(&seed, &["add", "flake.lock"]);
+        self.git(&seed, &["commit", "-qm", "lock"]);
+        self.bare(repo, &seed);
+        let source = self.source(repo);
+        self.git(
+            &self.root,
+            &["init", "-q", "--bare", &source.display().to_string()],
+        );
+        self.git(
+            &source,
+            &[
+                "remote",
+                "add",
+                "origin",
+                &self.forge_repo(repo).display().to_string(),
+            ],
+        );
+        self.git(&source, &["fetch", "-q", "origin"]);
+        let config = self.root.join("repos.toml");
+        let mut text = fs::read_to_string(&config).unwrap();
+        text.push_str(&format!(
+            "[repos.{repo}]\nsource = \"{}\"\n",
+            source.display()
+        ));
+        fs::write(config, text).unwrap();
     }
 
     pub fn source(&self, repo: &str) -> PathBuf {
