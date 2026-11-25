@@ -48,6 +48,12 @@ impl Change {
         } else {
             self.f.swl(&self.f.root, &args)
         };
+        // The token never reaches the output.
+        assert!(
+            !support::text(&out).contains(support::TOKEN),
+            "{}",
+            support::text(&out)
+        );
         stdout(&out)
     }
 
