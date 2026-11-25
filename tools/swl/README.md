@@ -515,7 +515,8 @@ then push to master; `swl publish` refuses to push it.
 ### Forge access
 
 `status` and `start --from` read MR state and commit status anonymously
-first, so public repos never see a token. On a 404 they ask again with the
+first: public repos are read without a token unless the read 404s. On a
+404 they ask again with the
 login of `fj`: the token for `forgejo.lynx-lizard.ts.net` in fj's
 `keys.json` (`$XDG_DATA_HOME/forgejo-cli/keys.json`, default
 `~/.local/share/forgejo-cli/keys.json`; `SWL_FJ_KEYS` overrides the path).
