@@ -4,8 +4,8 @@
 //! saying what it waits for and for whom. Rerun it to continue.
 //!
 //! 1. The shared MRs that the consumers' `swl.toml` entries name, nested
-//!    entries first: a draft is marked ready, then a fast-forward merge is
-//!    requested for when its checks succeed.
+//!    entries first: a draft is marked ready, then it is merged by
+//!    fast-forward: now when its checks are green, else when they succeed.
 //! 2. A merged MR whose input `flake.nix` declares at a branch other than the
 //!    base (common's `swan-lake-current`) is promoted: that branch is
 //!    fast-forwarded on the forge to the merge commit. Then the declared
@@ -35,7 +35,10 @@ use crate::{
     config::Config,
     env::GENERATED_MARKER,
     finalize::{self, Landing},
-    forge::{CiState, ForgeWriter, MergeOutcome, PrInfo, PrReader, PrState, ready_title},
+    forge::{
+        CancelOutcome, CiState, ForgeWriter, MergeOutcome, MergeWhen, PrInfo, PrReader, PrState,
+        ready_title,
+    },
     git::{git, git_ok, short, valid_branch},
     manifest::{Entry, MANIFEST_FILE, Manifest},
     start,
@@ -255,13 +258,9 @@ impl Lander<'_> {
                     "{which} ({path}) was closed without merging: reopen it, or drop the entry"
                 ),
             ),
-            MrRead::Open { info, ci } => self.merge(
-                &which,
-                &e.repo,
-                info,
-                ci,
-                &format!("swl publish {consumer}"),
-            ),
+            MrRead::Open { info, .. } => {
+                self.merge(&which, &e.repo, info, &format!("swl publish {consumer}"))
+            }
             MrRead::Merged {
                 merge_commit,
                 promotion,
@@ -296,17 +295,23 @@ impl Lander<'_> {
         }
     }
 
-    /// Marks an open MR ready and requests its merge. `republish` is the
-    /// command that updates its branch after a rebase.
-    fn merge(
-        &self,
-        which: &str,
-        repo: &str,
-        info: &PrInfo,
-        ci: &Result<Option<CiState>, String>,
-        republish: &str,
-    ) -> Result<Step> {
-        if let Ok(Some(CiState::Failing(s))) = ci {
+    /// The combined commit status of an MR head, read now; `None` when it
+    /// cannot be read.
+    fn ci_now(&self, repo: &str, head: &str) -> Option<CiState> {
+        self.reader.commit_status(repo, head).ok().flatten()
+    }
+
+    /// Marks an open MR ready and merges it: now when its checks are green,
+    /// else when they succeed. `republish` is the command that updates its
+    /// branch after a rebase.
+    ///
+    /// Forgejo merges a scheduled MR on a later commit status event only:
+    /// scheduled on checks that are green already, it never merges. So a
+    /// green MR is merged directly (any scheduled merge cancelled first), and
+    /// one that turns green right after its merge was scheduled too.
+    fn merge(&self, which: &str, repo: &str, info: &PrInfo, republish: &str) -> Result<Step> {
+        let ci = self.ci_now(repo, &info.head_sha);
+        if let Some(CiState::Failing(s)) = &ci {
             return stop(
                 Waits::Anyone,
                 format!("{which}: CI failing ({s}); fix it, then rerun swl land"),
@@ -314,6 +319,9 @@ impl Lander<'_> {
         }
         if let Some(step) = self.mark_ready(which, repo, info)? {
             return Ok(step);
+        }
+        if ci == Some(CiState::Green) {
+            return self.merge_now(which, repo, info, republish);
         }
         let what = format!(
             "request the merge of {which} at {} (fast-forward only, when its checks succeed, \
@@ -323,15 +331,80 @@ impl Lander<'_> {
         if !self.act(&format!("merge {which}"), &what)? {
             return self.dry_stop(&format!("{which} merges when its checks succeed"));
         }
+        let outcome = self.writer.request_merge(
+            repo,
+            info.number,
+            &info.head_sha,
+            MergeWhen::ChecksSucceed,
+        )?;
+        if outcome == MergeOutcome::Scheduled {
+            if self.ci_now(repo, &info.head_sha) == Some(CiState::Green) {
+                println!(
+                    "swl land: {which}: its checks turned green as the merge was scheduled, and \
+                     no later status would start it"
+                );
+                return self.merge_now(which, repo, info, republish);
+            }
+            return stop(
+                Waits::Nobody,
+                format!(
+                    "{which} waits for CI, then it merges (merge when checks succeed); rerun swl land"
+                ),
+            );
+        }
+        self.merge_answer(which, repo, info, outcome, republish)
+    }
+
+    /// Merges an MR whose checks are green: cancels any scheduled merge
+    /// (nothing scheduled is fine), then requests a plain fast-forward merge.
+    fn merge_now(&self, which: &str, repo: &str, info: &PrInfo, republish: &str) -> Result<Step> {
+        let what = format!(
+            "merge {which} at {} now, its checks being green (cancelling a scheduled merge \
+             first; fast-forward only, deleting its branch)",
+            short(&info.head_sha)
+        );
+        if !self.act(&format!("merge now {which}"), &what)? {
+            return self.dry_stop(&format!("{which} is merged"));
+        }
+        match self.writer.cancel_scheduled_merge(repo, info.number)? {
+            CancelOutcome::Cancelled => {
+                println!("swl land: cancelled the scheduled merge of {which}")
+            }
+            CancelOutcome::NothingScheduled => {}
+            CancelOutcome::Refused(why) => {
+                return stop(
+                    Waits::Owner,
+                    format!("merge {which} (cancelling its scheduled merge was refused: {why})"),
+                );
+            }
+        }
+        let outcome =
+            self.writer
+                .request_merge(repo, info.number, &info.head_sha, MergeWhen::Now)?;
+        if outcome == MergeOutcome::Scheduled {
+            return stop(
+                Waits::Nobody,
+                format!("{which}: the forge did not merge it yet; rerun swl land"),
+            );
+        }
+        self.merge_answer(which, repo, info, outcome, republish)
+    }
+
+    /// The step after the forge's answer to a merge request.
+    fn merge_answer(
+        &self,
+        which: &str,
+        repo: &str,
+        info: &PrInfo,
+        outcome: MergeOutcome,
+        republish: &str,
+    ) -> Result<Step> {
         let base_branch = self
             .config
             .base_for(repo)
             .split_once('/')
             .map_or(self.config.base_for(repo), |(_, b)| b)
             .to_string();
-        let outcome = self
-            .writer
-            .request_merge(repo, info.number, &info.head_sha)?;
         let merged_now = || -> bool {
             matches!(
                 self.reader.pr(repo, info.number),
@@ -534,9 +607,9 @@ impl Lander<'_> {
             _ => return stop_at(row),
         };
         let which = format!("{}#{number}", c.name);
-        let (info, ci) = match read {
+        let info = match read {
             MrRead::Merged { .. } => return Ok(Step::Done),
-            MrRead::Open { info, ci } => (info, ci),
+            MrRead::Open { info, .. } => info,
             _ => return stop_at(row),
         };
         // The MR was found by its head commit: it must be this branch's.
@@ -609,13 +682,7 @@ impl Lander<'_> {
             git(&c.dir, &["push", "--quiet", &remote, &refspec])?;
             return self.await_pull_head(&c.dir, &remote, &which, number);
         }
-        self.merge(
-            &which,
-            &c.name,
-            info,
-            ci,
-            &format!("swl publish {}", c.name),
-        )
+        self.merge(&which, &c.name, info, &format!("swl publish {}", c.name))
     }
 
     /// After a push: waits until the forge has updated the MR's pull ref.
@@ -888,7 +955,11 @@ impl ForgeWriter for DryRunWriter {
         bail!("a dry run writes nothing")
     }
 
-    fn request_merge(&self, _: &str, _: u64, _: &str) -> Result<MergeOutcome> {
+    fn request_merge(&self, _: &str, _: u64, _: &str, _: MergeWhen) -> Result<MergeOutcome> {
+        bail!("a dry run writes nothing")
+    }
+
+    fn cancel_scheduled_merge(&self, _: &str, _: u64) -> Result<CancelOutcome> {
         bail!("a dry run writes nothing")
     }
 }

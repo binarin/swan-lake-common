@@ -537,3 +537,231 @@ fn land_checks_the_consumer_mr_and_branch() {
         t.f.api.writes()
     );
 }
+
+impl Change {
+    /// The head of common#1.
+    fn common_head(&self) -> String {
+        self.f.git(&self.common, &["rev-parse", "HEAD"])
+    }
+
+    /// The forge writes since `from`, without the bodies of merge requests:
+    /// `METHOD path`, and for a merge request whether it waits for checks.
+    fn writes_since(&self, from: usize) -> Vec<String> {
+        self.f.api.writes()[from..]
+            .iter()
+            .map(|w| {
+                let (head, body) = w.split_once(" {").map_or((w.as_str(), ""), |(h, b)| (h, b));
+                let head = head.trim_end();
+                match head.ends_with("/merge") && head.starts_with("POST") {
+                    true if body.contains("\"merge_when_checks_succeed\":true") => {
+                        format!("{head} when checks succeed")
+                    }
+                    true => format!("{head} now"),
+                    false => head.to_string(),
+                }
+            })
+            .collect()
+    }
+}
+
+const COMMON_MERGE: &str = "/api/v1/repos/binarin/swan-lake-common/pulls/1/merge";
+
+#[test]
+fn land_merges_an_mr_with_green_checks_directly() {
+    let t = Change::new("land-green");
+    t.mirror_at_once();
+    let c2 = t.common_head();
+    t.f.api.set_status("swan-lake-common", &c2, "success");
+
+    // A dry run says so, and writes nothing.
+    let log = stdout(&t.land(&["--dry-run"]));
+    assert!(
+        log.contains(&format!(
+            "would merge swan-lake-common#1 at {} now, its checks being green",
+            &c2[..12]
+        )),
+        "{log}"
+    );
+    assert!(log.contains("then: swan-lake-common#1 is merged"), "{log}");
+    assert!(t.f.api.writes().is_empty(), "{:?}", t.f.api.writes());
+
+    // A plain merge, after cancelling whatever may be scheduled (nothing).
+    let out = t.land(&[]);
+    let log = out_text(&out);
+    assert!(log.contains("swan-lake-common#1 is merged"), "{log}");
+    assert!(!log.contains("swan-lake-common#1 waits for CI"), "{log}");
+    assert!(!log.contains("cancelled the scheduled merge"), "{log}");
+    let writes = t.f.api.writes();
+    let post = writes
+        .iter()
+        .find_map(|w| w.strip_prefix(&format!("POST {COMMON_MERGE} ")))
+        .unwrap();
+    let post: serde_json::Value = serde_json::from_str(post).unwrap();
+    assert_eq!(
+        post,
+        serde_json::json!({"Do": "fast-forward-only", "delete_branch_after_merge": true,
+                           "head_commit_id": c2})
+    );
+    assert_eq!(
+        t.writes_since(0)[..3],
+        [
+            "PATCH /api/v1/repos/binarin/swan-lake-common/pulls/1".to_string(),
+            format!("DELETE {COMMON_MERGE}"),
+            format!("POST {COMMON_MERGE} now"),
+        ]
+    );
+    // The consumer's landing has no status yet: its merge is scheduled.
+    failed(&out, 5, "swan-lake#2 waits for CI, then it merges");
+    assert!(t.f.api.is_scheduled("swan-lake", 2));
+    assert_eq!(
+        t.writes_since(3).last().unwrap(),
+        "POST /api/v1/repos/binarin/swan-lake/pulls/2/merge when checks succeed"
+    );
+
+    // CI reports success on the landing: the forge merges it by itself, and
+    // the rerun finds it merged.
+    let landing = t.f.git(&t.consumer, &["rev-parse", "HEAD"]);
+    let writes = t.f.api.writes().len();
+    t.f.api.set_status("swan-lake", &landing, "success");
+    assert!(!t.f.api.is_scheduled("swan-lake", 2));
+    let log = stdout(&t.land(&[]));
+    assert!(log.contains("every MR of the change is merged"), "{log}");
+    assert!(!t.ws.exists(), "{log}");
+    assert_eq!(t.f.api.writes().len(), writes, "nothing more to write");
+}
+
+#[test]
+fn land_cancels_a_scheduled_merge_once_the_checks_are_green() {
+    let t = Change::new("land-scheduled");
+    t.mirror_at_once();
+    let c2 = t.common_head();
+    t.f.api.set_status("swan-lake-common", &c2, "pending");
+
+    // Pending: a dry run plans the scheduled merge; the run schedules it.
+    let log = stdout(&t.land(&["--dry-run"]));
+    assert!(
+        log.contains("then: swan-lake-common#1 merges when its checks succeed"),
+        "{log}"
+    );
+    assert!(t.f.api.writes().is_empty());
+    failed(
+        &t.land(&[]),
+        5,
+        "waits for nobody: swan-lake-common#1 waits for CI, then it merges",
+    );
+    assert_eq!(
+        t.writes_since(0),
+        [
+            "PATCH /api/v1/repos/binarin/swan-lake-common/pulls/1".to_string(),
+            format!("POST {COMMON_MERGE} when checks succeed"),
+        ]
+    );
+    assert!(t.f.api.is_scheduled("swan-lake-common", 1));
+
+    // Green without a status event that would start the scheduled merge:
+    // it stays scheduled on the forge. A dry run plans the direct merge.
+    t.f.api
+        .set_status_without_event("swan-lake-common", &c2, "success");
+    assert!(t.f.api.is_scheduled("swan-lake-common", 1));
+    let log = stdout(&t.land(&["--dry-run"]));
+    assert!(log.contains("would merge swan-lake-common#1"), "{log}");
+    assert!(!log.contains("waits for CI"), "{log}");
+    assert_eq!(t.f.api.writes().len(), 2, "a dry run writes nothing");
+
+    // Cancelling is refused: for the owner.
+    t.f.api
+        .on_cancel("swan-lake-common", 1, &[(403, "not the scheduler")]);
+    failed(
+        &t.land(&[]),
+        3,
+        "waits for the owner: merge swan-lake-common#1 (cancelling its scheduled merge was refused: HTTP 403: not the scheduler)",
+    );
+    assert_eq!(t.writes_since(2), [format!("DELETE {COMMON_MERGE}")]);
+
+    // Cancelled, then the direct merge is refused: for the owner, as before.
+    t.f.api.on_merge(
+        "swan-lake-common",
+        1,
+        &[MergeReply::Status(
+            405,
+            "User not allowed to merge PR".into(),
+        )],
+    );
+    let out = t.land(&[]);
+    failed(
+        &out,
+        3,
+        "waits for the owner: merge swan-lake-common#1 (the forge refused: HTTP 405: User not allowed to merge PR)",
+    );
+    assert!(
+        out_text(&out).contains("cancelled the scheduled merge of swan-lake-common#1"),
+        "{}",
+        text(&out)
+    );
+    assert!(!t.f.api.is_scheduled("swan-lake-common", 1));
+    assert_eq!(
+        t.writes_since(3),
+        [
+            format!("DELETE {COMMON_MERGE}"),
+            format!("POST {COMMON_MERGE} now"),
+        ]
+    );
+
+    // Allowed now: nothing left to cancel, merged directly.
+    let out = t.land(&[]);
+    let log = out_text(&out);
+    assert!(log.contains("swan-lake-common#1 is merged"), "{log}");
+    assert!(!log.contains("swan-lake-common#1 waits for CI"), "{log}");
+    assert_eq!(
+        t.writes_since(5)[..2],
+        [
+            format!("DELETE {COMMON_MERGE}"),
+            format!("POST {COMMON_MERGE} now"),
+        ]
+    );
+    assert_eq!(
+        t.f.git(
+            &t.f.forge_repo("swan-lake-common"),
+            &["rev-parse", "master"]
+        ),
+        c2
+    );
+    failed(&out, 5, "swan-lake#2 waits for CI, then it merges");
+}
+
+#[test]
+fn land_merges_directly_when_the_checks_turn_green_as_the_merge_is_scheduled() {
+    let t = Change::new("land-race");
+    t.mirror_at_once();
+    let c2 = t.common_head();
+    t.f.api.set_status("swan-lake-common", &c2, "pending");
+    t.f.api.on_merge(
+        "swan-lake-common",
+        1,
+        &[MergeReply::ScheduleAsChecksTurnGreen],
+    );
+    let out = t.land(&[]);
+    let log = out_text(&out);
+    assert!(
+        log.contains("swan-lake-common#1: its checks turned green as the merge was scheduled"),
+        "{log}"
+    );
+    assert!(
+        log.contains("cancelled the scheduled merge of swan-lake-common#1"),
+        "{log}"
+    );
+    assert!(log.contains("swan-lake-common#1 is merged"), "{log}");
+    assert!(!log.contains("swan-lake-common#1 waits for CI"), "{log}");
+    assert_eq!(
+        t.writes_since(0)[..4],
+        [
+            "PATCH /api/v1/repos/binarin/swan-lake-common/pulls/1".to_string(),
+            format!("POST {COMMON_MERGE} when checks succeed"),
+            format!("DELETE {COMMON_MERGE}"),
+            format!("POST {COMMON_MERGE} now"),
+        ]
+    );
+    assert!(!t.f.api.is_scheduled("swan-lake-common", 1));
+    // On to the consumer, in the same run.
+    failed(&out, 5, "swan-lake#2 waits for CI, then it merges");
+}

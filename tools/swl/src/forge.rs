@@ -592,14 +592,67 @@ pub fn merge_outcome(code: u16, body: &str) -> Result<MergeOutcome> {
     })
 }
 
-/// The forge writes of `swl land`: marking an MR ready and requesting its
-/// merge.
+/// When a requested merge happens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeWhen {
+    /// Now: the checks are green already.
+    Now,
+    /// When the checks succeed (Forgejo's `merge_when_checks_succeed`). Forgejo
+    /// merges a scheduled MR on a later commit status event only, so this is
+    /// for checks that have not finished.
+    ChecksSucceed,
+}
+
+/// What the forge said to cancelling a scheduled merge (`DELETE
+/// .../pulls/{n}/merge`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CancelOutcome {
+    /// 204: a scheduled merge was cancelled.
+    Cancelled,
+    /// 404: nothing was scheduled.
+    NothingScheduled,
+    /// 403, 423: the user may not cancel it (another user's schedule, a
+    /// locked repo).
+    Refused(String),
+}
+
+/// The outcome of cancelling a scheduled merge from Forgejo's answer.
+pub fn cancel_outcome(code: u16, body: &str) -> Result<CancelOutcome> {
+    let message = serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|v| v.get("message")?.as_str().map(|m| m.trim().to_string()))
+        .filter(|m| !m.is_empty())
+        .unwrap_or_else(|| body.trim().to_string());
+    let why = if message.is_empty() {
+        format!("HTTP {code}")
+    } else {
+        format!("HTTP {code}: {message}")
+    };
+    Ok(match code {
+        200 | 204 => CancelOutcome::Cancelled,
+        404 => CancelOutcome::NothingScheduled,
+        401 => bail!(LOGIN_REJECTED),
+        403 | 423 => CancelOutcome::Refused(why),
+        _ => bail!("cancelling a scheduled merge: {why}"),
+    })
+}
+
+/// The forge writes of `swl land`: marking an MR ready, requesting its
+/// merge, and cancelling a scheduled merge.
 pub trait ForgeWriter {
     /// Sets the MR's title (a draft is marked ready by dropping `WIP:`).
     fn set_title(&self, repo: &str, number: u64, title: &str) -> Result<()>;
-    /// Requests a fast-forward merge of `head` when checks succeed, deleting
-    /// the branch after the merge.
-    fn request_merge(&self, repo: &str, number: u64, head: &str) -> Result<MergeOutcome>;
+    /// Requests a fast-forward merge of `head`, now or when checks succeed,
+    /// deleting the branch after the merge.
+    fn request_merge(
+        &self,
+        repo: &str,
+        number: u64,
+        head: &str,
+        when: MergeWhen,
+    ) -> Result<MergeOutcome>;
+    /// Cancels the MR's scheduled merge, if any.
+    fn cancel_scheduled_merge(&self, repo: &str, number: u64) -> Result<CancelOutcome>;
 }
 
 /// The title without a draft prefix (Forgejo's `WIP:` and `[WIP]`).
@@ -633,38 +686,59 @@ impl FjWriter {
         }
     }
 
-    fn send(&self, method: &str, path: &str, body: &Value) -> Result<(u16, String)> {
+    fn send(&self, method: &str, path: &str, body: Option<&Value>) -> Result<(u16, String)> {
         http(&Request {
             method,
             url: &format!("{}/{path}", self.base.trim_end_matches('/')),
             token: Some(&self.token),
             accept: "application/json",
-            body: Some(&body.to_string()),
+            body: body.map(Value::to_string).as_deref(),
             what: "forge API",
         })
     }
 }
 
+/// The body of a merge request: fast-forward only, at `head`, deleting the
+/// branch; with `merge_when_checks_succeed` for [`MergeWhen::ChecksSucceed`].
+pub fn merge_request_body(head: &str, when: MergeWhen) -> Value {
+    let mut body = serde_json::json!({
+        "Do": "fast-forward-only",
+        "delete_branch_after_merge": true,
+        "head_commit_id": head,
+    });
+    if when == MergeWhen::ChecksSucceed {
+        body["merge_when_checks_succeed"] = true.into();
+    }
+    body
+}
+
 impl ForgeWriter for FjWriter {
     fn set_title(&self, repo: &str, number: u64, title: &str) -> Result<()> {
         let path = format!("repos/{}/pulls/{number}", slug(repo));
-        match self.send("PATCH", &path, &serde_json::json!({ "title": title }))? {
+        match self.send("PATCH", &path, Some(&serde_json::json!({ "title": title })))? {
             (200 | 201, _) => Ok(()),
             (401, _) => bail!(LOGIN_REJECTED),
             (code, body) => bail!("PATCH {path}: HTTP {code}: {}", body.trim()),
         }
     }
 
-    fn request_merge(&self, repo: &str, number: u64, head: &str) -> Result<MergeOutcome> {
+    fn request_merge(
+        &self,
+        repo: &str,
+        number: u64,
+        head: &str,
+        when: MergeWhen,
+    ) -> Result<MergeOutcome> {
         let path = format!("repos/{}/pulls/{number}/merge", slug(repo));
-        let body = serde_json::json!({
-            "Do": "fast-forward-only",
-            "merge_when_checks_succeed": true,
-            "delete_branch_after_merge": true,
-            "head_commit_id": head,
-        });
-        let (code, text) = self.send("POST", &path, &body)?;
+        let body = merge_request_body(head, when);
+        let (code, text) = self.send("POST", &path, Some(&body))?;
         merge_outcome(code, &text).with_context(|| format!("POST {path}"))
+    }
+
+    fn cancel_scheduled_merge(&self, repo: &str, number: u64) -> Result<CancelOutcome> {
+        let path = format!("repos/{}/pulls/{number}/merge", slug(repo));
+        let (code, text) = self.send("DELETE", &path, None)?;
+        cancel_outcome(code, &text).with_context(|| format!("DELETE {path}"))
     }
 }
 
@@ -926,6 +1000,37 @@ mod tests {
             LOGIN_REJECTED
         );
         assert!(merge_outcome(500, "boom").is_err());
+    }
+
+    #[test]
+    fn cancel_answers() {
+        let o = |code, body| cancel_outcome(code, body).unwrap();
+        assert_eq!(o(204, ""), CancelOutcome::Cancelled);
+        assert_eq!(o(404, ""), CancelOutcome::NothingScheduled);
+        assert_eq!(
+            o(403, r#"{"message":"not the scheduler"}"#),
+            CancelOutcome::Refused("HTTP 403: not the scheduler".into())
+        );
+        assert!(matches!(o(423, ""), CancelOutcome::Refused(_)));
+        assert_eq!(
+            cancel_outcome(401, "").unwrap_err().to_string(),
+            LOGIN_REJECTED
+        );
+        assert!(cancel_outcome(500, "boom").is_err());
+    }
+
+    #[test]
+    fn merge_request_bodies() {
+        assert_eq!(
+            merge_request_body("abc", MergeWhen::Now),
+            serde_json::json!({"Do": "fast-forward-only", "delete_branch_after_merge": true,
+                               "head_commit_id": "abc"})
+        );
+        assert_eq!(
+            merge_request_body("abc", MergeWhen::ChecksSucceed),
+            serde_json::json!({"Do": "fast-forward-only", "delete_branch_after_merge": true,
+                               "head_commit_id": "abc", "merge_when_checks_succeed": true})
+        );
     }
 
     #[test]
