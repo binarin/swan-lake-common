@@ -191,6 +191,16 @@ fn flatten<'a>(node: &'a Node<'a>, lead: String, cont: &str, out: &mut Vec<Flat<
     }
 }
 
+/// `text` on one line of the row: its line breaks as `; `.
+fn one_line(text: impl std::fmt::Display) -> String {
+    text.to_string()
+        .lines()
+        .map(str::trim_end)
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 fn width(s: &str) -> usize {
     s.chars().count()
 }
@@ -224,7 +234,7 @@ pub fn lines(rows: &[Row]) -> Vec<String> {
         .min(NAME_WIDTH);
     let stage_w = flat
         .iter()
-        .map(|f| width(&f.node.row.verdict.stage.to_string()))
+        .map(|f| width(&one_line(&f.node.row.verdict.stage)))
         .max()
         .unwrap_or(0)
         .min(STAGE_WIDTH);
@@ -241,11 +251,12 @@ pub fn lines(rows: &[Row]) -> Vec<String> {
         let mood = mood(row);
         let color = mood_style(mood);
         let (plain_label, styled_label) = label(f.node);
-        let stage = v.stage.to_string();
+        let stage = one_line(&v.stage);
+        let next_text = one_line(&v.next);
         let waits = format!("waits: {}", v.waits);
         let next = match mood {
-            Mood::Owner => paint(OWNER, &v.next),
-            _ => v.next.clone(),
+            Mood::Owner => paint(OWNER, &next_text),
+            _ => next_text,
         };
         if f.gap {
             out.push(String::new());
@@ -263,8 +274,10 @@ pub fn lines(rows: &[Row]) -> Vec<String> {
             Some((c, p)) => vec![format!("details under {c}: {p}")],
             None => row.details.clone(),
         };
-        for d in details {
-            out.push(paint(DIM, format!("{}{d}", f.detail_lead)));
+        // A multi-line detail (git's stderr in an error) keeps the tree:
+        // each of its lines gets the glyphs.
+        for line in details.iter().flat_map(|d| d.lines()) {
+            out.push(paint(DIM, format!("{}{line}", f.detail_lead)));
         }
     }
     out
@@ -374,6 +387,32 @@ nixos-config                                  no change (HEAD is in origin/maste
         assert!(styled[1].starts_with(DIM.render().to_string().as_str()));
         assert!(styled[4].contains(&paint(GOOD, "landed")), "{styled:?}");
         assert!(styled[6].contains(&paint(BAD, "unknown (offline)")));
+    }
+
+    #[test]
+    fn multi_line_errors_keep_the_tree() {
+        let mut shared = row(
+            "a@a",
+            &[("c", "a")],
+            Stage::Unknown("fetching origin: ssh: offline\nfatal: no remote".into()),
+            "rerun swl status",
+            Waits::Nobody,
+        );
+        shared.details = vec!["input a  HEAD 1\nsecond line".into()];
+        let rows = [
+            shared,
+            row("c", &[], Stage::Pushed, "swl publish c", Waits::Anyone),
+        ];
+        assert_eq!(
+            plain(&lines(&rows)),
+            "\
+c          pushed                      waits: anyone  next: swl publish c
+│  c detail
+└─ a: a@a  unknown (fetching origin: ssh: offline; fatal: no remote)  waits: nobody  next: rerun swl status
+      input a  HEAD 1
+      second line
+"
+        );
     }
 
     #[test]
