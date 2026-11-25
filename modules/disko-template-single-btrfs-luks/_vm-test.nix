@@ -189,17 +189,30 @@ pkgs.testers.runNixOSTest {
             input=stdin, capture_output=True, text=True, timeout=60,
         )
 
-    with subtest("first boot: clevis fails, the passphrase over initrd SSH unlocks"):
+    with subtest("first boot: clevis fails, two wrong and then the right passphrase over initrd SSH"):
         tpm.start()
         machine.start()
         retry(lambda _: initrd_ssh("test -e /etc/initrd-release").returncode == 0, timeout_seconds=300)
         # The initrd has a shell and systemd, but no grep.
-        ask_pending = "for f in /run/systemd/ask-password/ask.*; do test -e \"$f\" && exit 0; done; exit 1"
-        retry(lambda _: initrd_ssh(ask_pending).returncode == 0, timeout_seconds=120)
+        def pending_asks():
+            result = initrd_ssh("for f in /run/systemd/ask-password/ask.*; do test -e \"$f\" && echo \"$f\"; done; true")
+            return set(result.stdout.split()) if result.returncode == 0 else set()
+
+        def answer(text):
+            result = initrd_ssh("systemd-tty-ask-password-agent --query", stdin=text + "\n", tty=True)
+            print(result.stdout, result.stderr)
+
+        retry(lambda _: pending_asks() != set(), timeout_seconds=120)
         result = initrd_ssh("systemctl is-failed cryptsetup-clevis-cryptroot.service")
         assert result.stdout.strip() == "failed", f"clevis did not fail: {result.stdout!r} {result.stderr!r}"
-        result = initrd_ssh("systemd-tty-ask-password-agent --query", stdin=passphrase + "\n", tty=True)
-        print(result.stdout, result.stderr)
+        result = initrd_ssh("cat /etc/crypttab")
+        assert "tries=0" in result.stdout, f"crypttab without tries=0: {result.stdout!r}"
+        # The clevis key file and two typos would use up the default 3 tries.
+        for attempt in range(2):
+            asks = pending_asks()
+            answer(f"wrong {attempt} " + passphrase)
+            retry(lambda _: (pending_asks() - asks) != set(), timeout_seconds=120)
+        answer(passphrase)
         machine.wait_for_unit("multi-user.target")
         machine.succeed("findmnt -n -o SOURCE / | grep -F '/dev/mapper/cryptroot[/root]'")
 

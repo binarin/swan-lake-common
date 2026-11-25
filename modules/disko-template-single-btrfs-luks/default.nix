@@ -18,6 +18,10 @@
   # for root on `initrdSsh.port`, which keeps its host key apart from the
   # system's port 22 in known_hosts. To unlock by hand:
   #   ssh -t -p 2222 root@HOST systemd-tty-ask-password-agent --query
+  # It asks as often as needed (tries=0). If the unlock is stuck anyway:
+  #   ssh -p 2222 root@HOST systemctl restart systemd-cryptsetup@cryptroot.service
+  # The passphrase stays what disko formatted with: changing it later takes
+  # `cryptsetup luksChangeKey` on the machine and a new JWE.
   #
   # TPM unlock stays off while `clevisSecretFile` is null: every boot asks for
   # the passphrase. Enrol from a workstation once the machine runs, with the
@@ -150,6 +154,10 @@
             };
           };
 
+          # systemd-cryptsetup allows 3 tries by default, and a failed clevis
+          # key file uses one up: typos over SSH must not end the boot.
+          boot.initrd.luks.devices.cryptroot.crypttabExtraOpts = [ "tries=0" ];
+
           boot.initrd.systemd.enable = true;
           # Only these settings: boot.initrd.network.enable would add the
           # stage 2 networking.* interfaces to the initrd.
@@ -228,7 +236,12 @@
             );
         mountpoints = lib.sort lib.lessThan (lib.attrNames config.fileSystems);
         luksDevices = lib.mapAttrs (_: d: {
-          inherit (d) device allowDiscards keyFile;
+          inherit (d)
+            device
+            allowDiscards
+            keyFile
+            crypttabExtraOpts
+            ;
         }) config.boot.initrd.luks.devices;
         grubDevices = config.boot.loader.grub.devices;
         diskDevice = config.disko.devices.disk.main.device;
@@ -306,6 +319,7 @@
             device = "/dev/disk/by-partlabel/disk-main-luks";
             allowDiscards = true;
             keyFile = if clevis then "/clevis-cryptroot/decrypted" else null;
+            crypttabExtraOpts = [ "tries=0" ];
           };
           grubDevices = [ device ];
           diskDevice = device;
@@ -356,14 +370,14 @@
 
       failures = lib.filterAttrs (_: c: c.actual != c.expected) cases;
 
+      failedAssertions = config: map (a: a.message) (lib.filter (a: !a.assertion) config.assertions);
+      baseFailedAssertions = failedAssertions (evalWith [ ]);
       # A host key in the store would be world-readable there.
-      storeHostKeyRejected =
-        let
-          config = evalWith [
-            { swanLake.encryptedRoot.initrdSsh.hostKey = "${pkgs.writeText "key" ""}"; }
-          ];
-        in
-        lib.any (a: !a.assertion) config.assertions;
+      storeHostKeyRejected = lib.any (lib.hasInfix "initrdSsh.hostKey must be") (
+        failedAssertions (evalWith [
+          { swanLake.encryptedRoot.initrdSsh.hostKey = "${pkgs.writeText "key" ""}"; }
+        ])
+      );
     in
     {
       checks.disko-template-single-btrfs-luks =
@@ -371,6 +385,9 @@
           disko-template-single-btrfs-luks: unexpected evaluation result
           ${builtins.toJSON failures}
         '';
+        assert lib.assertMsg (
+          baseFailedAssertions == [ ]
+        ) "disko-template-single-btrfs-luks: failing assertions: ${builtins.toJSON baseFailedAssertions}";
         assert lib.assertMsg storeHostKeyRejected
           "disko-template-single-btrfs-luks: a host key in the store is not rejected";
         pkgs.writeText "disko-template-single-btrfs-luks-check.json" (
