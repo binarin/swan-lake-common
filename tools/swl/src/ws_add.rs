@@ -34,6 +34,10 @@ impl Fetcher {
         }
     }
 
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
     /// `git fetch <remote>` in the repository at `dir`, unless fetching is
     /// off or that repository and remote were fetched already.
     pub fn fetch(&self, dir: &Path, remote: &str) -> Result<()> {
@@ -77,6 +81,8 @@ pub enum Start<'a> {
     /// On this branch: the local one, else one created from the remote's,
     /// else one created at the base.
     Branch(&'a str),
+    /// Detached at this revision.
+    Detached(&'a str),
 }
 
 fn rev(dir: &Path, refname: &str) -> Option<String> {
@@ -183,6 +189,13 @@ pub fn add(
                 &["worktree", "add", "--quiet", "--detach", &dest_str, base],
             )?;
             format!("detached at {base}")
+        }
+        Start::Detached(at) => {
+            git(
+                source,
+                &["worktree", "add", "--quiet", "--detach", &dest_str, at],
+            )?;
+            format!("detached at {}", &at[..at.len().min(12)])
         }
         Start::Branch(b) if rev(source, &format!("refs/heads/{b}")).is_some() => {
             let how = existing_branch(source, remote.as_deref(), b)?;

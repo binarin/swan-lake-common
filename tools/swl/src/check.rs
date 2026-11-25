@@ -354,7 +354,9 @@ mod tests {
             number: 24,
             state,
             head_sha: "abc".into(),
+            head_ref: "b".into(),
             title: String::new(),
+            draft: false,
         }))
     }
 

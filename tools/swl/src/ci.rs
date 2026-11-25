@@ -157,7 +157,9 @@ mod tests {
                 number,
                 state,
                 head_sha: format!("head{number}"),
+                head_ref: String::new(),
                 title: String::new(),
+                draft: false,
             }))
         }
     }

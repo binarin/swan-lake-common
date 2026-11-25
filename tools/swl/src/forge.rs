@@ -1,9 +1,12 @@
-//! The forge (Forgejo): MR state through the anonymous REST API, and MR
-//! creation through the `fj` CLI, which holds the owner's login. swl itself
-//! has no token configuration.
+//! The forge (Forgejo): MR state and commit status through the REST API,
+//! anonymously or, for `status` and `start`, read-only with the login of the
+//! `fj` CLI; and MR creation through `fj`. swl itself has no token
+//! configuration.
 
 use std::{
     env,
+    io::Write,
+    path::PathBuf,
     process::{Command, Stdio},
 };
 
@@ -60,7 +63,12 @@ pub struct PrInfo {
     pub number: u64,
     pub state: PrState,
     pub head_sha: String,
+    /// The head branch while the MR is open; `refs/pull/N/head` once its
+    /// branch is gone.
+    pub head_ref: String,
     pub title: String,
+    /// A draft: `draft` in the API, or a `WIP:` title.
+    pub draft: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,13 +113,18 @@ impl PrInfo {
             (Some("closed"), false) => PrState::ClosedUnmerged,
             (other, _) => bail!("MR {number} has an unknown state {other:?}"),
         };
+        let title = s("/title").unwrap_or_default().to_string();
+        let draft = v.get("draft").and_then(Value::as_bool).unwrap_or(false)
+            || title.to_ascii_uppercase().starts_with("WIP:");
         Ok(Self {
             number,
             state,
             head_sha: s("/head/sha")
                 .ok_or_else(|| anyhow!("MR {number} has no head sha"))?
                 .to_string(),
-            title: s("/title").unwrap_or_default().to_string(),
+            head_ref: s("/head/ref").unwrap_or_default().to_string(),
+            title,
+            draft,
         })
     }
 }
@@ -120,71 +133,215 @@ impl PrInfo {
 /// private repo too.
 pub const NOT_FOUND: &str = "no such MR (or the repo is not public)";
 
-/// Reads MR state. `Ok(None)` is an MR that does not exist; an error is a
-/// forge that could not be asked.
+/// Reads MR state. `Ok(None)` is a 404: no such MR, or a repo this reader may not see; an error is a forge that
+/// could not be asked.
 pub trait PrReader {
     fn pr(&self, repo: &str, number: u64) -> Result<Option<PrInfo>>;
+    /// What a 404 means for this reader.
+    fn not_found(&self) -> &'static str {
+        NOT_FOUND
+    }
+}
+
+/// `(HTTP status, body)` of a GET of `<base>/<path>` through curl, or an
+/// error when the forge is unreachable. A token goes to curl on stdin, never
+/// on its command line.
+fn api_get(base: &str, path: &str, token: Option<&str>) -> Result<(u16, String)> {
+    let url = format!("{}/{path}", base.trim_end_matches('/'));
+    let mut cmd = Command::new(CURL);
+    cmd.args([
+        "--silent",
+        "--show-error",
+        "--location",
+        "--max-time",
+        "30",
+        "--header",
+        "Accept: application/json",
+        "--write-out",
+        "\n%{http_code}",
+    ]);
+    if token.is_some() {
+        cmd.args(["--config", "-"]);
+    }
+    let mut child = cmd
+        .arg(&url)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("running {CURL}"))?;
+    let mut stdin = child.stdin.take().expect("piped");
+    if let Some(token) = token {
+        let token = token.replace('\\', "\\\\").replace('"', "\\\"");
+        writeln!(stdin, "header = \"Authorization: token {token}\"")
+            .context("passing the token to curl")?;
+    }
+    drop(stdin);
+    let out = child
+        .wait_with_output()
+        .with_context(|| format!("running {CURL}"))?;
+    if !out.status.success() {
+        bail!(
+            "forge API unreachable: GET {url}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let (body, code) = text.rsplit_once('\n').unwrap_or(("", &text));
+    let code = code
+        .trim()
+        .parse()
+        .with_context(|| format!("GET {url}: no HTTP status"))?;
+    Ok((code, body.to_string()))
+}
+
+/// An MR through [`api_get`]; `hint` explains other HTTP statuses.
+fn read_pr(
+    base: &str,
+    token: Option<&str>,
+    repo: &str,
+    number: u64,
+    hint: &str,
+) -> Result<Option<PrInfo>> {
+    let path = format!("repos/{}/pulls/{number}", slug(repo));
+    match api_get(base, &path, token)? {
+        (200, body) => {
+            let v: Value =
+                serde_json::from_str(&body).with_context(|| format!("GET {path}: not JSON"))?;
+            PrInfo::from_api(&v).map(Some)
+        }
+        (404, _) => Ok(None),
+        (code, _) => bail!("GET {path}: HTTP {code} ({hint})"),
+    }
 }
 
 /// The anonymous Forgejo API, through curl. The manifest repos must be
 /// public for this to work.
 pub struct AnonApi {
     pub base: String,
+    /// What a 404 means, see [`PrReader::not_found`].
+    pub not_found: &'static str,
 }
 
 impl AnonApi {
     pub fn from_env() -> Self {
-        Self { base: api_base() }
+        Self {
+            base: api_base(),
+            not_found: NOT_FOUND,
+        }
     }
 
-    /// `(HTTP status, body)` of a GET, or an error when the forge is
-    /// unreachable.
-    fn get(&self, path: &str) -> Result<(u16, String)> {
-        let url = format!("{}/{path}", self.base.trim_end_matches('/'));
-        let out = Command::new(CURL)
-            .args([
-                "--silent",
-                "--show-error",
-                "--location",
-                "--max-time",
-                "30",
-                "--header",
-                "Accept: application/json",
-                "--write-out",
-                "\n%{http_code}",
-                &url,
-            ])
-            .stdin(Stdio::null())
-            .output()
-            .with_context(|| format!("running {CURL}"))?;
-        if !out.status.success() {
-            bail!(
-                "forge API unreachable: GET {url}: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
+    /// For `status` and `start`, which would have used a login.
+    pub fn without_login() -> Self {
+        Self {
+            not_found: NOT_FOUND_WITHOUT_LOGIN,
+            ..Self::from_env()
         }
-        let text = String::from_utf8_lossy(&out.stdout);
-        let (body, code) = text.rsplit_once('\n').unwrap_or(("", &text));
-        let code = code
-            .trim()
-            .parse()
-            .with_context(|| format!("GET {url}: no HTTP status"))?;
-        Ok((code, body.to_string()))
     }
 }
 
+const ANON_HINT: &str = "the repo must be public; see the swl README";
+
 impl PrReader for AnonApi {
     fn pr(&self, repo: &str, number: u64) -> Result<Option<PrInfo>> {
-        let path = format!("repos/{}/pulls/{number}", slug(repo));
-        let (code, body) = self.get(&path)?;
-        match code {
-            200 => {
-                let v: Value =
-                    serde_json::from_str(&body).with_context(|| format!("GET {path}: not JSON"))?;
-                PrInfo::from_api(&v).map(Some)
-            }
-            404 => Ok(None),
-            _ => bail!("GET {path}: HTTP {code} (the repo must be public; see the swl README)"),
+        read_pr(&self.base, None, repo, number, ANON_HINT)
+    }
+
+    fn not_found(&self) -> &'static str {
+        self.not_found
+    }
+}
+
+/// Overrides the path of fj's `keys.json`, e.g. for tests.
+pub const FJ_KEYS_ENV: &str = "SWL_FJ_KEYS";
+
+/// fj's logins: `$SWL_FJ_KEYS`, else `$XDG_DATA_HOME/forgejo-cli/keys.json`
+/// (`~/.local/share/forgejo-cli/keys.json`).
+pub fn fj_keys_path() -> Option<PathBuf> {
+    let var = |k: &str| env::var_os(k).filter(|v| !v.is_empty()).map(PathBuf::from);
+    if let Some(p) = var(FJ_KEYS_ENV) {
+        return Some(p);
+    }
+    let data = var("XDG_DATA_HOME").or_else(|| var("HOME").map(|h| h.join(".local/share")))?;
+    Some(data.join("forgejo-cli/keys.json"))
+}
+
+/// The token of fj's login to the forge host in a `keys.json`, if any.
+pub fn fj_token(keys_json: &str) -> Result<Option<String>> {
+    let v: Value = serde_json::from_str(keys_json).context("fj's keys.json is not JSON")?;
+    Ok(v.pointer(&format!("/hosts/{FORGE_HOST}/token"))
+        .and_then(Value::as_str)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string))
+}
+
+/// Whether the API base may receive the token: the forge itself, or a test
+/// server on the loopback interface.
+pub fn token_allowed(base: &str) -> bool {
+    let rest = base
+        .strip_prefix("https://")
+        .or_else(|| base.strip_prefix("http://"))
+        .unwrap_or("");
+    let authority = rest.split('/').next().unwrap_or("");
+    let host = authority.rsplit_once(':').map_or(authority, |(h, _)| h);
+    (base.starts_with("https://") && host == FORGE_HOST)
+        || matches!(host, "127.0.0.1" | "localhost")
+}
+
+/// The Forgejo API with fj's login, for reads only: MR state and commit
+/// status of private repos too. The token never reaches a command line or
+/// the output.
+pub struct AuthApi {
+    base: String,
+    token: String,
+}
+
+const AUTH_HINT: &str = "is the fj login still valid? `fj auth login`";
+
+impl AuthApi {
+    /// fj's login to the forge host, or `None` without one.
+    pub fn from_fj_login() -> Result<Option<Self>> {
+        let Some(path) = fj_keys_path() else {
+            return Ok(None);
+        };
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        };
+        let base = api_base();
+        let token = fj_token(&text).with_context(|| path.display().to_string())?;
+        match token {
+            Some(token) if token_allowed(&base) => Ok(Some(Self { base, token })),
+            Some(_) => bail!("not sending fj's token to {base}, which is not the forge"),
+            None => Ok(None),
+        }
+    }
+}
+
+impl PrReader for AuthApi {
+    fn pr(&self, repo: &str, number: u64) -> Result<Option<PrInfo>> {
+        read_pr(&self.base, Some(&self.token), repo, number, AUTH_HINT)
+    }
+
+    fn not_found(&self) -> &'static str {
+        "no such MR"
+    }
+}
+
+/// What a 404 from the anonymous reader means to `status` and `start`.
+pub const NOT_FOUND_WITHOUT_LOGIN: &str =
+    "not readable anonymously, and no fj login: no such MR, or the repo is private";
+
+/// The reader for `status` and `start`: fj's login when there is one, else
+/// the anonymous API. A login that cannot be used is a warning.
+pub fn interactive_reader() -> Box<dyn PrReader> {
+    match AuthApi::from_fj_login() {
+        Ok(Some(api)) => Box::new(api),
+        Ok(None) => Box::new(AnonApi::without_login()),
+        Err(e) => {
+            eprintln!("swl: warning: not using fj's login: {e:#}");
+            Box::new(AnonApi::without_login())
         }
     }
 }
@@ -317,6 +474,42 @@ mod tests {
         );
         assert!(api(r#"{"number":2,"state":"weird","merged":false,"head":{"sha":"a"}}"#).is_err());
         assert!(api(r#"{"state":"open"}"#).is_err());
+    }
+
+    #[test]
+    fn api_head_ref_and_draft() {
+        let open = api(r#"{"number":24,"state":"open","merged":false,"title":"t","draft":false,"head":{"sha":"abc","ref":"sl-1-x"}}"#).unwrap();
+        assert_eq!(open.head_ref, "sl-1-x");
+        assert!(!open.draft);
+        let wip = api(r#"{"number":24,"state":"open","merged":false,"title":"WIP: t","head":{"sha":"abc","ref":"b"}}"#).unwrap();
+        assert!(wip.draft);
+        let draft = api(r#"{"number":24,"state":"open","merged":false,"title":"t","draft":true,"head":{"sha":"abc","ref":"b"}}"#).unwrap();
+        assert!(draft.draft);
+    }
+
+    #[test]
+    fn fj_login_token() {
+        let keys = r#"{"hosts":{"forgejo.lynx-lizard.ts.net":{"type":"Application","name":"u","token":"t0k"}},"aliases":{},"default_ssh":[]}"#;
+        assert_eq!(fj_token(keys).unwrap().as_deref(), Some("t0k"));
+        assert_eq!(
+            fj_token(r#"{"hosts":{"codeberg.org":{"token":"x"}}}"#).unwrap(),
+            None
+        );
+        assert_eq!(fj_token(r#"{"hosts":{}}"#).unwrap(), None);
+        assert!(fj_token("not json").is_err());
+    }
+
+    #[test]
+    fn the_token_goes_only_to_the_forge_or_a_local_test_server() {
+        assert!(token_allowed("https://forgejo.lynx-lizard.ts.net/api/v1"));
+        assert!(token_allowed("http://127.0.0.1:4711/api/v1"));
+        assert!(token_allowed("http://localhost/api/v1"));
+        assert!(!token_allowed("http://forgejo.lynx-lizard.ts.net/api/v1"));
+        assert!(!token_allowed("https://example.org/api/v1"));
+        assert!(!token_allowed(
+            "https://forgejo.lynx-lizard.ts.net.example.org/api/v1"
+        ));
+        assert!(!token_allowed("https://127.0.0.1@example.org/api/v1"));
     }
 
     #[test]

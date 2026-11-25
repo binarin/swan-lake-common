@@ -30,6 +30,8 @@ skipped. Each input name can be overridden by only one checkout per workspace.
 ## Commands
 
 ```sh
+swl start SL-0060-foo swan-lake swan-lake-common@common   # a workspace for one change
+swl start --from swan-lake#12             # join a published consumer MR
 swl ws add swan-lake                      # fetch, worktree detached at the base, then env
 swl ws add swan-lake-common@common --branch sl-0036-x
 swl env                                   # .envrc.local per consumer, and the wrappers
@@ -42,7 +44,32 @@ swl finalize [--wait]                     # landed entries -> one lock commit
 ```
 
 `ws add`, `env` and `status` use the current directory as the workspace unless
-`--workspace DIR` is given. The global `--config FILE` selects the repos config.
+`--workspace DIR` is given; `start` creates one below it. The global
+`--config FILE` selects the repos config.
+
+- `start NAME CHECKOUT... [--workspace DIR] [--branch B] [--no-fetch]` sets up
+  the workspace for one change: `DIR` (default `./NAME`) with each checkout
+  (at least one consumer, plus `<repo>@<input>` shared checkouts) on branch
+  `B` (default `NAME` lower-cased: workspace `SL-0060-foo`, branches
+  `sl-0060-foo`), added as `ws add --branch B` does, fetching each source
+  once. Then `env` once, and `direnv allow` for each consumer with an
+  `.envrc` when `direnv` is on PATH (else a note to run it). It ends with the
+  checkouts and a `cd` hint. Rerunnable: an existing checkout directory is
+  kept, and reported when it is on another branch (never changed); missing
+  ones are added. An interrupted `start` is finished by rerunning it.
+- `start --from CONSUMER#MR [--workspace DIR] [--no-fetch]` joins a
+  published change, for example on another machine. With git (consumer repos
+  are private), it reads `refs/pull/MR/head` from the consumer source's
+  remote and the one branch at that head; with none (the MR was merged and
+  its branch deleted, or the branch moved on) or several, it refuses. It
+  fetches that head and reads its `swl.toml`. The workspace is `DIR`
+  (default `./<consumer branch>`): the consumer on its branch, tracking the
+  remote's, and for each entry `[inputs.<path>] repo, mr` the checkout
+  `<repo>@<last segment of path>` (`common/zwanenzang` gives
+  `zwanenzang@zwanenzang`): on an open MR's head branch, or detached at a
+  merged MR's merge commit. A closed or unknown MR is an error, before
+  anything is added. Then `env` and `direnv allow` as above; rerunnable
+  likewise.
 
 - `ws add NAME [--branch B] [--no-fetch] [--no-env]` runs `git worktree add`
   in the repo's configured source, which can be a bare repository or a main
@@ -399,6 +426,15 @@ it fails the MR's `swl check`. Rerun `finalize` once the rest has landed,
 then push to master; `swl publish` refuses to push it.
 
 ### Forge access
+
+`start --from` reads MR state with the login of `fj`: the token for
+`forgejo.lynx-lizard.ts.net` in fj's `keys.json`
+(`$XDG_DATA_HOME/forgejo-cli/keys.json`, default
+`~/.local/share/forgejo-cli/keys.json`; `SWL_FJ_KEYS` overrides the path).
+That covers private repos. It only reads: the token goes to curl on stdin,
+never on a command line or into the output, and only to the forge (or a
+loopback test server). Without a login it reads anonymously. swl has no
+token configuration of its own.
 
 `check`, `ci env` and `finalize` read MR state anonymously
 (`GET /api/v1/repos/binarin/<repo>/pulls/<n>`, through curl) and CI fetches

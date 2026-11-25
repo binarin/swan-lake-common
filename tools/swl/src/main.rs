@@ -14,6 +14,7 @@ mod nix_args;
 mod pin_policy;
 mod publish;
 mod shim;
+mod start;
 mod status;
 mod tempdir;
 mod workspace;
@@ -52,6 +53,31 @@ enum Commands {
     Ws {
         #[command(subcommand)]
         command: WsCommands,
+    },
+    // In `about`, not a doc comment, so that rustdoc does not read the
+    // placeholders as HTML tags.
+    #[command(
+        about = "Create or finish a workspace for one change: <name> <consumer>... <repo>@<input>..., or --from <consumer>#<MR>"
+    )]
+    Start {
+        /// Workspace name, e.g. SL-0060-foo; the branch is its lower-case form
+        #[arg(required_unless_present = "from", conflicts_with = "from")]
+        name: Option<String>,
+        /// Checkouts: at least one consumer, and <repo>@<input> shared checkouts
+        #[arg(conflicts_with = "from")]
+        checkouts: Vec<String>,
+        /// Join a published consumer MR, e.g. swan-lake#12, with the shared MRs its swl.toml names
+        #[arg(long, value_name = "CONSUMER#MR")]
+        from: Option<String>,
+        /// Workspace directory [default: ./<name>, with --from ./<consumer branch>]
+        #[arg(long, value_name = "DIR")]
+        workspace: Option<PathBuf>,
+        /// Branch of every checkout [default: <name> lower-cased]
+        #[arg(long, conflicts_with = "from")]
+        branch: Option<String>,
+        /// Do not fetch the sources; use the refs they already have
+        #[arg(long)]
+        no_fetch: bool,
     },
     /// Write each consumer's .envrc.local and the workspace's nix, nh and deploy wrappers
     Env {
@@ -195,6 +221,40 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 &ws_add::Fetcher::new(!no_fetch),
                 swl.as_deref(),
             )?;
+        }
+        Commands::Start {
+            name,
+            checkouts,
+            from,
+            workspace,
+            branch,
+            no_fetch,
+        } => {
+            let config = Config::load(config_flag)?;
+            let cwd = std::env::current_dir().context("current directory")?;
+            let fetcher = ws_add::Fetcher::new(!no_fetch);
+            let swl = current_exe()?;
+            match from {
+                Some(from) => start::run_from(
+                    &config,
+                    &cwd,
+                    &from,
+                    workspace.as_deref(),
+                    &fetcher,
+                    forge::interactive_reader().as_ref(),
+                    &swl,
+                )?,
+                None => start::run_new(
+                    &config,
+                    &cwd,
+                    name.as_deref().expect("required by clap without --from"),
+                    &checkouts,
+                    workspace.as_deref(),
+                    branch.as_deref(),
+                    &fetcher,
+                    &swl,
+                )?,
+            }
         }
         Commands::Env { workspace, force } => {
             let config = Config::load(config_flag)?;
