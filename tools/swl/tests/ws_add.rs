@@ -117,6 +117,32 @@ fn ws_add_joins_a_published_branch_and_fast_forwards_a_stale_one() {
     );
     assert_eq!(f.git(&checkout, &["rev-parse", "HEAD"]), mine);
 
+    // A branch checked out in another worktree is refused; nothing is added.
+    let other = ws.join("swan-lake-common@other");
+    let out = f.swl(
+        &f.root,
+        &[
+            "ws",
+            "add",
+            "swan-lake-common@other",
+            "--workspace",
+            &ws_s,
+            "--branch",
+            "feature",
+            "--no-env",
+        ],
+    );
+    failed(
+        &out,
+        2,
+        &format!(
+            "branch feature is already checked out at {}",
+            checkout.display()
+        ),
+    );
+    assert!(!other.exists());
+    assert_eq!(f.git(&checkout, &["rev-parse", "HEAD"]), mine);
+
     // A branch that is nowhere yet starts at the base, without an upstream.
     let out = stdout(&f.swl(
         &f.root,

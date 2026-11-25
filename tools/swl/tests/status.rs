@@ -482,3 +482,29 @@ fn status_rows_are_unknown_when_the_forge_is_unreachable() {
     assert!(r.starts_with("swan-lake-common@lib  pushed  "), "{out}");
     assert!(r.contains("not readable anonymously"), "{out}");
 }
+
+#[test]
+fn a_plain_lock_bump_is_not_a_landing() {
+    let f = Forge::new("status-bump");
+    let work = f.root.join("work");
+    fs::create_dir_all(&work).unwrap();
+    stdout(&f.swl(&work, &["start", "SL-0012-bump", "swan-lake"]));
+    let consumer = work.join("SL-0012-bump/swan-lake");
+    // A bump of lib to a new `current`, without any swl.toml history.
+    f.commit_on_forge("swan-lake-common", "current", "c2");
+    stdout(&f.nix(&consumer, &["flake", "update", "lib"]));
+    f.git(&consumer, &["commit", "-qam", "lib: bump"]);
+    f.git(&consumer, &["push", "-q", "origin", "sl-0012-bump"]);
+    let head = f.git(&consumer, &["rev-parse", "HEAD"]);
+    f.git(
+        &f.forge_repo("swan-lake"),
+        &["update-ref", "refs/pull/4/head", &head],
+    );
+    f.api
+        .set_pr("swan-lake", 4, "open", "sl-0012-bump", &head, None);
+    let ws = work.join("SL-0012-bump").display().to_string();
+    let out = stdout(&f.swl(&f.root, &["status", "--workspace", &ws]));
+    let r = row(&out, "swan-lake");
+    assert!(!r.contains("landing pushed"), "{out}");
+    assert!(r.starts_with("swan-lake  CI pending"), "{out}");
+}
