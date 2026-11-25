@@ -1264,6 +1264,20 @@ pub fn run(
     reader: &dyn PrReader,
     fetcher: &Fetcher,
 ) -> Result<()> {
+    for r in &collect(ws, config, reader, fetcher)? {
+        r.print();
+    }
+    Ok(())
+}
+
+/// The rows of a workspace: shared checkouts, entries without one, then
+/// consumers.
+pub fn collect(
+    ws: &Workspace,
+    config: &Config,
+    reader: &dyn PrReader,
+    fetcher: &Fetcher,
+) -> Result<Vec<Row>> {
     let ctx = Ctx {
         config,
         reader,
@@ -1316,10 +1330,7 @@ pub fn run(
     for (which, consumers) in &named {
         finish_landed_entry(&mut rows, which, consumers);
     }
-    for r in &rows {
-        r.print();
-    }
-    Ok(())
+    Ok(rows)
 }
 
 /// `swl status --from <consumer>#<MR>`: the published change, without a
@@ -1331,6 +1342,19 @@ pub fn run_from(
     reader: &dyn PrReader,
     fetcher: &Fetcher,
 ) -> Result<()> {
+    for r in &collect_from(config, from, reader, fetcher)? {
+        r.print();
+    }
+    Ok(())
+}
+
+/// The rows of a published consumer MR: one per entry, then the consumer.
+pub fn collect_from(
+    config: &Config,
+    from: &str,
+    reader: &dyn PrReader,
+    fetcher: &Fetcher,
+) -> Result<Vec<Row>> {
     let ctx = Ctx {
         config,
         reader,
@@ -1476,10 +1500,7 @@ pub fn run_from(
     for which in &entries {
         finish_landed_entry(&mut rows, which, &[consumer.as_str()]);
     }
-    for r in &rows {
-        r.print();
-    }
-    Ok(())
+    Ok(rows)
 }
 
 #[cfg(test)]
