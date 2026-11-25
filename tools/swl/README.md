@@ -55,7 +55,9 @@ prefix bold, errors red, warnings yellow, what waits for the owner magenta,
 what is done green, and `status` (see [Status](#status)). `auto`, the
 default, colours a terminal only, never with `NO_COLOR` set, and always with
 `CLICOLOR_FORCE` set (and no `NO_COLOR`). Without colour the text is the same
-as with it, escape codes aside.
+as with it, escape codes aside. `--color` does not reach the output of the
+argument parser itself (`--help`, usage errors), which colours itself on a
+terminal.
 
 - `start NAME CHECKOUT... [--workspace DIR] [--branch B] [--no-fetch]` sets up
   the workspace for one change: `DIR` (default `./NAME`) with each checkout

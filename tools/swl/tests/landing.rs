@@ -345,6 +345,10 @@ impl World {
             "SWL_FORGE_API",
             "SWL_FORGE_GIT",
             "SWL_GITHUB_TOKEN",
+            "SWL_LOG",
+            "NO_COLOR",
+            "CLICOLOR",
+            "CLICOLOR_FORCE",
         ] {
             c.env_remove(var);
         }

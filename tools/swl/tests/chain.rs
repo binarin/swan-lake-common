@@ -147,8 +147,12 @@ impl Chain {
             .env("GIT_COMMITTER_NAME", "swl test")
             .env("GIT_COMMITTER_EMAIL", "swl@example.org")
             .env("SWL_CONFIG", self.root.join("repos.toml"))
-            .env("SWL_SHIM_LOG", &self.log)
-            .env_remove("SWL_LOG");
+            .env("SWL_SHIM_LOG", &self.log);
+        // The text checks need swl's plain output, whatever the caller's
+        // environment.
+        for var in ["SWL_LOG", "NO_COLOR", "CLICOLOR", "CLICOLOR_FORCE"] {
+            c.env_remove(var);
+        }
     }
 
     fn git(&self, dir: &Path, args: &[&str]) -> String {
