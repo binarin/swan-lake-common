@@ -1098,10 +1098,11 @@ fn consumer_row(ctx: &Ctx, hops: &[Hop], ws: &Workspace, rows: &[Row], c: &Check
         };
         let local_lock_change =
             state == RemoteBranch::Behind && lock_changed(&c.dir, &head, &base)?;
-        let mr = match (&remote, &topic) {
-            (Some(r), Some(_)) => {
-                ctx.consumer_mr(&c.dir, r, &c.name, remote_head.as_deref().unwrap_or(&head))
-            }
+        // The MR at the remote branch head. Not for a head already in the
+        // base: that is landed by git alone, and an older merged MR can have
+        // the same head (a new branch at master).
+        let mr = match (&remote, &remote_head) {
+            (Some(r), Some(rh)) if !remote_in_base => ctx.consumer_mr(&c.dir, r, &c.name, rh),
             _ => MrFacts::None,
         };
         if let (Some(r), Some(b), Some(rh)) = (&remote, &topic, &remote_head)

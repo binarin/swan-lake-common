@@ -145,7 +145,7 @@ The stages, in order:
 | `local` | its branch is not on the remote (or detached with commits not in the base) | likewise |
 | `needs publish` | the remote branch is behind HEAD, or no consumer's `swl.toml` names an MR for it, or a consumer that overrides it has no entry, or the MR was closed | the branch has unpushed commits, or an overridden input's checkout differs from the lock without an entry |
 | `pushed` | pushed, but the MR cannot be read | pushed, no MR yet (or it cannot be read) |
-| `MR open`, `MR open (draft)` | the `swl.toml` entry's MR is open; a draft has a `WIP:` title or `draft` set | the MR whose `refs/pull/N/head` is the branch head |
+| `MR open`, `MR open (draft)` | the `swl.toml` entry's MR is open; a draft has a `WIP:` title or `draft` set | the MR whose `refs/pull/N/head` is the remote branch head (not looked up once that head is in the base) |
 | `CI pending`, `CI failing`, `CI green` | the combined commit status of the MR head | likewise |
 | `merged` | the MR is merged (its merge commit) | |
 | `promoted` | the merge commit is in the declared branch on the forge (`swan-lake-current` for common; an input without a ref is promoted when merged) | |

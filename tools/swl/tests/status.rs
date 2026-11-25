@@ -321,6 +321,10 @@ fn status_follows_a_change_from_local_to_landed() {
     );
     let out = t.status(false);
     assert_row(&out, consumer, "landing pushed", "request merge", "owner");
+    // --no-fetch looks up no consumer MR.
+    let ws = t.ws.display().to_string();
+    let out = stdout(&t.f.swl(&t.f.root, &["status", "--workspace", &ws, "--no-fetch"]));
+    assert!(out.contains("--no-fetch: the MR is not looked up"), "{out}");
 
     // Landed: merged on the forge. Without a login, from git alone.
     t.f.git(
@@ -339,11 +343,6 @@ fn status_follows_a_change_from_local_to_landed() {
     assert_row(&t.status(false), consumer, "landed", "-", "nobody");
     let out = t.status_from("swan-lake#2");
     assert_row(&out, consumer, "landed", "-", "nobody");
-
-    // --no-fetch reads no forge refs and looks up no consumer MR.
-    let ws = t.ws.display().to_string();
-    let out = stdout(&t.f.swl(&t.f.root, &["status", "--workspace", &ws, "--no-fetch"]));
-    assert!(out.contains("--no-fetch: the MR is not looked up"), "{out}");
 }
 
 #[test]
