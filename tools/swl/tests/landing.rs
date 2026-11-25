@@ -105,6 +105,8 @@ esac
 struct FakeApi {
     port: u16,
     responses: Arc<Mutex<BTreeMap<String, String>>>,
+    /// The paths of requests that carried an Authorization header.
+    authed: Arc<Mutex<Vec<String>>>,
 }
 
 impl FakeApi {
@@ -114,20 +116,25 @@ impl FakeApi {
             port: listener.local_addr().unwrap().port(),
             ..Default::default()
         };
-        let responses = api.responses.clone();
+        let (responses, authed) = (api.responses.clone(), api.authed.clone());
         thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { continue };
                 let mut reader = BufReader::new(stream.try_clone().unwrap());
                 let mut request = String::new();
                 reader.read_line(&mut request).ok();
+                let mut auth = false;
                 loop {
                     let mut line = String::new();
                     if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
                         break;
                     }
+                    auth |= line.to_ascii_lowercase().starts_with("authorization:");
                 }
                 let path = request.split_whitespace().nth(1).unwrap_or("").to_string();
+                if auth {
+                    authed.lock().unwrap().push(path.clone());
+                }
                 let found = responses.lock().unwrap().get(&path).cloned();
                 let (status, body) = match found {
                     Some(b) => ("200 OK", b),
@@ -235,6 +242,11 @@ impl World {
             root,
         };
         fs::create_dir_all(&w.fj_state).unwrap();
+        fs::write(
+            w.root.join("fj-keys.json"),
+            r#"{"hosts":{"forgejo.lynx-lizard.ts.net":{"type":"Application","name":"u","token":"secret"}}}"#,
+        )
+        .unwrap();
         let fakebin = w.root.join("fakebin");
         fs::create_dir_all(&fakebin).unwrap();
         fs::write(fakebin.join("fj"), FAKE_FJ).unwrap();
@@ -346,6 +358,8 @@ impl World {
             .env("GIT_COMMITTER_NAME", "swl test")
             .env("GIT_COMMITTER_EMAIL", "swl@example.org")
             .env("SWL_CONFIG", self.root.join("repos.toml"))
+            // An fj login, which check, ci env and finalize must not use.
+            .env("SWL_FJ_KEYS", self.root.join("fj-keys.json"))
             .env("FJ_STATE", &self.fj_state)
             .env("SWL_FORGE_API", self.api.base())
             .env("SWL_FORGE_GIT", format!("file://{}", self.forge.display()));
@@ -410,6 +424,11 @@ impl World {
 
 impl Drop for World {
     fn drop(&mut self) {
+        // check, ci env and finalize read anonymously, also with an fj login.
+        if !thread::panicking() {
+            let authed = self.api.authed.lock().unwrap().clone();
+            assert!(authed.is_empty(), "requests with a token: {authed:?}");
+        }
         let _ = fs::remove_dir_all(&self.root);
     }
 }

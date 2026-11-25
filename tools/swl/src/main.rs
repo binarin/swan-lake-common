@@ -247,7 +247,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     &from,
                     workspace.as_deref(),
                     &fetcher,
-                    forge::interactive_reader().as_ref(),
+                    &forge::ForgeReader::from_env(),
                     &swl,
                 )?,
                 None => start::run_new(
@@ -274,13 +274,13 @@ fn run(cli: Cli) -> Result<ExitCode> {
         } => {
             let config = Config::load(config_flag)?;
             let fetcher = ws_add::Fetcher::new(!no_fetch);
-            let reader = forge::interactive_reader();
+            let reader = forge::ForgeReader::from_env();
             match from {
-                Some(from) => status::run_from(&config, &from, reader.as_ref(), &fetcher)?,
+                Some(from) => status::run_from(&config, &from, &reader, &fetcher)?,
                 None => status::run(
                     &Workspace::scan(&workspace_dir(workspace)?)?,
                     &config,
-                    reader.as_ref(),
+                    &reader,
                     &fetcher,
                 )?,
             }

@@ -172,14 +172,13 @@ pub trait PrReader {
 
 /// `(HTTP status, body)` of a GET of `<base>/<path>` through curl, or an
 /// error when the forge is unreachable. A token goes to curl on stdin, never
-/// on its command line.
+/// on its command line, and a request with it follows no redirect.
 fn api_get(base: &str, path: &str, token: Option<&str>) -> Result<(u16, String)> {
     let url = format!("{}/{path}", base.trim_end_matches('/'));
     let mut cmd = Command::new(CURL);
     cmd.args([
         "--silent",
         "--show-error",
-        "--location",
         "--max-time",
         "30",
         "--header",
@@ -187,9 +186,10 @@ fn api_get(base: &str, path: &str, token: Option<&str>) -> Result<(u16, String)>
         "--write-out",
         "\n%{http_code}",
     ]);
-    if token.is_some() {
-        cmd.args(["--config", "-"]);
-    }
+    match token {
+        Some(_) => cmd.args(["--config", "-"]),
+        None => cmd.arg("--location"),
+    };
     let mut child = cmd
         .arg(&url)
         .stdin(Stdio::piped())
@@ -222,6 +222,17 @@ fn api_get(base: &str, path: &str, token: Option<&str>) -> Result<(u16, String)>
     Ok((code, body.to_string()))
 }
 
+/// What a 401 or 403 to a request with fj's token means.
+pub const LOGIN_REJECTED: &str = "fj login rejected: run fj auth login";
+
+/// The error for an HTTP status other than 200 and 404; `hint` explains it.
+fn http_error(path: &str, code: u16, token: Option<&str>, hint: &str) -> anyhow::Error {
+    match (token, code) {
+        (Some(_), 401 | 403) => anyhow!(LOGIN_REJECTED),
+        _ => anyhow!("GET {path}: HTTP {code} ({hint})"),
+    }
+}
+
 /// The reads over [`api_get`]; `hint` explains other HTTP statuses.
 fn read_pr(
     base: &str,
@@ -238,7 +249,7 @@ fn read_pr(
             PrInfo::from_api(&v).map(Some)
         }
         (404, _) => Ok(None),
-        (code, _) => bail!("GET {path}: HTTP {code} ({hint})"),
+        (code, _) => Err(http_error(&path, code, token, hint)),
     }
 }
 
@@ -257,7 +268,7 @@ fn read_commit_status(
             Ok(Some(CiState::from_api(&v)))
         }
         (404, _) => Ok(None),
-        (code, _) => bail!("GET {path}: HTTP {code} ({hint})"),
+        (code, _) => Err(http_error(&path, code, token, hint)),
     }
 }
 
@@ -265,24 +276,11 @@ fn read_commit_status(
 /// public for this to work.
 pub struct AnonApi {
     pub base: String,
-    /// What a 404 means, see [`PrReader::not_found`].
-    pub not_found: &'static str,
 }
 
 impl AnonApi {
     pub fn from_env() -> Self {
-        Self {
-            base: api_base(),
-            not_found: NOT_FOUND,
-        }
-    }
-
-    /// For `status` and `start`, which would have used a login.
-    pub fn without_login() -> Self {
-        Self {
-            not_found: NOT_FOUND_WITHOUT_LOGIN,
-            ..Self::from_env()
-        }
+        Self { base: api_base() }
     }
 }
 
@@ -295,10 +293,6 @@ impl PrReader for AnonApi {
 
     fn commit_status(&self, repo: &str, sha: &str) -> Result<Option<CiState>> {
         read_commit_status(&self.base, None, repo, sha, ANON_HINT)
-    }
-
-    fn not_found(&self) -> &'static str {
-        self.not_found
     }
 }
 
@@ -316,41 +310,141 @@ pub fn fj_keys_path() -> Option<PathBuf> {
     Some(data.join("forgejo-cli/keys.json"))
 }
 
-/// The token of fj's login to the forge host in a `keys.json`, if any.
-pub fn fj_token(keys_json: &str) -> Result<Option<String>> {
+/// fj's login to the forge host in a `keys.json`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum FjLogin {
+    None,
+    Token(String),
+    /// An OAuth login whose `expires_at` has passed.
+    Expired,
+}
+
+/// Days since 1970-01-01 of a proleptic Gregorian date.
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+/// Unix seconds of an `expires_at`: the `time` crate's default form
+/// `[year, ordinal, hour, minute, second, nanosecond, offset h, m, s]` that
+/// fj writes, Unix seconds, or RFC 3339. `None` for anything else.
+pub fn expiry_seconds(v: &Value) -> Option<i64> {
+    match v {
+        Value::Number(n) => n.as_i64(),
+        Value::Array(a) => {
+            let n: Vec<i64> = a.iter().map(Value::as_i64).collect::<Option<_>>()?;
+            let (year, ordinal, h, m, sec) =
+                (n.first()?, n.get(1)?, n.get(2)?, n.get(3)?, n.get(4)?);
+            let offset = n.get(6).unwrap_or(&0) * 3600
+                + n.get(7).unwrap_or(&0) * 60
+                + n.get(8).unwrap_or(&0);
+            let days = days_from_civil(*year, 1, 1) + ordinal - 1;
+            Some(days * 86400 + h * 3600 + m * 60 + sec - offset)
+        }
+        Value::String(s) => {
+            let num = |r: std::ops::Range<usize>| s.get(r)?.parse::<i64>().ok();
+            let days = days_from_civil(num(0..4)?, num(5..7)?, num(8..10)?);
+            let secs = days * 86400 + num(11..13)? * 3600 + num(14..16)? * 60 + num(17..19)?;
+            let rest = s
+                .get(19..)?
+                .trim_start_matches(|c: char| c == '.' || c.is_ascii_digit());
+            let offset = match rest {
+                "Z" | "z" => 0,
+                _ => {
+                    let sign = match rest.get(..1)? {
+                        "+" => 1,
+                        "-" => -1,
+                        _ => return None,
+                    };
+                    let oh: i64 = rest.get(1..3)?.parse().ok()?;
+                    let om: i64 = rest.get(4..6)?.parse().ok()?;
+                    sign * (oh * 3600 + om * 60)
+                }
+            };
+            Some(secs - offset)
+        }
+        _ => None,
+    }
+}
+
+/// The login to the forge host in fj's `keys.json`, judged at Unix time
+/// `now`. An `expires_at` that cannot be read is taken as not expired: a
+/// rejected token is reported when it is used.
+pub fn fj_login(keys_json: &str, now: i64) -> Result<FjLogin> {
     let v: Value = serde_json::from_str(keys_json).context("fj's keys.json is not JSON")?;
-    Ok(v.pointer(&format!("/hosts/{FORGE_HOST}/token"))
+    let Some(host) = v.pointer(&format!("/hosts/{FORGE_HOST}")) else {
+        return Ok(FjLogin::None);
+    };
+    let Some(token) = host
+        .get("token")
         .and_then(Value::as_str)
         .filter(|t| !t.is_empty())
-        .map(str::to_string))
+    else {
+        return Ok(FjLogin::None);
+    };
+    if host
+        .get("expires_at")
+        .and_then(expiry_seconds)
+        .is_some_and(|t| t <= now)
+    {
+        return Ok(FjLogin::Expired);
+    }
+    Ok(FjLogin::Token(token.to_string()))
 }
 
-/// Whether the API base may receive the token: the forge itself, or a test
-/// server on the loopback interface.
+/// Whether the API base may receive the token: `https://` to the forge
+/// itself, or a test server on the loopback interface. An authority with
+/// user info (`@`) is refused.
 pub fn token_allowed(base: &str) -> bool {
-    let rest = base
-        .strip_prefix("https://")
-        .or_else(|| base.strip_prefix("http://"))
-        .unwrap_or("");
-    let authority = rest.split('/').next().unwrap_or("");
+    let (https, rest) = match (base.strip_prefix("https://"), base.strip_prefix("http://")) {
+        (Some(rest), _) => (true, rest),
+        (None, Some(rest)) => (false, rest),
+        (None, None) => return false,
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.contains('@') {
+        return false;
+    }
     let host = authority.rsplit_once(':').map_or(authority, |(h, _)| h);
-    (base.starts_with("https://") && host == FORGE_HOST)
-        || matches!(host, "127.0.0.1" | "localhost")
+    (https && host == FORGE_HOST) || matches!(host, "127.0.0.1" | "localhost")
 }
 
-/// The Forgejo API with fj's login, for reads only: MR state and commit
-/// status of private repos too. The token never reaches a command line or
-/// the output.
-pub struct AuthApi {
-    base: String,
-    token: String,
+/// The reader for `status` and `start`: the anonymous API first, so that
+/// public repos never see the token; on a 404 again with fj's login, when
+/// there is one, so that private repos (the consumers) are readable too.
+/// Reads only. The token never reaches a command line or the output.
+pub struct ForgeReader {
+    anon: AnonApi,
+    token: Option<String>,
 }
 
-const AUTH_HINT: &str = "is the fj login still valid? `fj auth login`";
+/// What a 404 means without an fj login.
+pub const NOT_FOUND_WITHOUT_LOGIN: &str =
+    "not readable anonymously, and no fj login: no such MR, or the repo is private";
 
-impl AuthApi {
-    /// fj's login to the forge host, or `None` without one.
-    pub fn from_fj_login() -> Result<Option<Self>> {
+const AUTH_HINT: &str = "with fj's login";
+
+impl ForgeReader {
+    /// With fj's login to the forge host, if there is a usable one; a login
+    /// that cannot be used is a warning.
+    pub fn from_env() -> Self {
+        let anon = AnonApi::from_env();
+        let token = match Self::fj_token(&anon.base) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("swl: warning: not using fj's login: {e:#}");
+                None
+            }
+        };
+        Self { anon, token }
+    }
+
+    fn fj_token(base: &str) -> Result<Option<String>> {
         let Some(path) = fj_keys_path() else {
             return Ok(None);
         };
@@ -359,43 +453,53 @@ impl AuthApi {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
         };
-        let base = api_base();
-        let token = fj_token(&text).with_context(|| path.display().to_string())?;
-        match token {
-            Some(token) if token_allowed(&base) => Ok(Some(Self { base, token })),
-            Some(_) => bail!("not sending fj's token to {base}, which is not the forge"),
-            None => Ok(None),
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64);
+        match fj_login(&text, now).with_context(|| path.display().to_string())? {
+            FjLogin::None => Ok(None),
+            FjLogin::Expired => {
+                bail!("it has expired; run fj auth login")
+            }
+            FjLogin::Token(_) if !token_allowed(base) => {
+                bail!("not sending fj's token to {base}, which is not the forge")
+            }
+            FjLogin::Token(t) => Ok(Some(t)),
+        }
+    }
+
+    /// `anon`, then on a 404 `authed` with the token.
+    fn read<T>(
+        &self,
+        anon: impl Fn() -> Result<Option<T>>,
+        authed: impl Fn(&str) -> Result<Option<T>>,
+    ) -> Result<Option<T>> {
+        match (anon()?, &self.token) {
+            (None, Some(token)) => authed(token),
+            (found, _) => Ok(found),
         }
     }
 }
 
-impl PrReader for AuthApi {
+impl PrReader for ForgeReader {
     fn pr(&self, repo: &str, number: u64) -> Result<Option<PrInfo>> {
-        read_pr(&self.base, Some(&self.token), repo, number, AUTH_HINT)
+        self.read(
+            || self.anon.pr(repo, number),
+            |t| read_pr(&self.anon.base, Some(t), repo, number, AUTH_HINT),
+        )
     }
 
     fn commit_status(&self, repo: &str, sha: &str) -> Result<Option<CiState>> {
-        read_commit_status(&self.base, Some(&self.token), repo, sha, AUTH_HINT)
+        self.read(
+            || self.anon.commit_status(repo, sha),
+            |t| read_commit_status(&self.anon.base, Some(t), repo, sha, AUTH_HINT),
+        )
     }
 
     fn not_found(&self) -> &'static str {
-        "no such MR"
-    }
-}
-
-/// What a 404 from the anonymous reader means to `status` and `start`.
-pub const NOT_FOUND_WITHOUT_LOGIN: &str =
-    "not readable anonymously, and no fj login: no such MR, or the repo is private";
-
-/// The reader for `status` and `start`: fj's login when there is one, else
-/// the anonymous API. A login that cannot be used is a warning.
-pub fn interactive_reader() -> Box<dyn PrReader> {
-    match AuthApi::from_fj_login() {
-        Ok(Some(api)) => Box::new(api),
-        Ok(None) => Box::new(AnonApi::without_login()),
-        Err(e) => {
-            eprintln!("swl: warning: not using fj's login: {e:#}");
-            Box::new(AnonApi::without_login())
+        match self.token {
+            Some(_) => "no such MR",
+            None => NOT_FOUND_WITHOUT_LOGIN,
         }
     }
 }
@@ -562,13 +666,46 @@ mod tests {
     #[test]
     fn fj_login_token() {
         let keys = r#"{"hosts":{"forgejo.lynx-lizard.ts.net":{"type":"Application","name":"u","token":"t0k"}},"aliases":{},"default_ssh":[]}"#;
-        assert_eq!(fj_token(keys).unwrap().as_deref(), Some("t0k"));
+        assert_eq!(fj_login(keys, 0).unwrap(), FjLogin::Token("t0k".into()));
         assert_eq!(
-            fj_token(r#"{"hosts":{"codeberg.org":{"token":"x"}}}"#).unwrap(),
-            None
+            fj_login(r#"{"hosts":{"codeberg.org":{"token":"x"}}}"#, 0).unwrap(),
+            FjLogin::None
         );
-        assert_eq!(fj_token(r#"{"hosts":{}}"#).unwrap(), None);
-        assert!(fj_token("not json").is_err());
+        assert_eq!(fj_login(r#"{"hosts":{}}"#, 0).unwrap(), FjLogin::None);
+        assert!(fj_login("not json", 0).is_err());
+    }
+
+    #[test]
+    fn an_expired_oauth_login_is_no_login() {
+        // 2026-11-25T08:00:00Z, as the time crate writes it, and as text.
+        let at = 1_795_593_600;
+        for expires in [
+            "[2026,329,8,0,0,0,0,0,0]",
+            "1795593600",
+            "\"2026-11-25T08:00:00Z\"",
+            "\"2026-11-25T09:00:00.5+01:00\"",
+        ] {
+            let keys = format!(
+                r#"{{"hosts":{{"forgejo.lynx-lizard.ts.net":{{"type":"OAuth","name":"u","token":"t","refresh_token":"r","expires_at":{expires}}}}}}}"#
+            );
+            assert_eq!(
+                expiry_seconds(&serde_json::from_str(expires).unwrap()),
+                Some(at),
+                "{expires}"
+            );
+            assert_eq!(
+                fj_login(&keys, at - 1).unwrap(),
+                FjLogin::Token("t".into()),
+                "{expires}"
+            );
+            assert_eq!(fj_login(&keys, at).unwrap(), FjLogin::Expired, "{expires}");
+        }
+        let unreadable =
+            r#"{"hosts":{"forgejo.lynx-lizard.ts.net":{"token":"t","expires_at":"soon"}}}"#;
+        assert_eq!(
+            fj_login(unreadable, i64::MAX).unwrap(),
+            FjLogin::Token("t".into())
+        );
     }
 
     #[test]
@@ -582,6 +719,13 @@ mod tests {
             "https://forgejo.lynx-lizard.ts.net.example.org/api/v1"
         ));
         assert!(!token_allowed("https://127.0.0.1@example.org/api/v1"));
+        assert!(!token_allowed(
+            "https://forgejo.lynx-lizard.ts.net:443@evil.example/api/v1"
+        ));
+        assert!(!token_allowed("http://127.0.0.1:1@evil.example/"));
+        // `?` ends the authority: this host is 127.0.0.1, as for curl.
+        assert!(token_allowed("http://127.0.0.1?@evil.example/"));
+        assert!(!token_allowed("ftp://127.0.0.1/"));
     }
 
     #[test]

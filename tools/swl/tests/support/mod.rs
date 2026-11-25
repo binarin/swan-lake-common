@@ -53,7 +53,8 @@ pub const TOKEN: &str = "test-token-0123";
 type SeenAuth = Arc<Mutex<Vec<(String, Option<String>)>>>;
 
 /// GET responses by path; anything else is 404. Paths under a private repo
-/// answer only with `Authorization: token TOKEN`, as Forgejo does.
+/// answer only with `Authorization: token TOKEN`, as Forgejo does; any other
+/// token is a 401.
 #[derive(Clone, Default)]
 pub struct FakeApi {
     pub port: u16,
@@ -99,12 +100,21 @@ impl FakeApi {
                     .and_then(|r| r.split('/').next())
                     .unwrap_or("")
                     .to_string();
-                let allowed = !private.lock().unwrap().contains(&repo)
-                    || auth.as_deref() == Some(&format!("token {TOKEN}"));
+                let good = auth.as_deref() == Some(&format!("token {TOKEN}"));
+                let allowed = !private.lock().unwrap().contains(&repo) || good;
+                // Like Forgejo, a commit without statuses has an empty
+                // combined status, not a 404.
+                let no_status = path.ends_with("/status").then(|| {
+                    r#"{"state":"","sha":"","total_count":0,"statuses":null}"#.to_string()
+                });
                 let found = allowed
-                    .then(|| responses.lock().unwrap().get(&path).cloned())
+                    .then(|| responses.lock().unwrap().get(&path).cloned().or(no_status))
                     .flatten();
                 let (status, body) = match found {
+                    _ if auth.is_some() && !good => (
+                        "401 Unauthorized",
+                        r#"{"message":"invalid token"}"#.to_string(),
+                    ),
                     Some(b) => ("200 OK", b),
                     None => ("404 Not Found", r#"{"message":"not found"}"#.to_string()),
                 };
@@ -380,12 +390,28 @@ impl Forge {
 
     /// A fake fj login: keys.json with the token the fake API wants.
     pub fn login(&self) -> PathBuf {
-        let keys = self.root.join("fj-keys.json");
+        self.login_with("fj-keys.json", TOKEN, None)
+    }
+
+    /// A keys.json with `token`, and an OAuth `expires_at` if given.
+    pub fn login_with(
+        &self,
+        file: &str,
+        token: &str,
+        expires_at: Option<serde_json::Value>,
+    ) -> PathBuf {
+        let keys = self.root.join(file);
+        let mut host = serde_json::json!({
+            "type": "Application", "name": "binarin", "token": token });
+        if let Some(at) = expires_at {
+            host["type"] = "OAuth".into();
+            host["refresh_token"] = "r".into();
+            host["expires_at"] = at;
+        }
         fs::write(
             &keys,
             serde_json::json!({
-                "hosts": { "forgejo.lynx-lizard.ts.net": {
-                    "type": "Application", "name": "binarin", "token": TOKEN } },
+                "hosts": { "forgejo.lynx-lizard.ts.net": host },
                 "aliases": {},
                 "default_ssh": [],
             })
@@ -393,6 +419,19 @@ impl Forge {
         )
         .unwrap();
         keys
+    }
+
+    /// The requests to `repo` that carried an Authorization header.
+    pub fn authed_requests(&self, repo: &str) -> Vec<String> {
+        let prefix = format!("/api/v1/repos/binarin/{repo}/");
+        self.api
+            .seen_auth
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(p, a)| p.starts_with(&prefix) && a.is_some())
+            .map(|(p, _)| p.clone())
+            .collect()
     }
 
     pub fn env(&self, c: &mut Command, path: &str) {
