@@ -86,9 +86,8 @@ fn is_ancestor(dir: &Path, a: &str, b: &str) -> bool {
 }
 
 /// Why the checkout at `dir` cannot be moved to a rebased `branch`, and
-/// what to do: changed or untracked files (but those that removing a
-/// landed checkout may delete, as swl's `.envrc.local`), another branch, or
-/// a HEAD other than `observed`, the head of `tracking`.
+/// what to do: changed or untracked files (but swl's `.envrc.local`),
+/// another branch, or a HEAD other than `observed`, the head of `tracking`.
 fn checkout_problem(
     dir: &Path,
     branch: &str,
@@ -124,13 +123,13 @@ fn checkout_problem(
 }
 
 /// The changed and untracked files of the checkout at `dir`, as `git status
-/// --porcelain` lines, but those that removing a landed checkout may
-/// delete; `None` when there are none.
+/// --porcelain` lines, but swl's generated `.envrc.local` (as removing a
+/// landed checkout counts them); `None` when there are none.
 fn changed_files(dir: &Path) -> Result<Option<String>> {
     let status = git(dir, &["status", "--porcelain"])?;
     let changed: Vec<&str> = status
         .lines()
-        .filter(|l| !(l.starts_with("?? ") && land::disposable(dir, &l[3..], true)))
+        .filter(|l| !(l.starts_with("?? ") && land::disposable(dir, &l[3..], false)))
         .collect();
     Ok((!changed.is_empty()).then(|| changed.join(", ")))
 }
@@ -550,8 +549,50 @@ pub(crate) fn refresh(l: &Lander, part: &Part) -> Result<Step> {
         if lock_changed(source, &observed, &head)? {
             rerun_env(cmd, root, l.config);
         }
+    } else {
+        follow_local_branch(cmd, source, which, branch, &observed, &head);
     }
     l.await_pull_at(source, &remote, which, part.info.number, &head)
+}
+
+/// Without a checkout, moves the source's own local `branch` to the pushed
+/// `head` by compare-and-swap when it is at the `observed` head and no
+/// worktree has it checked out, so that a later push of it is a
+/// fast-forward; else leaves it, and says so when it exists.
+fn follow_local_branch(
+    cmd: &str,
+    source: &Path,
+    which: &str,
+    branch: &str,
+    observed: &str,
+    head: &str,
+) {
+    let refname = format!("refs/heads/{branch}");
+    let Some(local) = git_ok(source, &["rev-parse", "--verify", "--quiet", &refname]) else {
+        return;
+    };
+    let worktrees = git_ok(source, &["worktree", "list", "--porcelain"]).unwrap_or_default();
+    let checked_out = worktrees.lines().any(|l| l == format!("branch {refname}"));
+    let moved = local == observed
+        && !checked_out
+        && git(
+            source,
+            &["update-ref", "-m", "swl refresh", &refname, head, observed],
+        )
+        .is_ok();
+    if !moved {
+        style::say(
+            cmd,
+            Tone::Warn,
+            format!(
+                "{which}: the local {branch} of {} (at {}) was left as it is; it is not the pushed \
+                 head {}",
+                source.display(),
+                short(&local),
+                short(head)
+            ),
+        );
+    }
 }
 
 /// Whether `flake.lock` differs between two revisions.

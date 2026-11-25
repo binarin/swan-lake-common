@@ -1124,6 +1124,10 @@ fn refresh_stops_for_a_checkout_that_is_not_clean_or_not_at_the_remote_head() {
     assert!(log.contains("dry run, nothing was written"), "{log}");
     assert_eq!(t.forge_refs(), refs);
 
+    // An untracked file, which is not swl's.
+    fs::write(t.common.join("result-notes.md"), "n").unwrap();
+    stops("is not rebased: it has uncommitted or untracked files: ?? result-notes.md");
+    fs::remove_file(t.common.join("result-notes.md")).unwrap();
     // Changes to a tracked file.
     fs::write(t.common.join("value.txt"), "edited").unwrap();
     stops("is not rebased: it has uncommitted or untracked files:  M value.txt");
@@ -1259,6 +1263,12 @@ fn land_rebases_a_shared_mr_without_a_checkout_in_a_scratch_worktree() {
     assert!(
         t.f.git(&source, &["branch", "--list", "swl-refresh-*"])
             .is_empty()
+    );
+    // The source's own branch, at the old head and checked out nowhere,
+    // follows.
+    assert_eq!(
+        t.f.git(&source, &["rev-parse", "refs/heads/sl-0020-land"]),
+        rebased
     );
 }
 
@@ -1724,4 +1734,73 @@ fn refresh_keeps_a_commit_that_only_looks_like_a_landing() {
     let rebased_lock =
         t.f.git(&t.consumer, &["show", &format!("{head}:flake.lock")]);
     assert!(rebased_lock.contains("\"/x\""), "{rebased_lock}");
+}
+
+#[test]
+fn refresh_stops_for_a_refused_push_and_a_branch_all_in_its_base() {
+    let t = Change::new("refresh-refused");
+    let c2 = t.common_head();
+    t.f.commit_file_on_forge("swan-lake-common", "master", "other.txt", "o");
+    // A protected MR branch: the forge refuses the push, for the owner.
+    t.f.hook(
+        "swan-lake-common",
+        "pre-receive",
+        "#!/bin/sh\necho \"sl-0020-land is protected\" >&2\nexit 1\n",
+    );
+    let refs = t.forge_refs();
+    failed(
+        &t.refresh(&[]),
+        3,
+        "waits for the owner: swan-lake-common#1: the push of the rebased sl-0020-land was \
+         refused: remote: sl-0020-land is protected",
+    );
+    assert_eq!(t.forge_refs(), refs);
+    assert_eq!(t.common_head(), c2);
+    t.f.hook_opt("swan-lake-common", "pre-receive", None);
+
+    // Master has the MR's change already: nothing is left to push.
+    t.f.commit_on_forge("swan-lake-common", "master", "c2");
+    let refs = t.forge_refs();
+    failed(
+        &t.refresh(&[]),
+        4,
+        "swan-lake-common#1: everything on sl-0020-land is in origin/master already; nothing was \
+         pushed: close swan-lake-common#1",
+    );
+    assert_eq!(t.forge_refs(), refs);
+    assert_eq!(t.common_head(), c2);
+}
+
+#[test]
+fn refresh_warns_when_swl_env_fails_after_a_rebase_moved_a_lock() {
+    let t = Change::new("refresh-env");
+    // Master changes common's lock (here only its formatting), and the
+    // consumer's .envrc.local is not swl's.
+    let lock = fs::read_to_string(t.common.join("flake.lock")).unwrap();
+    t.f.commit_file_on_forge(
+        "swan-lake-common",
+        "master",
+        "flake.lock",
+        &format!("{lock}\n"),
+    );
+    fs::write(t.consumer.join(".envrc.local"), "# mine\n").unwrap();
+    let out = t.refresh(&[]);
+    let log = stdout(&out);
+    assert!(
+        log.contains("swan-lake-common#1: pushed sl-0020-land at"),
+        "{log}"
+    );
+    assert!(
+        log.contains("swl env failed after the rebase:")
+            && log.contains("was not written by swl env"),
+        "{log}"
+    );
+    assert_eq!(
+        t.common_head(),
+        t.forge_head("swan-lake-common", "sl-0020-land")
+    );
+    assert_eq!(
+        fs::read_to_string(t.consumer.join(".envrc.local")).unwrap(),
+        "# mine\n"
+    );
 }
