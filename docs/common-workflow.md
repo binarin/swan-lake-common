@@ -150,8 +150,10 @@ Always inspect the full diff and rerun required policy/build CI. The helper
 never bypasses required statuses. A later canonical lock remains valid after
 another promotion; the guard does not require today's promoted head.
 
-Routine upgrades use `nix flake update common`. nixos-config's existing scheduled
-full update already covers common; swan-lake uses manual updates for now.
+Routine upgrades use `swl bump` (see `tools/swl/README.md`): it moves common's
+inputs forward, promotes `swan-lake-current`, and opens a bump MR moving `common`
+in each consumer. nixos-config's existing scheduled full update already covers
+common.
 
 ## Validation
 
