@@ -19,6 +19,7 @@ use crate::{
     git::git,
     manifest::{MANIFEST_FILE, Manifest},
     shim::OverrideArgs,
+    style::{self, Tone},
 };
 
 /// First-line marker of the wrapper `swl ci env` writes; the shims skip
@@ -88,20 +89,24 @@ pub fn run_env(dir: &Path, api: &dyn PrReader, swl: &Path) -> Result<ExitCode> {
     let root = PathBuf::from(git(dir, &["rev-parse", "--show-toplevel"])?);
     let manifest = Manifest::read(&root)?.unwrap_or_default();
     if manifest.is_empty() {
-        println!("swl ci env: no pending entries in {MANIFEST_FILE}; nix runs unchanged");
+        style::say(
+            "swl ci env",
+            Tone::Plain,
+            format!("no pending entries in {MANIFEST_FILE}; nix runs unchanged"),
+        );
         return Ok(ExitCode::SUCCESS);
     }
     let (args, notes) = match overrides(&manifest, api) {
         Ok(found) => found,
         Err(errors) => {
             for e in errors {
-                eprintln!("swl ci env: error: {e}");
+                style::tell("swl ci env", Tone::Error, format!("error: {e}"));
             }
             return Ok(ExitCode::from(1));
         }
     };
     for n in notes {
-        println!("swl ci env: note: {n}");
+        style::say("swl ci env", Tone::Plain, format!("note: {n}"));
     }
     let bin = wrapper_dir()?;
     let nix = bin.join("nix");
@@ -109,7 +114,11 @@ pub fn run_env(dir: &Path, api: &dyn PrReader, swl: &Path) -> Result<ExitCode> {
         .with_context(|| format!("writing {}", nix.display()))?;
     fs::set_permissions(&nix, fs::Permissions::from_mode(0o755))?;
     for (path, url) in &args {
-        println!("swl ci env: --override-input {path} {url}");
+        style::say(
+            "swl ci env",
+            Tone::Plain,
+            format!("--override-input {path} {url}"),
+        );
     }
     match env::var_os("GITHUB_PATH").filter(|p| !p.is_empty()) {
         Some(file) => {
@@ -119,14 +128,19 @@ pub fn run_env(dir: &Path, api: &dyn PrReader, swl: &Path) -> Result<ExitCode> {
                 .open(&file)
                 .and_then(|mut f| writeln!(f, "{}", bin.display()))
                 .with_context(|| format!("appending to $GITHUB_PATH {}", file.to_string_lossy()))?;
-            println!(
-                "swl ci env: {} is on PATH for the job's later steps",
-                nix.display()
+            style::say(
+                "swl ci env",
+                Tone::Plain,
+                format!("{} is on PATH for the job's later steps", nix.display()),
             );
         }
-        None => println!(
-            "swl ci env: no $GITHUB_PATH; to use the wrapper, run\n  export PATH={}:\"$PATH\"",
-            shell_quote(bin.as_os_str())
+        None => style::say(
+            "swl ci env",
+            Tone::Plain,
+            format!(
+                "no $GITHUB_PATH; to use the wrapper, run\n  export PATH={}:\"$PATH\"",
+                shell_quote(bin.as_os_str())
+            ),
         ),
     }
     Ok(ExitCode::SUCCESS)

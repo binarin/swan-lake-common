@@ -6,8 +6,7 @@
 
 use std::{
     borrow::Cow,
-    env,
-    io::{self, IsTerminal},
+    env, io,
     process::{Command, ExitStatus, Output},
     time::Instant,
 };
@@ -41,11 +40,6 @@ pub fn init(only_when_asked: bool, ansi: bool) {
     if let Some((v, e)) = bad {
         tracing::warn!("{LOG_ENV}={v:?} is not a filter ({e}); using warn");
     }
-}
-
-/// Whether stderr gets colour by default: a terminal, and no `NO_COLOR`.
-pub fn stderr_ansi() -> bool {
-    io::stderr().is_terminal() && env::var_os("NO_COLOR").is_none_or(|v| v.is_empty())
 }
 
 /// Whether a word looks like it carries a credential: an Authorization

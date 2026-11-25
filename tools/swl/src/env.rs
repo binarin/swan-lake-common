@@ -13,6 +13,7 @@ use crate::{
     config::Config,
     nix::Nix,
     shim::Tool,
+    style::{self, Tone},
     workspace::{Override, Workspace, overrides_summary},
 };
 
@@ -199,10 +200,14 @@ pub fn run(ws: &Workspace, config: &Config, swl: &Path, force: bool) -> Result<(
         )?;
     }
     if let Err(e) = root_swl(ws, swl) {
-        eprintln!(
-            "swl env: warning: could not make {} a GC root for {}: {e:#}",
-            ws.root.join(GC_ROOT).display(),
-            swl.display()
+        style::tell(
+            "swl env",
+            Tone::Warn,
+            format!(
+                "warning: could not make {} a GC root for {}: {e:#}",
+                ws.root.join(GC_ROOT).display(),
+                swl.display()
+            ),
         );
     }
     for (c, path, overrides) in plans {
@@ -219,9 +224,13 @@ pub fn run(ws: &Workspace, config: &Config, swl: &Path, force: bool) -> Result<(
         );
         let envrc = fs::read_to_string(c.dir.join(".envrc")).unwrap_or_default();
         if !envrc.contains(".envrc.local") || !envrc.contains("use_flake_args") {
-            eprintln!(
-                "swl env: warning: {}/.envrc does not source .envrc.local into use_flake_args",
-                c.name
+            style::tell(
+                "swl env",
+                Tone::Warn,
+                format!(
+                    "warning: {}/.envrc does not source .envrc.local into use_flake_args",
+                    c.name
+                ),
             );
         }
     }

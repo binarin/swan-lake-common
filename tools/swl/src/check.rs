@@ -19,6 +19,7 @@ use crate::{
     manifest::{Entry, MANIFEST_FILE, Manifest},
     nix::Nix,
     pin_policy,
+    style::{self, Tone},
     tempdir::TempDir,
 };
 
@@ -494,20 +495,20 @@ pub fn run(
         Event::Master => check_master(&root, &Nix::find()?)?,
     };
     for n in &out.notes {
-        println!("swl check: {n}");
+        style::say("swl check", Tone::Plain, n);
     }
     for e in &out.errors {
-        eprintln!("swl check: error: {e}");
+        style::tell("swl check", Tone::Error, format!("error: {e}"));
     }
     let what = match event {
         Event::Mr => "MR",
         Event::Master => "master",
     };
     if out.errors.is_empty() {
-        println!("swl check: {what} checks passed");
+        style::say("swl check", Tone::Good, format!("{what} checks passed"));
         Ok(ExitCode::SUCCESS)
     } else {
-        eprintln!("swl check: {what} checks failed");
+        style::tell("swl check", Tone::Error, format!("{what} checks failed"));
         Ok(ExitCode::from(1))
     }
 }

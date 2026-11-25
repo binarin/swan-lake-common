@@ -43,6 +43,7 @@ use crate::{
     manifest::{Entry, MANIFEST_FILE, Manifest},
     start,
     status::{self, MrFacts, MrRead, RemoteBranch, Row, RowFacts, Stage, Waits},
+    style::{self, Tone},
     workspace::{Checkout, Workspace},
     ws_add::{Fetcher, base_remote},
 };
@@ -183,7 +184,7 @@ impl Lander<'_> {
     /// run; a [`Repeated`] error when this run did the same already.
     fn act(&self, key: &str, what: &str) -> Result<bool> {
         if self.opts.dry_run {
-            println!("swl land: would {what}");
+            style::say("swl land", Tone::Plain, format!("would {what}"));
             return Ok(false);
         }
         if !self.done.borrow_mut().insert(key.to_string()) {
@@ -193,7 +194,7 @@ impl Lander<'_> {
             ))
             .into());
         }
-        println!("swl land: {what}");
+        style::say("swl land", Tone::Plain, what);
         Ok(true)
     }
 
@@ -341,9 +342,13 @@ impl Lander<'_> {
         )?;
         if outcome == MergeOutcome::Scheduled {
             if self.ci_now(repo, &info.head_sha) == Some(CiState::Green) {
-                println!(
-                    "swl land: {which}: its checks turned green as the merge was scheduled, and \
+                style::say(
+                    "swl land",
+                    Tone::Plain,
+                    format!(
+                        "{which}: its checks turned green as the merge was scheduled, and \
                      no later status would start it"
+                    ),
                 );
                 return self.merge_now(which, repo, info, republish);
             }
@@ -369,9 +374,11 @@ impl Lander<'_> {
             return self.dry_stop(&format!("{which} is merged"));
         }
         match self.writer.cancel_scheduled_merge(repo, info.number)? {
-            CancelOutcome::Cancelled => {
-                println!("swl land: cancelled the scheduled merge of {which}")
-            }
+            CancelOutcome::Cancelled => style::say(
+                "swl land",
+                Tone::Plain,
+                format!("cancelled the scheduled merge of {which}"),
+            ),
             CancelOutcome::NothingScheduled => {
                 tracing::debug!(%which, "no scheduled merge to cancel")
             }
@@ -420,7 +427,7 @@ impl Lander<'_> {
         };
         match outcome {
             MergeOutcome::Merged => {
-                println!("swl land: {which} is merged");
+                style::say("swl land", Tone::Good, format!("{which} is merged"));
                 Ok(Step::Progress)
             }
             MergeOutcome::Scheduled => stop(
@@ -531,10 +538,14 @@ impl Lander<'_> {
                     ),
                 );
             }
-            println!(
-                "swl land: {which}: {url} {branch} does not have {} yet; checking again in {}s",
-                short(merge_commit),
-                self.opts.interval.as_secs()
+            style::say(
+                "swl land",
+                Tone::Plain,
+                format!(
+                    "{which}: {url} {branch} does not have {} yet; checking again in {}s",
+                    short(merge_commit),
+                    self.opts.interval.as_secs()
+                ),
             );
             thread::sleep(self.opts.interval);
         }
@@ -656,21 +667,25 @@ impl Lander<'_> {
                 );
             }
             Landing::WouldLand(lines) => {
-                println!(
-                    "swl land: would finalize {}:\n  {}",
-                    c.name,
-                    lines.join("\n  ")
+                style::say(
+                    "swl land",
+                    Tone::Plain,
+                    format!("would finalize {}:\n  {}", c.name, lines.join("\n  ")),
                 );
                 return self.dry_stop(&format!(
                     "then push the landing to {branch} and request the merge of {which}"
                 ));
             }
             Landing::Committed(done) => {
-                println!(
-                    "swl land: {}: committed {} on {branch}: {}",
-                    c.name,
-                    short(&done.head),
-                    done.subject
+                style::say(
+                    "swl land",
+                    Tone::Good,
+                    format!(
+                        "{}: committed {} on {branch}: {}",
+                        c.name,
+                        short(&done.head),
+                        done.subject
+                    ),
                 );
                 return Ok(Step::Progress);
             }
@@ -868,19 +883,27 @@ fn remove_workspace(ws: &Workspace, config: &Config, dry_run: bool) -> Result<()
             git(&c.dir, &["fetch", "--quiet", &r])?;
         }
         if let Some(why) = keep_reason(c, base)? {
-            println!("swl land: keeping {}: {why}", c.dir.display());
+            style::say(
+                "swl land",
+                Tone::Warn,
+                format!("keeping {}: {why}", c.dir.display()),
+            );
             kept.push(c.name.clone());
             continue;
         }
         let branch = git_ok(&c.dir, &["symbolic-ref", "--quiet", "--short", "HEAD"]);
         if dry_run {
-            println!(
-                "swl land: would remove {}{}",
-                c.dir.display(),
-                branch
-                    .as_deref()
-                    .map(|b| format!(" and its branch {b}"))
-                    .unwrap_or_default()
+            style::say(
+                "swl land",
+                Tone::Plain,
+                format!(
+                    "would remove {}{}",
+                    c.dir.display(),
+                    branch
+                        .as_deref()
+                        .map(|b| format!(" and its branch {b}"))
+                        .unwrap_or_default()
+                ),
             );
             continue;
         }
@@ -893,8 +916,16 @@ fn remove_workspace(ws: &Workspace, config: &Config, dry_run: bool) -> Result<()
             // `git branch -d` sees it merged.
             git(&c.dir, &["switch", "--quiet", "--detach", base])?;
             match git(&c.dir, &["branch", "--quiet", "-d", b]) {
-                Ok(_) => println!("swl land: deleted the merged branch {b} of {repo}"),
-                Err(e) => println!("swl land: kept the branch {b} of {repo}: {e:#}"),
+                Ok(_) => style::say(
+                    "swl land",
+                    Tone::Good,
+                    format!("deleted the merged branch {b} of {repo}"),
+                ),
+                Err(e) => style::say(
+                    "swl land",
+                    Tone::Warn,
+                    format!("kept the branch {b} of {repo}: {e:#}"),
+                ),
             }
         }
         git(
@@ -902,18 +933,30 @@ fn remove_workspace(ws: &Workspace, config: &Config, dry_run: bool) -> Result<()
             &["worktree", "remove", &c.dir.to_string_lossy()],
         )
         .with_context(|| format!("removing the worktree {}", c.dir.display()))?;
-        println!("swl land: removed {}", c.dir.display());
+        style::say(
+            "swl land",
+            Tone::Good,
+            format!("removed {}", c.dir.display()),
+        );
     }
     if !kept.is_empty() {
-        println!(
-            "swl land: kept {} and the workspace {}",
-            kept.join(", "),
-            ws.root.display()
+        style::say(
+            "swl land",
+            Tone::Warn,
+            format!(
+                "kept {} and the workspace {}",
+                kept.join(", "),
+                ws.root.display()
+            ),
         );
         return Ok(());
     }
     if dry_run {
-        println!("swl land: would remove {}", ws.root.display());
+        style::say(
+            "swl land",
+            Tone::Plain,
+            format!("would remove {}", ws.root.display()),
+        );
         return Ok(());
     }
     let dot_swl = ws.root.join(".swl");
@@ -921,22 +964,27 @@ fn remove_workspace(ws: &Workspace, config: &Config, dry_run: bool) -> Result<()
         fs::remove_dir_all(&dot_swl).with_context(|| format!("removing {}", dot_swl.display()))?;
     }
     match fs::remove_dir(&ws.root) {
-        Ok(()) => println!("swl land: removed {}", ws.root.display()),
-        Err(e) => println!(
-            "swl land: kept {}, which has other files: {e}",
-            ws.root.display()
+        Ok(()) => style::say(
+            "swl land",
+            Tone::Good,
+            format!("removed {}", ws.root.display()),
+        ),
+        Err(e) => style::say(
+            "swl land",
+            Tone::Warn,
+            format!("kept {}, which has other files: {e}", ws.root.display()),
         ),
     }
     Ok(())
 }
 
 fn exit(waits: Waits, msg: &str, dry_run: bool) -> ExitCode {
-    let who = match waits {
-        Waits::Owner => "the owner",
-        Waits::Anyone => "anyone",
-        Waits::Nobody => "nobody",
+    let (who, tone) = match waits {
+        Waits::Owner => ("the owner", Tone::Owner),
+        Waits::Anyone => ("anyone", Tone::Warn),
+        Waits::Nobody => ("nobody", Tone::Nobody),
     };
-    println!("swl land: waits for {who}: {msg}");
+    style::say("swl land", tone, format!("waits for {who}: {msg}"));
     if dry_run {
         return ExitCode::SUCCESS;
     }
@@ -948,7 +996,11 @@ fn exit(waits: Waits, msg: &str, dry_run: bool) -> ExitCode {
 }
 
 fn planned(then: &str) -> ExitCode {
-    println!("swl land: dry run, nothing was written; then: {then}");
+    style::say(
+        "swl land",
+        Tone::Plain,
+        format!("dry run, nothing was written; then: {then}"),
+    );
     ExitCode::SUCCESS
 }
 
@@ -1001,19 +1053,24 @@ pub fn run(
             Step::Planned(then) => return Ok(planned(&then)),
             Step::Stop(waits, msg) => return Ok(exit(waits, &msg, opts.dry_run)),
             Step::Done if !lander.landed_by_merge(&ws, &rows)? => {
-                println!(
-                    "swl land: nothing to land: no consumer of {} has a merged MR; the workspace \
+                style::say(
+                    "swl land",
+                    Tone::Plain,
+                    format!(
+                        "nothing to land: no consumer of {} has a merged MR; the workspace \
                      stays",
-                    ws.root.display()
+                        ws.root.display()
+                    ),
                 );
                 return Ok(ExitCode::SUCCESS);
             }
             Step::Done => {
-                println!("swl land: every MR of the change is merged");
+                style::say("swl land", Tone::Good, "every MR of the change is merged");
                 if opts.keep {
-                    println!(
-                        "swl land: keeping the workspace {} (--keep)",
-                        ws.root.display()
+                    style::say(
+                        "swl land",
+                        Tone::Plain,
+                        format!("keeping the workspace {} (--keep)", ws.root.display()),
                     );
                 } else {
                     remove_workspace(&ws, config, opts.dry_run)?;
@@ -1055,7 +1112,11 @@ pub fn run_from(
         return match workspace.filter(|w| w.exists()) {
             Some(ws) => run(ws, config, reader, writer, opts),
             None => {
-                println!("swl land: {from} has landed: nothing left to do");
+                style::say(
+                    "swl land",
+                    Tone::Good,
+                    format!("{from} has landed: nothing left to do"),
+                );
                 Ok(ExitCode::SUCCESS)
             }
         };
@@ -1066,9 +1127,13 @@ pub fn run_from(
         if dir.exists() {
             return run(&dir, config, reader, writer, opts);
         }
-        println!(
-            "swl land: would run swl start --from {from} (the workspace {})",
-            dir.display()
+        style::say(
+            "swl land",
+            Tone::Plain,
+            format!(
+                "would run swl start --from {from} (the workspace {})",
+                dir.display()
+            ),
         );
         let lander = Lander {
             config,
@@ -1085,7 +1150,11 @@ pub fn run_from(
                 Step::Stop(waits, msg) => return Ok(exit(waits, &msg, true)),
             }
         }
-        println!("swl land: then, in the workspace, finalize, push and merge {from}");
+        style::say(
+            "swl land",
+            Tone::Plain,
+            format!("then, in the workspace, finalize, push and merge {from}"),
+        );
         return Ok(ExitCode::SUCCESS);
     }
     let root = start::run_from(config, cwd, from, workspace, &fetcher, reader, swl)?;

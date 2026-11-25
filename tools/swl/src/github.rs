@@ -11,6 +11,7 @@ use serde_json::Value;
 use crate::{
     ancestry::valid_github_name,
     forge::{Request, http},
+    style::{self, Tone},
 };
 
 /// Overrides the API base, `https://api.github.com`, e.g. for tests.
@@ -72,7 +73,11 @@ impl GitHub {
         let token = token.filter(|_| {
             let ok = token_allowed(&base);
             if !ok {
-                eprintln!("swl: warning: not sending {TOKEN_ENV} to {base}, which is not GitHub");
+                style::tell(
+                    "swl",
+                    Tone::Warn,
+                    format!("warning: not sending {TOKEN_ENV} to {base}, which is not GitHub"),
+                );
             }
             ok
         });

@@ -50,6 +50,13 @@ swl land [--dry-run] [--keep] [--from swan-lake#12]   # merge, promote, finalize
 `--workspace DIR` is given; `start` creates one below it. The global
 `--config FILE` selects the repos config.
 
+The global `--color auto|always|never` colours the output: the `swl <cmd>:`
+prefix bold, errors red, warnings yellow, what waits for the owner magenta,
+what is done green, and `status` (see [Status](#status)). `auto`, the
+default, colours a terminal only, never with `NO_COLOR` set, and always with
+`CLICOLOR_FORCE` set (and no `NO_COLOR`). Without colour the text is the same
+as with it, escape codes aside.
+
 - `start NAME CHECKOUT... [--workspace DIR] [--branch B] [--no-fetch]` sets up
   the workspace for one change: `DIR` (default `./NAME`) with each checkout
   (at least one consumer, plus `<repo>@<input>` shared checkouts) on branch

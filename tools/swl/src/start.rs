@@ -16,6 +16,7 @@ use crate::{
     git::{git, git_ok, short},
     manifest::{MANIFEST_FILE, Manifest},
     shim::find_real_tool,
+    style::{self, Tone},
     workspace::parse_shared_name,
     ws_add::{self, Fetcher, Start},
 };
@@ -307,8 +308,16 @@ fn direnv_allow(consumers: &[PathBuf]) {
         );
         match status {
             Ok(s) if s.success() => println!("direnv allow {}", dir.display()),
-            Ok(s) => eprintln!("swl start: warning: direnv allow {} {s}", dir.display()),
-            Err(e) => eprintln!("swl start: warning: running direnv: {e}"),
+            Ok(s) => style::tell(
+                "swl start",
+                Tone::Warn,
+                format!("warning: direnv allow {} {s}", dir.display()),
+            ),
+            Err(e) => style::tell(
+                "swl start",
+                Tone::Warn,
+                format!("warning: running direnv: {e}"),
+            ),
         }
     }
 }

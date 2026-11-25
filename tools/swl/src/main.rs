@@ -20,6 +20,7 @@ mod publish;
 mod shim;
 mod start;
 mod status;
+mod style;
 mod tempdir;
 mod workspace;
 mod ws_add;
@@ -47,6 +48,9 @@ struct Cli {
     /// Repos config [default: $SWL_CONFIG, else $XDG_CONFIG_HOME/swl/repos.toml]
     #[arg(long, global = true, value_name = "FILE")]
     config: Option<PathBuf>,
+    /// Colour the output: auto is on a terminal, unless NO_COLOR is set (CLICOLOR_FORCE forces it)
+    #[arg(long, global = true, value_name = "WHEN", default_value = "auto")]
+    color: style::ColorWhen,
     #[command(subcommand)]
     command: Commands,
 }
@@ -421,11 +425,12 @@ fn main() -> ExitCode {
                 command: CiCommands::Shim { .. }
             }
     );
-    logging::init(shim, logging::stderr_ansi());
+    style::init(cli.color);
+    logging::init(shim, style::stderr_colored());
     match run(cli) {
         Ok(code) => code,
         Err(e) => {
-            eprintln!("swl: {e:#}");
+            style::tell("swl", style::Tone::Error, format!("{e:#}"));
             ExitCode::from(2)
         }
     }

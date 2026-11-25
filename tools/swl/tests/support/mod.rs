@@ -796,6 +796,9 @@ impl Forge {
             "SWL_GITHUB_TOKEN",
             "SWL_LOG",
             "NIX_STORE_DIR",
+            "NO_COLOR",
+            "CLICOLOR",
+            "CLICOLOR_FORCE",
         ] {
             c.env_remove(var);
         }

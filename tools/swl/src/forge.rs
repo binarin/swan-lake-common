@@ -485,7 +485,11 @@ impl ForgeReader {
         let token = match Self::fj_token(&anon.base) {
             Ok(t) => t,
             Err(e) => {
-                eprintln!("swl: warning: not using fj's login: {e:#}");
+                crate::style::tell(
+                    "swl",
+                    crate::style::Tone::Warn,
+                    format!("warning: not using fj's login: {e:#}"),
+                );
                 None
             }
         };

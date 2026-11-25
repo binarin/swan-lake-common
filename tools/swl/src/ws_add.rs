@@ -14,6 +14,7 @@ use crate::{
     config::Config,
     env,
     git::{git, git_ok},
+    style::{self, Tone},
     workspace::{Workspace, parse_shared_name},
 };
 
@@ -149,9 +150,13 @@ fn existing_branch(source: &Path, remote: Option<&str>, branch: &str) -> Result<
             "existing branch {branch}, fast-forwarded to {tracking}"
         ));
     }
-    eprintln!(
-        "swl ws add: warning: {branch} and {tracking} have diverged; left as it is (merge or \
+    style::tell(
+        "swl ws add",
+        Tone::Warn,
+        format!(
+            "warning: {branch} and {tracking} have diverged; left as it is (merge or \
          rebase in the checkout)"
+        ),
     );
     Ok(format!(
         "existing branch {branch}, diverged from {tracking}"

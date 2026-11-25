@@ -477,6 +477,25 @@ fn land_has_nothing_to_land_in_a_fresh_workspace() {
     assert!(log.contains("nothing to land"), "{log}");
     assert!(work.join("SL-0021-fresh/swan-lake").exists(), "{log}");
     assert!(f.api.writes().is_empty());
+
+    // Colour: never into a pipe by default; with --color always or
+    // CLICOLOR_FORCE; never with NO_COLOR or --color never.
+    let colored = |args: &[&str], env: &[(&str, &str)]| {
+        let mut all = vec!["land", "--workspace", &ws];
+        all.extend(args);
+        let mut env = env.to_vec();
+        env.push(("SWL_FJ_KEYS", &keys));
+        let out = stdout(&f.swl_env(&f.root, &all, &env));
+        let plain = out.replace("\x1b[1mswl land\x1b[0m: ", "swl land: ");
+        assert!(!plain.contains('\x1b'), "{out:?}");
+        assert!(plain.contains("swl land: nothing to land"), "{out:?}");
+        out != plain
+    };
+    assert!(!colored(&[], &[]));
+    assert!(colored(&["--color", "always"], &[]));
+    assert!(colored(&[], &[("CLICOLOR_FORCE", "1")]));
+    assert!(!colored(&[], &[("CLICOLOR_FORCE", "1"), ("NO_COLOR", "1")]));
+    assert!(!colored(&["--color", "never"], &[("CLICOLOR_FORCE", "1")]));
 }
 
 #[test]

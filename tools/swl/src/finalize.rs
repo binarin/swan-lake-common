@@ -22,6 +22,7 @@ use crate::{
     manifest::{Entry, MANIFEST_FILE, Manifest},
     nix::Nix,
     pin_policy,
+    style::{self, Tone},
     tempdir::TempDir,
 };
 
@@ -395,15 +396,23 @@ pub fn land_all(dir: &Path, api: &dyn PrReader, dry_run: bool) -> Result<Landing
 pub fn run(dir: &Path, wait: Option<Wait>, api: &dyn PrReader) -> Result<ExitCode> {
     let (root, Some(mut p)) = prepare(dir)? else {
         let root = PathBuf::from(git(dir, &["rev-parse", "--show-toplevel"])?);
-        println!(
-            "swl finalize: no {MANIFEST_FILE} in {}: nothing to finalize",
-            root.display()
+        style::say(
+            "swl finalize",
+            Tone::Plain,
+            format!(
+                "no {MANIFEST_FILE} in {}: nothing to finalize",
+                root.display()
+            ),
         );
         return Ok(ExitCode::SUCCESS);
     };
     if p.manifest.is_empty() {
-        println!(
-            "swl finalize: {MANIFEST_FILE} has no entries; remove it (git rm {MANIFEST_FILE}) before landing"
+        style::say(
+            "swl finalize",
+            Tone::Warn,
+            format!(
+                "{MANIFEST_FILE} has no entries; remove it (git rm {MANIFEST_FILE}) before landing"
+            ),
         );
         return Ok(ExitCode::from(1));
     }
@@ -419,10 +428,14 @@ pub fn run(dir: &Path, wait: Option<Wait>, api: &dyn PrReader) -> Result<ExitCod
             .count();
         match (&wait, deadline) {
             (Some(w), Some(d)) if waiting_for > 0 && Instant::now() + w.interval <= d => {
-                println!(
-                    "swl finalize: {waiting_for} merged entr{} not promoted yet; checking again in {}s",
-                    if waiting_for == 1 { "y" } else { "ies" },
-                    w.interval.as_secs()
+                style::say(
+                    "swl finalize",
+                    Tone::Plain,
+                    format!(
+                        "{waiting_for} merged entr{} not promoted yet; checking again in {}s",
+                        if waiting_for == 1 { "y" } else { "ies" },
+                        w.interval.as_secs()
+                    ),
                 );
                 thread::sleep(w.interval);
             }
@@ -431,23 +444,30 @@ pub fn run(dir: &Path, wait: Option<Wait>, api: &dyn PrReader) -> Result<ExitCod
     };
     for (path, status) in &probe.statuses {
         let e = &p.manifest.inputs[path];
-        println!(
-            "swl finalize: {path} ({}#{}): {}",
-            e.repo,
-            e.mr,
-            describe(status)
+        style::say(
+            "swl finalize",
+            Tone::Plain,
+            format!("{path} ({}#{}): {}", e.repo, e.mr, describe(status)),
         );
     }
     if probe.new_lock.is_none() {
-        println!("swl finalize: nothing has landed; no commit made");
+        style::say(
+            "swl finalize",
+            Tone::Warn,
+            "nothing has landed; no commit made",
+        );
         return Ok(ExitCode::from(1));
     }
     let done = commit(&mut p, &nix, &probe, &old_bytes)?;
-    println!(
-        "swl finalize: committed {} on {}: {}",
-        short(&done.head),
-        p.branch,
-        done.subject
+    style::say(
+        "swl finalize",
+        Tone::Good,
+        format!(
+            "committed {} on {}: {}",
+            short(&done.head),
+            p.branch,
+            done.subject
+        ),
     );
     if done.remaining == 0 {
         println!(
