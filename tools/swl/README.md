@@ -718,6 +718,11 @@ the override URLs) redirect them, for tests.
 - `land` tells a landed consumer from the forge's pull refs and its
   remote-tracking branch: with `fetch.prune` the pruned branch of a merged
   MR is not seen, so the workspace stays; remove it by hand.
+- `swl check` guards against mistakes, not against a hostile MR author: on
+  `pull_request` the MR's own workflow runs it, with the swl of the MR's own
+  lock (`nix run .#swl`), so the MR can change both. A hardened setup would
+  run it from `pull_request_target`, with swl from the base branch and no
+  secrets in that job.
 - `check` refuses moves of inputs that are not GitHub or `https://` git
   sources (tarballs, GitLab, sourcehut, …), even legitimate ones: bump
   those on master directly.
