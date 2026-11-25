@@ -1027,6 +1027,57 @@ fn check_accepts_forward_moves_and_refuses_backwards() {
     );
 }
 
+/// The review's attack on a landing that adds an input: its `original` is
+/// the entry's repo, its `locked` source another repo.
+#[test]
+fn check_refuses_an_added_input_locked_elsewhere() {
+    let w = World::new("added-elsewhere");
+    let zw = w.forge_repo("zwanenzang");
+    let zw_head = w.git(&zw, &["rev-parse", "master"]);
+    let flake = fs::read_to_string(w.consumer.join("flake.nix")).unwrap();
+    fs::write(
+        w.consumer.join("flake.nix"),
+        flake.replacen(
+            "{\n",
+            &format!(
+                "{{\n  inputs.zwnext.url = \"git+file://{}\";\n",
+                zw.display()
+            ),
+            1,
+        ),
+    )
+    .unwrap();
+    stdout(&w.nix(&w.consumer, &["flake", "lock"]));
+    // Locked to another repo of the forge, at a rev of its own.
+    let path = w.consumer.join("flake.lock");
+    let mut lock: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    let elsewhere = w.forge_repo("swan-lake-common");
+    lock["nodes"]["zwnext"]["locked"]["url"] = format!("file://{}", elsewhere.display()).into();
+    lock["nodes"]["zwnext"]["locked"]["rev"] = w.git(&elsewhere, &["rev-parse", "master"]).into();
+    fs::write(&path, serde_json::to_string_pretty(&lock).unwrap()).unwrap();
+    fs::write(
+        w.consumer.join("swl.toml"),
+        "[inputs.zwnext]\nrepo = \"zwanenzang\"\nmr = 5\n",
+    )
+    .unwrap();
+    w.git(&w.consumer, &["add", "-A"]);
+    w.git(&w.consumer, &["commit", "-qm", "zwnext"]);
+    w.git(&w.consumer, &["rm", "-q", "swl.toml"]);
+    w.git(&w.consumer, &["commit", "-qm", "landed, supposedly"]);
+    w.api
+        .set("zwanenzang", 5, "merged", &zw_head, Some(&zw_head));
+    failed(
+        &w.swl(
+            &w.consumer,
+            &["check", "--event", "mr", "--base", "origin/master"],
+            &[],
+        ),
+        1,
+        "zwnext: the new input is not the repo \"zwanenzang\"",
+    );
+}
+
 #[test]
 fn publish_refuses_the_base_branch_and_lock_changes() {
     let w = World::new("publish-refusals");

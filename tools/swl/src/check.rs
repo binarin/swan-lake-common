@@ -14,7 +14,7 @@ use crate::{
     config::Config,
     forge::{PrReader, PrState},
     git::{git, git_ok, short},
-    lock::{Lock, Node, attrs_url},
+    lock::{Lock, attrs_url},
     lock_rules,
     manifest::{Entry, MANIFEST_FILE, Manifest},
     nix::Nix,
@@ -179,10 +179,14 @@ fn relock(
     run().map_err(|e| format!("{e:#}"))
 }
 
-/// Whether a lock node's URLs name `repo`.
+/// Whether a lock node is `repo`: both its `original` and its `locked`
+/// source name it, so that neither can point elsewhere.
 fn node_names_repo(config: &Config, node: &Value, repo: &str) -> bool {
-    serde_json::from_value::<Node>(node.clone())
-        .is_ok_and(|n| n.urls().iter().any(|u| config.url_names_repo(u, repo)))
+    ["original", "locked"].iter().all(|k| {
+        node.get(k)
+            .and_then(attrs_url)
+            .is_some_and(|u| config.url_names_repo(&u, repo))
+    })
 }
 
 /// The lock rules for an MR whose `flake.lock` differs from the merge base
@@ -515,6 +519,33 @@ mod tests {
         );
         assert!(e(&[("GITHUB_EVENT_NAME", "schedule")]).is_err());
         assert!(e(&[]).is_err());
+    }
+
+    #[test]
+    fn an_added_input_is_its_repo_by_every_url() {
+        let config = Config::default();
+        let zw = "https://forgejo.lynx-lizard.ts.net/binarin/zwanenzang";
+        let node = |original: &str, locked: &str| {
+            serde_json::json!({
+                "original": {"type": "git", "url": original},
+                "locked": {"type": "git", "url": locked, "rev": "a".repeat(40)},
+            })
+        };
+        assert!(node_names_repo(&config, &node(zw, zw), "zwanenzang"));
+        // The review's attack: the forge in original, another repo locked.
+        assert!(!node_names_repo(
+            &config,
+            &node(zw, "https://evil.example/zw"),
+            "zwanenzang"
+        ));
+        assert!(!node_names_repo(
+            &config,
+            &node("https://evil.example/zw", zw),
+            "zwanenzang"
+        ));
+        let mut only_original = node(zw, zw);
+        only_original.as_object_mut().unwrap().remove("locked");
+        assert!(!node_names_repo(&config, &only_original, "zwanenzang"));
     }
 
     fn entry() -> Entry {

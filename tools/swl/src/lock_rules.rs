@@ -708,8 +708,11 @@ mod tests {
         })
     }
 
+    /// Like `check`'s: both `original` and `locked` name the repo.
     fn names_repo(node: &Value, repo: &str) -> bool {
-        node.pointer("/locked/repo").and_then(Value::as_str) == Some(repo)
+        ["/original/repo", "/locked/repo"]
+            .iter()
+            .all(|p| node.pointer(p).and_then(Value::as_str) == Some(repo))
     }
 
     /// The rules with `relocked` as what nix locks (HEAD's lock when
@@ -1098,6 +1101,13 @@ mod tests {
         landed["nodes"]["next"]["locked"]["rev"] = json!(rev('b'));
         let removed = [("common-next", entry("swan-lake-common", 24))];
         ok(&judge(&old, &landed, &removed, &[(24, merged('c'))], &h));
+        // Locked elsewhere, though its original is the repo.
+        let mut elsewhere = landed.clone();
+        elsewhere["nodes"]["next"]["locked"]["repo"] = json!("evil");
+        fails(
+            &judge(&old, &elsewhere, &removed, &[(24, merged('c'))], &h),
+            "common-next: the new input is not the repo",
+        );
         let other = [("common-next", entry("zwanenzang", 24))];
         fails(
             &judge(&old, &landed, &other, &[(24, merged('c'))], &h),
