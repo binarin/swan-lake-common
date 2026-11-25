@@ -108,6 +108,108 @@ fn graph(lock: &Value, key: &str, active: &mut Vec<String>) -> Result<Value> {
     }))
 }
 
+/// The root inputs whose part of the lock differs between `old` and `new`.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct RootChanges {
+    /// In both, with a different edge or resolved graph.
+    pub changed: Vec<String>,
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+}
+
+impl RootChanges {
+    pub fn all(&self) -> Vec<String> {
+        let mut all: Vec<String> = self
+            .changed
+            .iter()
+            .chain(&self.added)
+            .chain(&self.removed)
+            .cloned()
+            .collect();
+        all.sort();
+        all
+    }
+}
+
+/// Which root inputs changed: a direct input when its graph (sources, and
+/// `follows` edges as paths) differs, a `follows` input when its path does.
+pub fn root_changes(old: &Value, new: &Value) -> Result<RootChanges> {
+    let (old_inputs, new_inputs) = (root_inputs(old)?, root_inputs(new)?);
+    let mut out = RootChanges::default();
+    for (name, edge) in &old_inputs {
+        let Some(new_edge) = new_inputs.get(name) else {
+            out.removed.push(name.clone());
+            continue;
+        };
+        let same = match (edge, new_edge) {
+            (Value::String(a), Value::String(b)) => {
+                graph(old, a, &mut Vec::new())? == graph(new, b, &mut Vec::new())?
+            }
+            (a, b) => a == b,
+        };
+        if !same {
+            out.changed.push(name.clone());
+        }
+    }
+    for name in new_inputs.keys() {
+        if !old_inputs.contains_key(name) {
+            out.added.push(name.clone());
+        }
+    }
+    Ok(out)
+}
+
+/// Where lock `b` differs from lock `a` as a graph, if it does: the version,
+/// a root edge, or a node below a root input (its `locked`, `original` or
+/// `flake`, or its edges). Node key names do not matter.
+pub fn first_difference(a: &Value, b: &Value) -> Result<Option<String>> {
+    if a.get("version") != b.get("version") {
+        return Ok(Some("the lock file version".into()));
+    }
+    let (ai, bi) = (root_inputs(a)?, root_inputs(b)?);
+    let names: BTreeSet<&String> = ai.keys().chain(bi.keys()).collect();
+    for name in names {
+        match (ai.get(name), bi.get(name)) {
+            (Some(Value::String(x)), Some(Value::String(y))) => {
+                let (ga, gb) = (graph(a, x, &mut Vec::new())?, graph(b, y, &mut Vec::new())?);
+                if let Some(d) = graph_difference(&ga, &gb, name) {
+                    return Ok(Some(d));
+                }
+            }
+            (x, y) if x != y => return Ok(Some(format!("the root input {name}"))),
+            _ => {}
+        }
+    }
+    Ok(None)
+}
+
+fn graph_difference(a: &Value, b: &Value, path: &str) -> Option<String> {
+    if a.get("follows").is_some() || b.get("follows").is_some() {
+        return (a != b).then(|| format!("{path} (its follows)"));
+    }
+    for field in ["locked", "original", "flake"] {
+        if a.get(field) != b.get(field) {
+            return Some(format!("{path} (its {field})"));
+        }
+    }
+    let empty = Map::new();
+    let ai = a.get("inputs").and_then(Value::as_object).unwrap_or(&empty);
+    let bi = b.get("inputs").and_then(Value::as_object).unwrap_or(&empty);
+    let names: BTreeSet<&String> = ai.keys().chain(bi.keys()).collect();
+    for name in names {
+        let sub = format!("{path}/{name}");
+        match (ai.get(name), bi.get(name)) {
+            (Some(x), Some(y)) => {
+                if let Some(d) = graph_difference(x, y, &sub) {
+                    return Some(d);
+                }
+            }
+            _ => return Some(format!("{sub} (in one lock only)")),
+        }
+    }
+    None
+}
+
 fn locked_field<'a>(lock: &'a Value, key: &str, field: &str) -> Option<&'a Value> {
     lock.pointer(&format!("/nodes/{key}/locked/{field}"))
 }
@@ -326,6 +428,65 @@ mod tests {
         new["nodes"]["renamed"]["inputs"]["dep"] = json!(["dep"]);
         let e = verify(&old, &new, &common()).unwrap_err().to_string();
         assert!(e.contains("same revision changed"), "{e}");
+    }
+
+    #[test]
+    fn root_changes_by_graph() {
+        let (old, mut new) = (lock(), lock());
+        assert_eq!(root_changes(&old, &new).unwrap(), RootChanges::default());
+        // A dependency of common moves: common changed; dep follows it and
+        // keeps its path.
+        new["nodes"]["dep"]["locked"]["rev"] = json!("new dependency");
+        let c = root_changes(&old, &new).unwrap();
+        assert_eq!(c.changed, ["common"]);
+        assert!(c.added.is_empty() && c.removed.is_empty());
+        // A follows path changes; an input is added and one removed.
+        let mut new = lock();
+        new["nodes"]["root"]["inputs"]["dep"] = json!(["other"]);
+        new["nodes"]["root"]["inputs"]["fresh"] = json!("other");
+        new["nodes"]["root"]["inputs"]
+            .as_object_mut()
+            .unwrap()
+            .remove("other");
+        let c = root_changes(&old, &new).unwrap();
+        assert_eq!(c.changed, ["dep"]);
+        assert_eq!(c.added, ["fresh"]);
+        assert_eq!(c.removed, ["other"]);
+        assert_eq!(c.all(), ["dep", "fresh", "other"]);
+    }
+
+    #[test]
+    fn differences_between_lock_graphs() {
+        let a = lock();
+        assert_eq!(first_difference(&a, &a).unwrap(), None);
+        // Key names do not matter.
+        let mut renamed = lock();
+        let node = renamed["nodes"]["dep"].take();
+        renamed["nodes"].as_object_mut().unwrap().remove("dep");
+        renamed["nodes"]["dep_2"] = node;
+        renamed["nodes"]["renamed"]["inputs"]["dep"] = json!("dep_2");
+        assert_eq!(first_difference(&a, &renamed).unwrap(), None);
+        let mut b = lock();
+        b["nodes"]["dep"]["locked"]["narHash"] = json!("sha256-other");
+        assert_eq!(
+            first_difference(&a, &b).unwrap().as_deref(),
+            Some("common/dep (its locked)")
+        );
+        let mut b = lock();
+        b["nodes"]["renamed"]["inputs"]["extra"] = json!("other");
+        assert_eq!(
+            first_difference(&a, &b).unwrap().as_deref(),
+            Some("common/extra (in one lock only)")
+        );
+        let mut b = lock();
+        b["nodes"]["root"]["inputs"]["dep"] = json!(["other"]);
+        assert_eq!(
+            first_difference(&a, &b).unwrap().as_deref(),
+            Some("the root input dep")
+        );
+        let mut b = lock();
+        b["version"] = json!(8);
+        assert!(first_difference(&a, &b).unwrap().is_some());
     }
 
     #[test]

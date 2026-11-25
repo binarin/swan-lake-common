@@ -353,16 +353,14 @@ pub fn run(dir: &Path, wait: Option<Wait>, api: &dyn PrReader) -> Result<ExitCod
     println!("swl finalize: committed {head} on {branch}: {subject}");
     if manifest.is_empty() {
         println!(
-            "Next, after checking the commit (nothing was pushed):\n  \
-             git push origin HEAD:master        # fast-forward only; the MR must be based on current master\n  \
-             git push origin --delete {branch}  # Forgejo marks the MR merged; stacked MRs restack"
+            "Next (nothing was pushed): push this commit to {branch} (fast-forward) and merge \
+             the MR, whose swl check accepts the landing."
         );
     } else {
         let n = manifest.inputs.len();
         println!(
-            "{n} entr{} remain in {MANIFEST_FILE}. Keep this commit local: pushed to the MR branch, \
-             it fails the MR's swl check, since an MR must not change flake.lock. Rerun swl \
-             finalize once the rest has landed, then push to master.",
+            "{n} entr{} remain in {MANIFEST_FILE}. Nothing was pushed; pushed to the MR branch, \
+             this partial landing passes swl check. Rerun swl finalize once the rest has landed.",
             if n == 1 { "y" } else { "ies" }
         );
     }

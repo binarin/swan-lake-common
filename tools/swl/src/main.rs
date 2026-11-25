@@ -1,5 +1,3 @@
-// The check rules use all of it from the next commit on.
-#[allow(dead_code)]
 mod ancestry;
 mod check;
 mod ci;
@@ -8,10 +6,10 @@ mod env;
 mod finalize;
 mod forge;
 mod git;
-#[allow(dead_code)]
 mod github;
 mod lock;
 mod lock_change;
+mod lock_rules;
 mod manifest;
 mod nix;
 mod nix_args;
@@ -126,7 +124,7 @@ enum Commands {
         #[arg(long, default_value_t = 10, value_name = "SECONDS")]
         interval: u64,
     },
-    /// CI gate: on an MR, flake.lock unchanged and swl.toml valid; on master, no swl.toml and the pin policy
+    /// CI gate: on an MR, flake.lock unchanged or changed by a landing or forward moves, and swl.toml valid; on master, no swl.toml and the pin policy
     Check {
         /// The repo [default: current directory]
         dir: Option<PathBuf>,
@@ -317,6 +315,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 base.as_deref(),
                 &config,
                 &AnonApi::from_env(),
+                &ancestry::RemoteHistory::from_env(),
             );
         }
         Commands::Ci {

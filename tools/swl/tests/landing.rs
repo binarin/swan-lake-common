@@ -342,6 +342,7 @@ impl World {
             "RUNNER_TEMP",
             "SWL_FORGE_API",
             "SWL_FORGE_GIT",
+            "SWL_GITHUB_TOKEN",
         ] {
             c.env_remove(var);
         }
@@ -362,7 +363,11 @@ impl World {
             .env("SWL_FJ_KEYS", self.root.join("fj-keys.json"))
             .env("FJ_STATE", &self.fj_state)
             .env("SWL_FORGE_API", self.api.base())
-            .env("SWL_FORGE_GIT", format!("file://{}", self.forge.display()));
+            .env("SWL_FORGE_GIT", format!("file://{}", self.forge.display()))
+            // No GitHub source here: nothing may ask the real API.
+            .env("SWL_GITHUB_API", "http://127.0.0.1:9")
+            // The forge's repos are file:// URLs.
+            .env("SWL_ALLOW_FILE_URLS", "1");
     }
 
     fn git(&self, dir: &Path, args: &[&str]) -> String {
@@ -791,7 +796,14 @@ fn finalize_relocks_landed_entries_in_one_commit() {
         "{out}"
     );
     assert!(out.contains("1 entry remain"), "{out}");
-    assert!(out.contains("Keep this commit local"), "{out}");
+    // The partial landing passes the MR's check by rule (i).
+    let check = ["check", "--event", "mr", "--base", "origin/master"];
+    let out_check = stdout(&w.swl(&w.consumer, &check, &[]));
+    assert!(
+        out_check.contains("lib: swan-lake-common#1 lands: merged as"),
+        "{out_check}"
+    );
+    assert!(out_check.contains("MR checks passed"), "{out_check}");
     assert_eq!(w.git(&w.consumer, &["rev-parse", "HEAD~1"]), before);
     assert_eq!(
         w.git(&w.consumer, &["log", "-1", "--format=%s"]),
@@ -827,9 +839,44 @@ fn finalize_relocks_landed_entries_in_one_commit() {
     w.api
         .set("swan-lake-common", 2, "merged", &head, Some(&head));
     let out = stdout(&w.swl(&w.consumer, &["finalize"], &[]));
-    assert!(out.contains("git push origin HEAD:master"), "{out}");
-    assert!(out.contains("git push origin --delete feat"), "{out}");
+    assert!(out.contains("check accepts the landing"), "{out}");
     assert!(!w.consumer.join("swl.toml").exists());
+    let out_check = stdout(&w.swl(&w.consumer, &check, &[]));
+    assert!(
+        out_check.contains("extra: swan-lake-common#2 lands"),
+        "{out_check}"
+    );
+    // An entry dropped unmerged leaves its input to a forward move.
+    w.api.set("swan-lake-common", 2, "open", &head, None);
+    let out_check = stdout(&w.swl(&w.consumer, &check, &[]));
+    assert!(
+        out_check.contains(
+            "extra: swan-lake-common#2 was removed from swl.toml but is open: not a landing"
+        ),
+        "{out_check}"
+    );
+    // Merged as a commit the new rev does not have: not landed.
+    let elsewhere = "f".repeat(40);
+    w.api
+        .set("swan-lake-common", 2, "merged", &head, Some(&elsewhere));
+    failed(
+        &w.swl(&w.consumer, &check, &[]),
+        1,
+        "extra: swan-lake-common#2: its merge commit ffffffffffff is not in",
+    );
+    w.api
+        .set("swan-lake-common", 2, "merged", &head, Some(&head));
+    // The owner's tamper: a narHash below the landed input.
+    let tampered = tamper_nested_hash(&w.consumer);
+    w.git(&w.consumer, &["commit", "-qam", "tamper"]);
+    failed(
+        &w.swl(&w.consumer, &check, &[]),
+        1,
+        &format!(
+            "flake.lock is not what nix locks for extra, lib at the new revisions: it differs at {tampered}"
+        ),
+    );
+    w.git(&w.consumer, &["reset", "-q", "--hard", "HEAD~1"]);
     assert_eq!(
         w.git(&w.consumer, &["show", "--format=", "--name-only", "HEAD"]),
         "flake.lock\nswl.toml"
@@ -845,6 +892,139 @@ fn finalize_relocks_landed_entries_in_one_commit() {
     w.git(&w.consumer, &["add", "swl.toml"]);
     w.git(&w.consumer, &["commit", "-qm", "empty manifest"]);
     failed(&w.swl(&w.consumer, &["finalize"], &[]), 1, "has no entries");
+}
+
+/// Changes the narHash of the consumer lock's `lib/zwanenzang` node, below
+/// a root input, as the owner's repro did; returns that input path.
+fn tamper_nested_hash(consumer: &Path) -> String {
+    let path = consumer.join("flake.lock");
+    let mut lock: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    let key = lock["nodes"]["lib"]["inputs"]["zwanenzang"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    lock["nodes"][&key]["locked"]["narHash"] =
+        "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into();
+    fs::write(&path, serde_json::to_string_pretty(&lock).unwrap()).unwrap();
+    "lib/zwanenzang (its locked)".into()
+}
+
+#[test]
+fn check_accepts_forward_moves_and_refuses_backwards() {
+    let w = World::new("forward");
+    // `current` moves on: c2 on the forge, as a promotion would.
+    w.git(&w.common, &["push", "-q", "origin", "HEAD:current"]);
+    stdout(&w.nix(&w.consumer, &["flake", "update", "lib"]));
+    w.git(&w.consumer, &["commit", "-qam", "lib: bump"]);
+    let bump = w.git(&w.consumer, &["rev-parse", "HEAD"]);
+    let check = ["check", "--event", "mr", "--base", "origin/master"];
+    let out = stdout(&w.swl(&w.consumer, &check, &[]));
+    assert!(out.contains("lib: forward move "), "{out}");
+    assert!(out.contains("is in current of file://"), "{out}");
+
+    // Back to the old rev, against the bump as the base: backwards.
+    w.git(
+        &w.consumer,
+        &["checkout", "-q", "HEAD~1", "--", "flake.lock"],
+    );
+    w.git(&w.consumer, &["commit", "-qam", "lib: back"]);
+    failed(
+        &w.swl(
+            &w.consumer,
+            &["check", "--event", "mr", "--base", &bump],
+            &[],
+        ),
+        1,
+        "is not a forward move",
+    );
+
+    // A nested node below the bumped input that nix would not lock so.
+    w.git(&w.consumer, &["reset", "-q", "--hard", &bump]);
+    let tampered = tamper_nested_hash(&w.consumer);
+    w.git(&w.consumer, &["commit", "-qam", "tamper"]);
+    failed(
+        &w.swl(&w.consumer, &check, &[]),
+        1,
+        &format!("it differs at {tampered}"),
+    );
+
+    // A forward rev with another ref is another source.
+    w.git(&w.consumer, &["reset", "-q", "--hard", &bump]);
+    let side = w.root.join("side");
+    w.git(
+        &w.root,
+        &[
+            "clone",
+            "-q",
+            &w.forge_repo("swan-lake-common").display().to_string(),
+            "side",
+        ],
+    );
+    w.git(&side, &["checkout", "-q", "origin/current"]);
+    fs::write(side.join("value.txt"), "c3").unwrap();
+    w.git(&side, &["commit", "-qam", "c3"]);
+    w.git(&side, &["push", "-q", "origin", "HEAD:refs/heads/side"]);
+    let c3 = w.git(&side, &["rev-parse", "HEAD"]);
+    let url = format!(
+        "git+file://{}?ref=side",
+        w.forge_repo("swan-lake-common").display()
+    );
+    stdout(&w.nix(
+        &w.consumer,
+        &["flake", "lock", "--override-input", "lib", &url],
+    ));
+    let lock = fs::read_to_string(w.consumer.join("flake.lock")).unwrap();
+    assert!(lock.contains(&c3), "{lock}");
+    w.git(&w.consumer, &["commit", "-qam", "lib: side"]);
+    let out = w.swl(
+        &w.consumer,
+        &["check", "--event", "mr", "--base", &bump],
+        &[],
+    );
+    failed(&out, 1, "lib: its locked source");
+
+    // Forward on the same source, but a rev the declared branch lacks.
+    w.git(&w.consumer, &["reset", "-q", "--hard", &bump]);
+    let mut lock: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(w.consumer.join("flake.lock")).unwrap()).unwrap();
+    lock["nodes"]["lib"]["locked"]["rev"] = c3.clone().into();
+    fs::write(
+        w.consumer.join("flake.lock"),
+        serde_json::to_string_pretty(&lock).unwrap(),
+    )
+    .unwrap();
+    w.git(&w.consumer, &["commit", "-qam", "lib: c3"]);
+    let out = w.swl(
+        &w.consumer,
+        &["check", "--event", "mr", "--base", &bump],
+        &[],
+    );
+    failed(&out, 1, "is not in current of file://");
+
+    // An input added to the lock is not a move.
+    w.git(&w.consumer, &["reset", "-q", "--hard", &bump]);
+    let flake = fs::read_to_string(w.consumer.join("flake.nix")).unwrap();
+    let new_input = format!(
+        "  inputs.newin.url = \"git+file://{}/binarin/zwanenzang\";\n",
+        w.forge.display()
+    );
+    fs::write(
+        w.consumer.join("flake.nix"),
+        flake.replacen("{\n", &format!("{{\n{new_input}"), 1),
+    )
+    .unwrap();
+    stdout(&w.nix(&w.consumer, &["flake", "lock"]));
+    w.git(&w.consumer, &["commit", "-qam", "newin"]);
+    failed(
+        &w.swl(
+            &w.consumer,
+            &["check", "--event", "mr", "--base", &bump],
+            &[],
+        ),
+        1,
+        "newin: the root input was added",
+    );
 }
 
 #[test]

@@ -166,10 +166,7 @@ The next steps are `swl publish <consumer>` (anyone), `mark <repo>#N ready`
 (anyone), wait for CI (nobody), `merge <repo>#N` (owner),
 `promote <branch>` (owner), `swl land` (anyone), `open the MR` (anyone) and
 `request merge when checks succeed` (owner) once the landing is pushed
-(`fix CI`, anyone, while it fails). Until slice 4b, whose `swl check` accepts
-a landing's lock change, the MR's `swl check` fails on that commit, so a
-pushed landing shows `landing pushed, CI failing`; the owner merges it by
-hand.
+(`fix CI`, anyone, while it fails).
 
 By default `status` fetches each checkout's remote (as `ws add` does, once per
 source) so that the stages are current, and finds a consumer's MR with
@@ -347,10 +344,13 @@ mr = 7
 - The format and code are not specific to consumers; a shared repo such as
   common can have a manifest for its own inputs (zwanenzang, the forks).
 
-Rules shared by all commands: an MR must not change `flake.lock` (CI
-enforces it); lock changes reach master only through `swl finalize` (for
-manifest entries) or by hand (routine bumps). A branch with entries is
-landed, not merged through the forge.
+Rules shared by all commands: an MR may change `flake.lock` in two ways
+only, which `swl check` enforces per root input: a landing (the relock of
+manifest entries whose MRs merged and were promoted, made by `swl
+finalize`, with those entries removed), or a forward move (a routine bump to
+a descendant of the old rev on the declared branch). Anything else in the
+lock is refused. A branch with entries lands once they are merged: its lock
+commit comes from `swl finalize`.
 
 ### `swl publish [--workspace DIR] <consumer>`
 
@@ -396,11 +396,60 @@ Exit status 1 with one line per problem.
 - `--event` defaults from the Forgejo Actions environment:
   `GITHUB_EVENT_NAME=pull_request` is `mr`; `push` with
   `GITHUB_REF=refs/heads/master` is `master`; anything else needs `--event`.
-- On an MR:
-  - `flake.lock` at HEAD equals the one at the merge base of HEAD and the
-    base: `--base REV`, else `origin/$GITHUB_BASE_REF`, which `check`
-    fetches (`--unshallow` in a shallow checkout; `fetch-depth: 0` is
-    better).
+- On an MR, against the merge base of HEAD and the base: `--base REV`,
+  else `origin/$GITHUB_BASE_REF`, which `check` fetches (`--unshallow` in a
+  shallow checkout; `fetch-depth: 0` is better). Several merge bases
+  (criss-cross merges) fail the check: rebase onto the base.
+  - `flake.lock` at HEAD equals the one at the merge base, or changes only
+    by the two accepted kinds of change. The removed entries are those named
+    in `swl.toml` at the merge base or at any commit since, minus HEAD's
+    entries. Each root input whose locked graph changed (its node, its
+    dependencies, or for a `follows` input its path) is one of:
+    - (i) a landing: it is the root of removed entries whose MRs are merged
+      (anonymous API); each merge commit is in the rev now locked at its
+      input path (a nested `common/zwanenzang` through common's new lock);
+      and the input moved as in (ii), or, new in the lock, is the repo its
+      entry names and is in its declared branch. A removed entry whose MR is
+      open, closed or unknown was dropped, not landed: a note, and its root
+      must be a forward move.
+    - (ii) a forward move: the input keeps its source (its `original` and
+      `flake` unchanged, its `locked` unchanged but for `rev`, `narHash`,
+      `lastModified` and `revCount`), and the new rev descends from the old
+      one and is in the branch the input's `flake.nix` declaration names
+      (promoted, e.g. `swan-lake-current`; the default branch without a
+      ref). The declaration is read from HEAD's `flake.nix`; when it differs
+      from the merge base's, a note says so.
+
+    Besides, no root input was removed, only a landing adds one, a
+    reformatted lock is not a change, nothing else in the lock changed
+    (other nodes, other inputs' graphs, shared nodes; a moved input that
+    keeps its rev keeps its graph), and the lock below the moved inputs is
+    exactly what nix locks for them at their new revisions: `check` runs
+    `nix flake lock` on HEAD's flake with the merge base's lock as the
+    reference, without the moved inputs, and each overridden
+    (`--override-input`) to its new locked source, into a scratch lock;
+    nix then takes their inputs from their own `flake.lock` at that
+    revision, with the consumer's `follows`, and the result must equal
+    HEAD's lock as a graph. That fetches the moved inputs' sources, as CI
+    does anyway. HEAD's lock passes the pin policy below. A partial landing
+    (entries remain) passes; a removed entry whose input did not change is a
+    note. Entries still at HEAD are checked as below.
+
+    Only GitHub sources on github.com and git sources over `https://` are
+    judged; their revs must be full, and owner and repo names plain. Other
+    inputs (tarballs, `path:`, `file://`, ssh, …) that move fail the check
+    (`SWL_ALLOW_FILE_URLS=1` allows `file://`, for tests).
+
+    Ancestry is asked of the locked source: for git sources (Forgejo, any
+    `git+https` URL) by a commit-only fetch; for GitHub sources (`github:`
+    and `https://github.com/` URLs) by GitHub's compare API
+    (`GET /repos/{owner}/{repo}/compare/{base}...{head}`), since a nixpkgs
+    fetch is too large. The API is anonymous, which GitHub limits to 60
+    requests an hour per address, a few per changed input; set
+    `SWL_GITHUB_TOKEN` to send a token (only to `https://api.github.com`, or
+    a loopback test server; `SWL_GITHUB_API` redirects it, for tests). An
+    answer that cannot be had (offline, rate limited, an unknown revision)
+    fails the check with the reason.
   - `swl.toml`, if present, parses, and for each entry: the input is that
     repo (its lock node's URL by the config's URL patterns, or for a root
     input not yet in the lock, its `flake.nix` URL), and the MR exists and is
@@ -508,9 +557,9 @@ git push origin --delete <branch>    # Forgejo marks the MR merged; stacked MRs 
 ```
 
 Master's CI then runs `swl check` on the result. When entries remain, the
-commit (which changes `flake.lock`) must stay local: pushed to the MR branch
-it fails the MR's `swl check`. Rerun `finalize` once the rest has landed,
-then push to master; `swl publish` refuses to push it.
+commit is a partial landing, which the MR's `swl check` accepts; rerun
+`finalize` once the rest has landed. `swl publish` refuses to push a lock
+change.
 
 ### Forge access
 
@@ -568,6 +617,9 @@ the override URLs) redirect them, for tests.
   stacked MRs).
 - `finalize`'s history fetch is cheap for swan-lake-common, but would fetch
   the whole commit history of a large fork such as nixpkgs.
+- `check` refuses moves of inputs that are not GitHub or `https://` git
+  sources (tarballs, GitLab, sourcehut, …), even legitimate ones: bump
+  those on master directly.
 - `finalize` relocks a root input as a whole: nested entries land when the
   parent (common) has bumped and promoted them.
 - `status` tells a landing from a plain lock bump by the branch's history:

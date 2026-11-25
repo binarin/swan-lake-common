@@ -1,6 +1,7 @@
 //! `swl check`: the CI gate. On an MR, `flake.lock` is unchanged against
-//! the merge base with the target branch and `swl.toml` is valid. On master,
-//! there is no `swl.toml` and the common pin policy holds.
+//! the merge base with the target branch, or changed only by a landing or
+//! forward moves (`lock_rules`), and `swl.toml` is valid. On master, there
+//! is no `swl.toml` and the common pin policy holds.
 
 use std::{collections::BTreeMap, fs, path::Path, process::ExitCode};
 
@@ -9,13 +10,16 @@ use clap::ValueEnum;
 use serde_json::Value;
 
 use crate::{
+    ancestry::History,
     config::Config,
     forge::{PrReader, PrState},
     git::{git, git_ok, short},
-    lock::{Lock, attrs_url},
+    lock::{Lock, Node, attrs_url},
+    lock_rules,
     manifest::{Entry, MANIFEST_FILE, Manifest},
     nix::Nix,
     pin_policy,
+    tempdir::TempDir,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -67,12 +71,33 @@ fn mr_base(
     Ok(tracking)
 }
 
-/// The failure, if `flake.lock` at HEAD differs from the merge base of HEAD
-/// and `base`.
-pub fn lock_change(root: &Path, base: &str) -> Result<Option<String>> {
-    let mb = git(root, &["merge-base", "HEAD", base]).with_context(|| {
+/// The one merge base of HEAD and `base`; several (criss-cross merges) are
+/// refused.
+fn merge_base(root: &Path, base: &str) -> Result<String> {
+    let all = git(root, &["merge-base", "--all", "HEAD", base]).with_context(|| {
         format!("no merge base of HEAD and {base} (a shallow checkout needs fetch-depth: 0)")
     })?;
+    match all.lines().collect::<Vec<_>>().as_slice() {
+        [one] => Ok(one.to_string()),
+        many => bail!(
+            "HEAD and {base} have {} merge bases (criss-cross merges); rebase onto {base}",
+            many.len()
+        ),
+    }
+}
+
+fn lock_differs(root: &Path, mb: &str) -> Result<bool> {
+    Ok(!git(
+        root,
+        &["diff", "--name-only", mb, "HEAD", "--", "flake.lock"],
+    )?
+    .is_empty())
+}
+
+/// The failure, if `flake.lock` at HEAD differs from the merge base of HEAD
+/// and `base`: `publish` pushes no lock change.
+pub fn lock_change(root: &Path, base: &str) -> Result<Option<String>> {
+    let mb = merge_base(root, base)?;
     let changed = git(
         root,
         &["diff", "--name-only", &mb, "HEAD", "--", "flake.lock"],
@@ -85,6 +110,147 @@ pub fn lock_change(root: &Path, base: &str) -> Result<Option<String>> {
             short(&mb)
         )
     }))
+}
+
+/// The lock at `rev`, parsed.
+fn lock_at(root: &Path, rev: &str) -> Result<Option<Value>> {
+    let file = format!("{rev}:flake.lock");
+    if git_ok(root, &["cat-file", "-e", &file]).is_none() {
+        return Ok(None);
+    }
+    let text = git(root, &["show", &file])?;
+    serde_json::from_str(&text)
+        .map(Some)
+        .with_context(|| format!("parsing flake.lock at {}", short(rev)))
+}
+
+/// The declarations of `flake.nix` at the merge base `mb`.
+fn base_declarations(root: &Path, mb: &str, nix: &Nix) -> Result<BTreeMap<String, Value>> {
+    let tmp = TempDir::new("swl-check-base")?;
+    fs::write(
+        tmp.path().join("flake.nix"),
+        git(root, &["show", &format!("{mb}:flake.nix")])?,
+    )?;
+    nix.declarations(tmp.path())
+}
+
+/// A root input's declaration in HEAD's `flake.nix`: its ref, and whether
+/// it differs from the merge base's (`base`, which cannot be read is a
+/// difference).
+fn declaration(
+    decls: &mut Decls,
+    base: &Result<BTreeMap<String, Value>, String>,
+    input: &str,
+) -> Result<lock_rules::Declaration, String> {
+    let (nix, d) = decls.get().map_err(|e| format!("{e:#}"))?;
+    let decl = d
+        .get(input)
+        .ok_or_else(|| format!("flake.nix does not declare {input}"))?;
+    let attrs = match decl.get("url").and_then(Value::as_str) {
+        Some(url) => nix.parse_flake_ref(url).map_err(|e| format!("{e:#}"))?,
+        None if decl.get("type").is_some() => decl.clone(),
+        None => return Err(format!("{input} has no url in flake.nix")),
+    };
+    Ok(lock_rules::Declaration {
+        branch: attrs.get("ref").and_then(Value::as_str).map(str::to_string),
+        changed: base.as_ref().map_or(true, |b| b.get(input) != Some(decl)),
+    })
+}
+
+/// The lock nix makes for the flake at `root` from `reference`, with the
+/// overrides (`Nix::lock_from`). It fetches the overridden sources.
+fn relock(
+    nix: &Nix,
+    root: &Path,
+    reference: &Value,
+    overrides: &[(String, String)],
+) -> Result<Value, String> {
+    let run = || -> Result<Value> {
+        let tmp = TempDir::new("swl-check-relock")?;
+        let (reference_path, output) = (
+            tmp.path().join("reference.lock"),
+            tmp.path().join("flake.lock"),
+        );
+        fs::write(&reference_path, serde_json::to_vec_pretty(reference)?)?;
+        nix.lock_from(root, &reference_path, overrides, &output)?;
+        let text = fs::read_to_string(&output).context("nix wrote no lock")?;
+        serde_json::from_str(&text).context("parsing the lock nix wrote")
+    };
+    run().map_err(|e| format!("{e:#}"))
+}
+
+/// Whether a lock node's URLs name `repo`.
+fn node_names_repo(config: &Config, node: &Value, repo: &str) -> bool {
+    serde_json::from_value::<Node>(node.clone())
+        .is_ok_and(|n| n.urls().iter().any(|u| config.url_names_repo(u, repo)))
+}
+
+/// The lock rules for an MR whose `flake.lock` differs from the merge base
+/// `mb`: a landing or forward moves (`lock_rules`), and the pin policy.
+#[allow(clippy::too_many_arguments)]
+fn check_lock_change(
+    root: &Path,
+    mb: &str,
+    head: &Manifest,
+    config: &Config,
+    api: &dyn PrReader,
+    history: &dyn History,
+    decls: &mut Decls,
+    out: &mut Outcome,
+) -> Result<()> {
+    let (Some(old), Some(new)) = (lock_at(root, mb)?, lock_at(root, "HEAD")?) else {
+        out.errors.push(format!(
+            "flake.lock is added or removed against the merge base {}: an MR must not do that",
+            short(mb)
+        ));
+        return Ok(());
+    };
+    let (removed, notes) = lock_rules::removed_entries(root, mb, head)?;
+    out.notes.extend(notes);
+    let decls = std::cell::RefCell::new(decls);
+    let base = std::cell::OnceCell::new();
+    let declared = |input: &str| {
+        let mut d = decls.borrow_mut();
+        let base = base.get_or_init(|| {
+            let (nix, _) = d.get().map_err(|e| format!("{e:#}"))?;
+            base_declarations(root, mb, nix).map_err(|e| format!("{e:#}"))
+        });
+        declaration(&mut d, base, input)
+    };
+    let relock = |reference: &Value, overrides: &[(String, String)]| {
+        let mut d = decls.borrow_mut();
+        let (nix, _) = d.get().map_err(|e| format!("{e:#}"))?;
+        relock(nix, root, reference, overrides)
+    };
+    let names_repo = |node: &Value, repo: &str| node_names_repo(config, node, repo);
+    let j = lock_rules::Rules {
+        old: &old,
+        new: &new,
+        removed: &removed,
+        declared: &declared,
+        api,
+        history,
+        names_repo: &names_repo,
+        relock: &relock,
+    }
+    .judge()?;
+    out.notes.extend(j.notes);
+    out.errors.extend(j.errors);
+    let mut decls = decls.borrow_mut();
+    match decls.get() {
+        Ok((nix, d)) => match pin_policy::check(d, &new, &|url| nix.parse_flake_ref(url)) {
+            Ok(Some(pins)) => out.notes.push(format!(
+                "HEAD's flake.lock passes the pin policy: common is canonical at {}",
+                short(&pins.common_rev)
+            )),
+            Ok(None) => {}
+            Err(e) => out
+                .errors
+                .push(format!("HEAD's flake.lock breaks the pin policy: {e:#}")),
+        },
+        Err(e) => out.errors.push(format!("{e:#}")),
+    }
+    Ok(())
 }
 
 /// The MR states for CI: open and merged MRs are usable (merged with a note
@@ -184,13 +350,14 @@ pub fn check_mr(
     base: &str,
     config: &Config,
     api: &dyn PrReader,
+    history: &dyn History,
     nix: &dyn Fn() -> Result<Nix>,
 ) -> Result<Outcome> {
     let mut out = Outcome {
         errors: Vec::new(),
         notes: Vec::new(),
     };
-    out.errors.extend(lock_change(root, base)?);
+    let mb = merge_base(root, base)?;
     let manifest = match Manifest::read(root) {
         Ok(m) => m.unwrap_or_default(),
         Err(e) => {
@@ -198,12 +365,17 @@ pub fn check_mr(
             return Ok(out);
         }
     };
-    let lock = Lock::read(root)?;
     let mut decls = Decls {
         root,
         nix,
         cache: None,
     };
+    if lock_differs(root, &mb)? {
+        check_lock_change(
+            root, &mb, &manifest, config, api, history, &mut decls, &mut out,
+        )?;
+    }
+    let lock = Lock::read(root)?;
     for (path, entry) in &manifest.inputs {
         if let Some(e) = entry_repo_error(path, entry, lock.as_ref(), config, &mut decls)? {
             out.errors.push(e);
@@ -270,6 +442,7 @@ pub fn run(
     base: Option<&str>,
     config: &Config,
     api: &dyn PrReader,
+    history: &dyn History,
 ) -> Result<ExitCode> {
     let var = |k: &str| std::env::var(k).ok();
     let root = std::path::PathBuf::from(git(dir, &["rev-parse", "--show-toplevel"])?);
@@ -280,7 +453,7 @@ pub fn run(
     let out = match event {
         Event::Mr => {
             let base = mr_base(&root, base, &var)?;
-            check_mr(&root, &base, config, api, &Nix::find)?
+            check_mr(&root, &base, config, api, history, &Nix::find)?
         }
         Event::Master => check_master(&root, &Nix::find()?)?,
     };

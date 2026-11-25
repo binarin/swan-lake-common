@@ -485,8 +485,6 @@ pub fn consumer_verdict(f: &ConsumerFacts) -> Verdict {
     }
     let which = |n: &u64| format!("{c}#{n}");
     if f.landing_pushed {
-        // Until slice 4b's `swl check` accepts a landing lock change, the
-        // MR's swl check fails on it; the owner merges by hand.
         return match &f.mr {
             MrFacts::Read {
                 number,
@@ -502,7 +500,7 @@ pub fn consumer_verdict(f: &ConsumerFacts) -> Verdict {
             } => match ci {
                 Ok(Some(CiState::Failing(_))) => verdict(
                     Stage::LandingPushed { ci_failing: true },
-                    "fix CI (until slice 4b swl check fails on a landing commit)",
+                    "fix CI",
                     Waits::Anyone,
                 ),
                 _ => verdict(
@@ -1821,7 +1819,7 @@ mod tests {
             }),
             (
                 "landing pushed, CI failing".into(),
-                "fix CI (until slice 4b swl check fails on a landing commit)".into(),
+                "fix CI".into(),
                 Waits::Anyone
             )
         );

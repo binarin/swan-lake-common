@@ -443,14 +443,14 @@ fn status_follows_a_change_from_local_to_landed() {
         "{out}"
     );
     t.f.git(&forge_consumer, &["update-ref", "-d", "refs/pull/5/head"]);
-    // Until slice 4b, the MR's swl check fails on the lock change.
+    // CI fails on the landing commit.
     t.f.api.set_status("swan-lake", &landing, "failure");
     let out = t.status(true);
     assert_row(
         &out,
         consumer,
         "landing pushed, CI failing",
-        "fix CI (until slice 4b swl check fails on a landing commit)",
+        "fix CI",
         "anyone",
     );
     // --no-fetch looks up no consumer MR.

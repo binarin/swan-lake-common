@@ -80,6 +80,38 @@ impl Nix {
         .with_context(|| format!("parsing the flake reference {url:?}"))
     }
 
+    /// `nix flake lock ROOT` from the lock `reference`, with `(input, flake
+    /// ref)` overrides, into `output`; the flake's own lock is not touched.
+    /// Inputs missing from `reference` are locked as nix does for a new
+    /// input: an overridden one at that flake ref, its own inputs from its
+    /// lock at that revision (honouring the root's follows).
+    pub fn lock_from(
+        &self,
+        root: &Path,
+        reference: &Path,
+        overrides: &[(String, String)],
+        output: &Path,
+    ) -> Result<()> {
+        let (root_s, reference_s, output_s) = (
+            root.to_string_lossy(),
+            reference.to_string_lossy(),
+            output.to_string_lossy(),
+        );
+        let mut args = vec![
+            "flake",
+            "lock",
+            &*root_s,
+            "--reference-lock-file",
+            &*reference_s,
+            "--output-lock-file",
+            &*output_s,
+        ];
+        for (input, flake_ref) in overrides {
+            args.extend(["--override-input", input, flake_ref]);
+        }
+        self.run(&args).map(drop)
+    }
+
     /// `nix flake update INPUTS --flake ROOT`, writing the new lock to
     /// `output` instead of the flake's `flake.lock`. `--refresh` so that a
     /// moved branch, such as a fresh promotion, is seen.
