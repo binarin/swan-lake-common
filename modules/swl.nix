@@ -78,4 +78,12 @@ in
       apps.swl = lib.mapAttrsRecursive (_: lib.mkDefault) (mkApp commonSelf.packages.${system}.swl);
     };
   };
+
+  # swl on PATH, for the machines where Swan Lake changes are made.
+  flake.homeModules.swl =
+    { pkgs, ... }:
+    {
+      key = "swan-lake-common.modules.home.swl";
+      home.packages = [ commonSelf.packages.${pkgs.stdenv.hostPlatform.system}.swl ];
+    };
 }
