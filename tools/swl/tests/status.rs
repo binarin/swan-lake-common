@@ -7,26 +7,53 @@ mod support;
 
 use std::{fs, path::Path};
 
-use support::{Forge, line, stdout};
+use support::{Forge, stdout};
 
-/// The status row of `name` (its first line).
-fn row<'a>(out: &'a str, name: &str) -> &'a str {
-    line(out, &format!("{name}  "))
+/// A line of the status without its tree glyphs.
+fn unglyphed(line: &str) -> &str {
+    line.trim_start_matches(['│', '├', '└', '─', ' '])
+}
+
+/// The status row of `name`: its line without the tree glyphs and the input
+/// path label, the columns' padding collapsed to two spaces: `<name>
+/// <stage>  waits: <who>  next: <step>`.
+fn row(out: &str, name: &str) -> String {
+    let want = format!("{name}  ");
+    for l in out.lines() {
+        let mut l = unglyphed(l).to_string();
+        while l.contains("   ") {
+            l = l.replace("   ", "  ");
+        }
+        if let Some((path, rest)) = l.split_once(": ")
+            && !path.contains(' ')
+            && rest.starts_with(&want)
+        {
+            return rest.to_string();
+        }
+        if l.starts_with(&want) {
+            return l;
+        }
+    }
+    panic!("no row {name:?} in\n{out}")
+}
+
+/// The first detail line that starts with `prefix`, without the glyphs.
+fn detail<'a>(out: &'a str, prefix: &str) -> &'a str {
+    out.lines()
+        .map(unglyphed)
+        .find(|l| l.starts_with(prefix))
+        .unwrap_or_else(|| panic!("no line starting with {prefix:?} in\n{out}"))
 }
 
 fn assert_row(out: &str, name: &str, stage: &str, next: &str, waits: &str) {
     let r = row(out, name);
     assert!(
-        r.starts_with(&format!("{name}  {stage}  next: ")),
-        "stage of {name}: want {stage:?} in {r:?}\n{out}"
+        r.starts_with(&format!("{name}  {stage}  waits: {waits}  next: ")),
+        "stage and waits of {name}: want {stage:?}, {waits:?} in {r:?}\n{out}"
     );
     assert!(
         r.contains(next),
         "next of {name}: want {next:?} in {r:?}\n{out}"
-    );
-    assert!(
-        r.ends_with(&format!("waits: {waits}")),
-        "waits of {name}: want {waits:?} in {r:?}\n{out}"
     );
 }
 
@@ -113,7 +140,7 @@ fn status_follows_a_change_from_local_to_landed() {
         "-",
         "nobody",
     );
-    assert!(line(&out, "  HEAD ").contains("sl-0010-x  clean"), "{out}");
+    assert!(detail(&out, "HEAD ").contains("sl-0010-x  clean"), "{out}");
     assert!(out.contains("  swan-lake: lib locked "), "{out}");
 
     // Local commits.
@@ -447,7 +474,7 @@ fn status_follows_a_change_from_local_to_landed() {
         "{out}"
     );
     assert!(
-        r.ends_with("next: check swan-lake#5 on the forge  waits: anyone"),
+        r.ends_with("waits: anyone  next: check swan-lake#5 on the forge"),
         "{out}"
     );
     t.f.git(&forge_consumer, &["update-ref", "-d", "refs/pull/5/head"]);

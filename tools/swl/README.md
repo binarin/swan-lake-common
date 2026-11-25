@@ -120,20 +120,37 @@ as with it, escape codes aside.
 `swl status [--workspace DIR] [--no-fetch]` for a workspace, and
 `swl status --from CONSUMER#MR [--no-fetch]` for a published change without
 one. It prints one row per shared checkout, per `swl.toml` entry that no
-checkout follows, and per consumer:
+checkout follows, and per consumer, as a tree per consumer:
 
 ```
-swan-lake-common@common  CI green  next: merge swan-lake-common#24  waits: owner
-  input common  HEAD 72f1eec  sl-0060-foo  clean
-  swan-lake: common locked 9477137, ahead 2, behind 0
-  swan-lake-common#24: open, sl-0060-foo at 72f1eec824d6, CI green
-swan-lake  CI green  next: wait for swan-lake-common#24 (merge swan-lake-common#24)  waits: owner
-  HEAD 1c0ffee  sl-0060-foo  clean
-  swl.toml: common swan-lake-common#24
-  swan-lake#31: open, sl-0060-foo at 1c0ffee00000, CI green
+swan-lake                              CI green  waits: owner   next: wait for swan-lake-common#24 (merge swan-lake-common#24)
+│  HEAD 1c0ffee  sl-0060-foo  clean
+│  swl.toml: common swan-lake-common#24, common/zwanenzang zwanenzang#7
+│  swan-lake#31: open, sl-0060-foo at 1c0ffee00000, CI green
+└─ common: swan-lake-common@common     CI green  waits: owner   next: merge swan-lake-common#24
+   │  input common  HEAD 72f1eec  sl-0060-foo  clean
+   │  swan-lake: common locked 9477137, ahead 2, behind 0
+   │  swan-lake-common#24: open, sl-0060-foo at 72f1eec824d6, CI green
+   └─ common/zwanenzang: zwanenzang#7  promoted  waits: anyone  next: swl land
+         swan-lake: common/zwanenzang
+         zwanenzang#7: merged as 5e1f00d9a2b4, in master; the declared source is not checked
 ```
 
-A row is the checkout or MR, its stage, the next step and who it waits for:
+Each consumer is a root. Under it, by input path, come the shared checkouts
+that override its inputs and its `swl.toml` entries (`<input path>:
+<checkout or MR>`), a nested path under its parent's row when there is one.
+A row under several consumers is shown in full under the first; under the
+others its line says `details under <consumer>: <path>`. Rows under no
+consumer follow as roots of their own; a blank line separates the roots.
+The columns are aligned: the stage, `waits: <who>`, `next: <step>` (a very
+long name or stage pushes its own line's columns). The glyphs are Unicode
+box drawing, also in a pipe or a file; this plain form is stable. On a
+terminal (see `--color` under [Commands](#commands)) each row's stage and
+waits are coloured by whom it waits for: the owner magenta (the next step
+too), anyone yellow, nobody cyan, done (`next: -`) green, unknown red; names
+are bold, glyphs and detail lines dimmed.
+
+A row is the checkout or MR, its stage, who it waits for and the next step:
 `owner` (merging, promoting, requesting a merge), `anyone` (whoever works on
 the change), or `nobody` (CI, a mirror, or nothing to do). The detail lines
 below it are the local facts:

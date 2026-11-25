@@ -20,6 +20,7 @@ mod publish;
 mod shim;
 mod start;
 mod status;
+mod status_tree;
 mod style;
 mod tempdir;
 mod workspace;

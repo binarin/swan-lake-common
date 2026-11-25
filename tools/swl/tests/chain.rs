@@ -454,23 +454,29 @@ fn three_level_chain_through_the_wrappers() {
         "{log:?}"
     );
 
-    // status: per shared checkout, the rev each flake in the workspace locks.
+    // status: the consumer's tree, the nested input under its parent; per
+    // shared checkout, the rev each flake in the workspace locks.
     let status = stdout(&t.swl(&["status"]));
+    let consumer_rev = t.git(&consumer, &["rev-parse", "--short", "HEAD"]);
     let common_rev = t.git(&common_src, &["rev-parse", "--short", "HEAD"]);
     let zw_rev = t.git(&t.src.join("zwanenzang"), &["rev-parse", "--short", "HEAD"]);
-    for line in [
-        "swan-lake-common@common  local  next: commit the changes, then swl publish swan-lake  waits: anyone".to_string(),
-        format!("  input common  HEAD {common_rev}  feature  dirty"),
-        format!("  swan-lake: common locked {common_rev}, ahead 0, behind 0"),
-        format!("  input zwanenzang  HEAD {zw_rev}  detached  dirty"),
-        format!("  swan-lake: common/zwanenzang locked {zw_rev}, ahead 0, behind 0"),
-        format!("  swan-lake-common@common: zwanenzang locked {zw_rev}, ahead 0, behind 0"),
-    ] {
-        assert!(
-            status.lines().any(|l| l == line),
-            "missing {line:?} in\n{status}"
-        );
-    }
+    let publish = "next: commit the changes, then swl publish swan-lake";
+    assert_eq!(
+        status,
+        format!(
+            "\
+swan-lake                                     no change (HEAD is in master)  waits: nobody  next: -
+│  HEAD {consumer_rev}  detached  clean
+│  no pending swl.toml entries
+└─ common: swan-lake-common@common            local                       waits: anyone  {publish}
+   │  input common  HEAD {common_rev}  feature  dirty
+   │  swan-lake: common locked {common_rev}, ahead 0, behind 0
+   └─ common/zwanenzang: zwanenzang@zwanenzang  local                       waits: anyone  {publish}
+         input zwanenzang  HEAD {zw_rev}  detached  dirty
+         swan-lake: common/zwanenzang locked {zw_rev}, ahead 0, behind 0
+         swan-lake-common@common: zwanenzang locked {zw_rev}, ahead 0, behind 0"
+        )
+    );
 
     // No lock in the workspace was written.
     let lock_after = (
@@ -488,8 +494,8 @@ fn three_level_chain_through_the_wrappers() {
     stdout(&t.real_nix(&common, &["flake", "update", "zwanenzang"]));
     let status = stdout(&t.swl(&["status"]));
     for line in [
-        format!("  swan-lake: common/zwanenzang locked {zw_rev}, ahead 0, behind 0"),
-        format!("  swan-lake-common@common: zwanenzang locked {zw_new}, ahead 0, behind 1"),
+        format!("         swan-lake: common/zwanenzang locked {zw_rev}, ahead 0, behind 0"),
+        format!("         swan-lake-common@common: zwanenzang locked {zw_new}, ahead 0, behind 1"),
     ] {
         assert!(
             status.lines().any(|l| l == line),

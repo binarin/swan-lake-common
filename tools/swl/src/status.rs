@@ -579,6 +579,10 @@ pub struct Row {
     pub name: String,
     /// The MR `repo#n` the row follows.
     pub follows: Option<String>,
+    /// Where the row sits in the change: the consumers and the input paths
+    /// there that it overrides or that their `swl.toml` entries name. Empty
+    /// for a consumer.
+    pub under: Vec<(String, String)>,
     pub verdict: Verdict,
     pub details: Vec<String>,
     /// What the verdict was computed from, for `swl land`.
@@ -624,6 +628,7 @@ impl Row {
         Self {
             name: name.to_string(),
             follows: None,
+            under: Vec::new(),
             verdict: verdict(Stage::Unknown(format!("{e:#}")), "-", Waits::Nobody),
             details,
             facts: RowFacts::None,
@@ -643,17 +648,6 @@ impl Row {
             landable = v.landable,
             "verdict"
         );
-    }
-
-    fn print(&self) {
-        let v = &self.verdict;
-        println!(
-            "{}  {}  next: {}  waits: {}",
-            self.name, v.stage, v.next, v.waits
-        );
-        for d in &self.details {
-            println!("  {d}");
-        }
     }
 }
 
@@ -1015,6 +1009,11 @@ fn shared_row(
     repo: &str,
 ) -> Row {
     let _span = tracing::debug_span!("checkout", name = %c.name).entered();
+    let under: Vec<(String, String)> = hops
+        .iter()
+        .filter(|h| h.checkout == c.name && h.target_is_consumer)
+        .map(|h| (h.target.clone(), h.input_path.clone()))
+        .collect();
     let mut details = Vec::new();
     let input = c.shared.as_ref().map_or("", |(_, i)| i.as_str());
     let result = (|| -> Result<(Verdict, Option<String>, SharedFacts)> {
@@ -1102,16 +1101,19 @@ fn shared_row(
         };
         Ok((shared_verdict(&facts), follows, facts))
     })();
-    match result {
+    let mut row = match result {
         Ok((verdict, follows, facts)) => Row {
             name: c.name.clone(),
             follows,
+            under: Vec::new(),
             verdict,
             details,
             facts: RowFacts::Shared(facts),
         },
         Err(e) => Row::unknown(&c.name, e, details),
-    }
+    };
+    row.under = under;
+    row
 }
 
 /// Whether the commit `at` is a pushed landing: it has no pending swl.toml
@@ -1238,6 +1240,7 @@ fn consumer_row(ctx: &Ctx, hops: &[Hop], ws: &Workspace, rows: &[Row], c: &Check
         Ok(facts) => Row {
             name: c.name.clone(),
             follows: None,
+            under: Vec::new(),
             verdict: consumer_verdict(&facts),
             details,
             facts: RowFacts::Consumer(facts),
@@ -1299,6 +1302,7 @@ fn mr_row(
     {
         let mut row = Row::unknown(&which, e, vec![format!("{consumer}: {path}")]);
         row.follows = Some(which);
+        row.under = vec![(consumer.to_string(), path.to_string())];
         return row;
     }
     let read = ctx.read_mr(&entry.repo, entry.mr, Some((dir.as_deref(), declared)));
@@ -1306,6 +1310,7 @@ fn mr_row(
         details: vec![format!("{consumer}: {path}"), describe_mr(&which, &read)],
         verdict: mr_verdict(&which, &read, consumer),
         follows: Some(which.clone()),
+        under: vec![(consumer.to_string(), path.to_string())],
         name: which,
         facts: RowFacts::Entry {
             repo: entry.repo.clone(),
@@ -1320,9 +1325,7 @@ pub fn run(
     reader: &dyn PrReader,
     fetcher: &Fetcher,
 ) -> Result<()> {
-    for r in &collect(ws, config, reader, fetcher)? {
-        r.print();
-    }
+    crate::status_tree::print(&collect(ws, config, reader, fetcher)?);
     Ok(())
 }
 
@@ -1357,10 +1360,14 @@ pub fn collect(
     for (consumer, m) in &manifests {
         for (path, e) in &m.inputs {
             let which = format!("{}#{}", e.repo, e.mr);
-            if rows
-                .iter()
-                .any(|r| r.follows.as_deref() == Some(which.as_str()))
+            if let Some(r) = rows
+                .iter_mut()
+                .find(|r| r.follows.as_deref() == Some(which.as_str()))
             {
+                let at = (consumer.clone(), path.clone());
+                if !matches!(r.facts, RowFacts::Shared(_)) && !r.under.contains(&at) {
+                    r.under.push(at);
+                }
                 continue;
             }
             let declared = || match declaring_flake(ws, &hops, consumer, path) {
@@ -1399,9 +1406,7 @@ pub fn run_from(
     reader: &dyn PrReader,
     fetcher: &Fetcher,
 ) -> Result<()> {
-    for r in &collect_from(config, from, reader, fetcher)? {
-        r.print();
-    }
+    crate::status_tree::print(&collect_from(config, from, reader, fetcher)?);
     Ok(())
 }
 
@@ -1532,6 +1537,7 @@ pub fn collect_from(
         Ok((v, facts)) if branches.is_empty() && v.stage != Stage::Landed => Row {
             name: consumer.clone(),
             follows: None,
+            under: Vec::new(),
             verdict: verdict(
                 Stage::Unknown(format!(
                     "the MR head {} is the head of no branch: the branch moved on (Forgejo has not updated the MR yet), or its branch is gone",
@@ -1546,6 +1552,7 @@ pub fn collect_from(
         Ok((verdict, facts)) => Row {
             name: consumer.clone(),
             follows: None,
+            under: Vec::new(),
             verdict,
             details,
             facts: RowFacts::Consumer(facts),

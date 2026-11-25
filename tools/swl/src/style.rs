@@ -34,6 +34,11 @@ pub fn stderr_colored() -> bool {
 
 /// The `swl <cmd>:` prefix of a message.
 pub const PREFIX: Style = Style::new().bold();
+pub const BOLD: Style = Style::new().bold();
+/// Detail lines and tree glyphs.
+pub const DIM: Style = Style::new().dimmed();
+/// What is not known.
+pub const BAD: Style = AnsiColor::Red.on_default();
 pub const GOOD: Style = AnsiColor::Green.on_default();
 pub const WARN: Style = AnsiColor::Yellow.on_default();
 pub const ERROR: Style = AnsiColor::Red.on_default().bold();
