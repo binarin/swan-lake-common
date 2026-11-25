@@ -1401,3 +1401,65 @@ fn land_makes_the_consumer_landing_anew_on_a_master_whose_lock_moved() {
         "{last}"
     );
 }
+
+#[test]
+fn refresh_moves_no_checkout_that_changed_during_the_run() {
+    for (name, change, want) in [
+        (
+            "commit",
+            "git -C @ commit -q --allow-empty -m mine",
+            "sl-0020-land is at",
+        ),
+        (
+            "edit",
+            "echo edited > @/value.txt",
+            "it has uncommitted or untracked files now:  M value.txt",
+        ),
+        (
+            "switch",
+            "git -C @ switch -q --detach",
+            "sl-0020-land was moved to it, but the checkout is on a detached HEAD now",
+        ),
+    ] {
+        let t = Change::new(&format!("refresh-moved-{name}"));
+        let c2 = t.common_head();
+        t.f.commit_file_on_forge("swan-lake-common", "master", "other.txt", "o");
+        // The checkout changes as swl pushes.
+        let change = change.replace("@", &t.common.display().to_string());
+        t.before_receive(
+            "swan-lake-common",
+            &format!("env -u GIT_DIR -u GIT_INDEX_FILE -u GIT_WORK_TREE sh -c '{change}'"),
+        );
+        let out = t.refresh(&[]);
+        let pushed = t.forge_head("swan-lake-common", "sl-0020-land");
+        assert_ne!(pushed, c2, "{name}: {}", text(&out));
+        failed(
+            &out,
+            4,
+            &format!(
+                "swan-lake-common#1: pushed, but its checkout {} was not moved: {want}",
+                t.common.display()
+            ),
+        );
+        let branch =
+            t.f.git(&t.common, &["rev-parse", "refs/heads/sl-0020-land"]);
+        match name {
+            "commit" => {
+                assert_eq!(t.f.git(&t.common, &["rev-parse", "HEAD^"]), c2);
+                assert_eq!(branch, t.common_head());
+            }
+            "edit" => {
+                assert_eq!(branch, c2);
+                assert_eq!(t.common_head(), c2);
+                assert_eq!(
+                    fs::read_to_string(t.common.join("value.txt")).unwrap(),
+                    "edited\n"
+                );
+            }
+            _ => {
+                assert_eq!(branch, pushed);
+                assert_eq!(t.common_head(), c2);
+            }
+        }
+    }
+}

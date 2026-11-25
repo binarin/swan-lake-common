@@ -95,15 +95,9 @@ fn checkout_problem(
     observed: &str,
     tracking: &str,
 ) -> Result<Option<String>> {
-    let status = git(dir, &["status", "--porcelain"])?;
-    let changed: Vec<&str> = status
-        .lines()
-        .filter(|l| !(l.starts_with("?? ") && land::disposable(dir, &l[3..], true)))
-        .collect();
-    if !changed.is_empty() {
+    if let Some(changed) = changed_files(dir)? {
         return Ok(Some(format!(
-            "it has uncommitted or untracked files: {}; commit or remove them",
-            changed.join(", ")
+            "it has uncommitted or untracked files: {changed}; commit or remove them"
         )));
     }
     let on = git_ok(dir, &["symbolic-ref", "--quiet", "--short", "HEAD"]);
@@ -127,6 +121,67 @@ fn checkout_problem(
     } else {
         format!("{branch} and {tracking} have diverged; merge or rebase onto {tracking} first")
     }))
+}
+
+/// The changed and untracked files of the checkout at `dir`, as `git status
+/// --porcelain` lines, but those that removing a landed checkout may
+/// delete; `None` when there are none.
+fn changed_files(dir: &Path) -> Result<Option<String>> {
+    let status = git(dir, &["status", "--porcelain"])?;
+    let changed: Vec<&str> = status
+        .lines()
+        .filter(|l| !(l.starts_with("?? ") && land::disposable(dir, &l[3..], true)))
+        .collect();
+    Ok((!changed.is_empty()).then(|| changed.join(", ")))
+}
+
+/// Moves the checkout at `dir` from `observed` to the pushed `head`,
+/// checked again now: `branch` by compare-and-swap from `observed`, then,
+/// when HEAD is that branch, the index and working tree (`git read-tree -m
+/// -u`, which refuses to overwrite changes; the branch is moved back then).
+/// Why not, with the commands to do it by hand.
+fn move_checkout(dir: &Path, branch: &str, observed: &str, head: &str) -> Result<Option<String>> {
+    let by_hand = format!(
+        "git -C {d} switch {branch} && git -C {d} reset --keep {head}",
+        d = dir.display()
+    );
+    let refname = format!("refs/heads/{branch}");
+    let on = git_ok(dir, &["symbolic-ref", "--quiet", "HEAD"]);
+    let checked_out = on.as_deref() == Some(refname.as_str());
+    if checked_out && let Some(changed) = changed_files(dir)? {
+        return Ok(Some(format!(
+            "it has uncommitted or untracked files now: {changed}; once they are committed or \
+             removed (commits go on top of the pushed head), {by_hand}"
+        )));
+    }
+    let cas = ["update-ref", "-m", "swl refresh", &refname, head, observed];
+    if git(dir, &cas).is_err() {
+        let now = git_ok(dir, &["rev-parse", "--verify", "--quiet", &refname]);
+        return Ok(Some(format!(
+            "{branch} is at {} now, not {}; bring its new commits onto the pushed head: git -C {} \
+             switch {branch} && git -C {} rebase {head}",
+            now.as_deref().map_or("(none)", short),
+            short(observed),
+            dir.display(),
+            dir.display()
+        )));
+    }
+    if !checked_out {
+        return Ok(Some(format!(
+            "{branch} was moved to it, but the checkout is on {} now; git -C {} switch {branch}",
+            on.as_deref()
+                .and_then(|r| r.strip_prefix("refs/heads/"))
+                .unwrap_or("a detached HEAD"),
+            dir.display()
+        )));
+    }
+    if let Err(e) = git(dir, &["read-tree", "-m", "-u", observed, head]) {
+        let _ = git(dir, &["update-ref", &refname, observed, head]);
+        return Ok(Some(format!(
+            "its working tree cannot be updated ({e:#}); {by_hand}"
+        )));
+    }
+    Ok(None)
 }
 
 /// Rebases the detached HEAD of `dir` onto `onto`, without the repo's
@@ -411,12 +466,11 @@ pub(crate) fn refresh(l: &Lander, part: &Part) -> Result<Step> {
         ),
     );
     if let Place::Checkout { dir, root } = part.place {
-        if let Err(e) = git(dir, &["reset", "--quiet", "--keep", &head]) {
+        if let Some(why) = move_checkout(dir, branch, &observed, &head)? {
             return stop(
                 Waits::Anyone,
                 format!(
-                    "{which}: pushed, but its checkout was not moved ({e:#}); run git -C {} reset \
-                     --keep {head}",
+                    "{which}: pushed, but its checkout {} was not moved: {why}",
                     dir.display()
                 ),
             );
