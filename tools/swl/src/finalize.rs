@@ -276,15 +276,17 @@ fn prepare(dir: &Path) -> Result<(PathBuf, Option<Prepared>)> {
 /// The subject of a landing commit starts so.
 pub const LANDING_SUBJECT: &str = "swl: land ";
 
-/// Whether `sha` is a landing commit as [`land_all`] makes it: one parent,
-/// a subject starting `swl: land `, changes to `swl.toml` (entries removed,
-/// or the file deleted) and `flake.lock` only, on a parent whose `swl.toml`
-/// has entries.
-pub fn is_landing(dir: &Path, sha: &str) -> Result<bool> {
+/// The input paths that `sha` lands, when it is a landing commit as
+/// [`land_all`] makes it: one parent, a subject starting `swl: land `,
+/// changes to `swl.toml` and `flake.lock` only; its parent's `swl.toml` has
+/// entries and its own has the same less some (the file deleted when none
+/// remain); and its lock moves nothing but those entries' root inputs
+/// ([`lock_change::verify`] against its parent's lock). `None` otherwise.
+pub fn own_landing(dir: &Path, sha: &str) -> Result<Option<BTreeSet<String>>> {
     let line = git(dir, &["log", "-1", "--format=%P%x00%s", sha])?;
     let (parents, subject) = line.split_once('\0').unwrap_or((&line, ""));
     if parents.split_whitespace().count() != 1 || !subject.starts_with(LANDING_SUBJECT) {
-        return Ok(false);
+        return Ok(None);
     }
     let files = git(
         dir,
@@ -295,13 +297,91 @@ pub fn is_landing(dir: &Path, sha: &str) -> Result<bool> {
             .lines()
             .any(|f| f != MANIFEST_FILE && f != "flake.lock")
     {
-        return Ok(false);
+        return Ok(None);
     }
-    let parent = format!("{sha}^:{MANIFEST_FILE}");
-    let Some(text) = git_ok(dir, &["show", &parent]) else {
-        return Ok(false);
+    let manifest_at = |rev: &str| -> Option<Manifest> {
+        match git_ok(dir, &["show", &format!("{rev}:{MANIFEST_FILE}")]) {
+            Some(text) => Manifest::parse(&text).ok(),
+            None => Some(Manifest::default()),
+        }
     };
-    Ok(Manifest::parse(&text).is_ok_and(|m| !m.is_empty()))
+    let parent = format!("{sha}^");
+    let (Some(before), Some(after)) = (manifest_at(&parent), manifest_at(sha)) else {
+        return Ok(None);
+    };
+    if before.is_empty()
+        || after
+            .inputs
+            .iter()
+            .any(|(path, e)| before.inputs.get(path) != Some(e))
+    {
+        return Ok(None);
+    }
+    let landed: BTreeSet<String> = before
+        .inputs
+        .keys()
+        .filter(|path| !after.inputs.contains_key(*path))
+        .cloned()
+        .collect();
+    let (Some(old), Some(new)) = (
+        crate::check::lock_at(dir, &parent)?,
+        crate::check::lock_at(dir, sha)?,
+    ) else {
+        return Ok(None);
+    };
+    let roots: Vec<String> = landed
+        .iter()
+        .map(|p| root_of(p).to_string())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if landed.is_empty() || lock_change::verify(&old, &new, &roots).is_err() {
+        return Ok(None);
+    }
+    Ok(Some(landed))
+}
+
+/// `finalize` for `swl refresh`, which makes a dropped landing anew: one
+/// commit, without the repo's hooks, only when the satisfied entries are
+/// exactly `paths`; else why not, with the state of each entry.
+pub fn land_exactly(
+    dir: &Path,
+    api: &dyn PrReader,
+    paths: &BTreeSet<String>,
+) -> Result<Result<Committed, String>> {
+    let (_, Some(mut p)) = prepare(dir)? else {
+        return Ok(Err(format!("there is no {MANIFEST_FILE}")));
+    };
+    let nix = Nix::find()?;
+    let old_bytes = fs::read(p.root.join("flake.lock")).context("reading flake.lock")?;
+    let probe = probe(&p.root, &p.manifest, api, &nix, &old_bytes)?;
+    let satisfied: BTreeSet<String> = probe
+        .statuses
+        .iter()
+        .filter(|(_, s)| matches!(s, Status::Satisfied { .. }))
+        .map(|(path, _)| path.clone())
+        .collect();
+    if satisfied != *paths {
+        let lines: Vec<String> = probe
+            .statuses
+            .iter()
+            .map(|(path, status)| {
+                let e = &p.manifest.inputs[path];
+                format!("{path} ({}#{}): {}", e.repo, e.mr, describe(status))
+            })
+            .collect();
+        let list = |s: &BTreeSet<String>| match s.is_empty() {
+            true => "none".to_string(),
+            false => s.iter().cloned().collect::<Vec<_>>().join(", "),
+        };
+        return Ok(Err(format!(
+            "it landed {}, but what lands now is {}:\n  {}",
+            list(paths),
+            list(&satisfied),
+            lines.join("\n  ")
+        )));
+    }
+    commit(&mut p, &nix, &probe, &old_bytes, false).map(Ok)
 }
 
 /// The landing commit: what it lands and how many entries remain.
@@ -314,7 +394,8 @@ pub struct Committed {
 
 /// Checks the relock of `probe` (nothing else changed, the pin policy) and
 /// commits it with the satisfied entries removed from the manifest; without
-/// the repo's commit hooks unless `hooks`.
+/// the repo's commit hooks unless `hooks` (a scratch worktree may lack
+/// their tools).
 fn commit(
     p: &mut Prepared,
     nix: &Nix,
@@ -399,9 +480,8 @@ pub enum Landing {
 }
 
 /// `finalize` for `swl land`: one commit only when every entry is satisfied,
-/// so that no partial landing is pushed; without the repo's commit hooks
-/// unless `hooks` (a scratch worktree may lack their tools).
-pub fn land_all(dir: &Path, api: &dyn PrReader, dry_run: bool, hooks: bool) -> Result<Landing> {
+/// so that no partial landing is pushed.
+pub fn land_all(dir: &Path, api: &dyn PrReader, dry_run: bool) -> Result<Landing> {
     let (_, Some(mut p)) = prepare(dir)? else {
         return Ok(Landing::NoManifest);
     };
@@ -429,7 +509,7 @@ pub fn land_all(dir: &Path, api: &dyn PrReader, dry_run: bool, hooks: bool) -> R
     if dry_run {
         return Ok(Landing::WouldLand(lines));
     }
-    commit(&mut p, &nix, &probe, &old_bytes, hooks).map(Landing::Committed)
+    commit(&mut p, &nix, &probe, &old_bytes, true).map(Landing::Committed)
 }
 
 pub fn run(dir: &Path, wait: Option<Wait>, api: &dyn PrReader) -> Result<ExitCode> {

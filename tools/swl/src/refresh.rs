@@ -11,21 +11,21 @@
 //! one push, so that no pushed head lacks a landing: the MR's scheduled
 //! merge could merge such a head.
 
-use std::{path::Path, process::ExitCode};
+use std::{collections::BTreeSet, path::Path, process::ExitCode};
 
 use anyhow::{Context, Result};
 
 use crate::{
     bump::{BUMP_BRANCH, Scratch},
     config::Config,
-    env,
-    finalize::{self, Landing},
+    env, finalize,
     forge::{PrInfo, PrReader, slug},
     git::{git, git_ok, short, valid_branch},
     land::{
         self, DryRunWriter, Lander, Options, Rejection, Step, push_rejection, say_waits, stop,
         waits_code,
     },
+    manifest::MANIFEST_FILE,
     status::{self, MrFacts, MrRead, Row, RowFacts, Waits},
     style::{self, Tone},
     workspace::Workspace,
@@ -241,30 +241,37 @@ fn rerun_env(cmd: &str, root: &Path, config: &Config) {
     }
 }
 
-/// Finalizes the scratch worktree's HEAD anew, on a temporary branch (which
-/// `finalize` needs), without hooks; the new head, or why not.
-fn refinalize(l: &Lander, s: &Scratch, source: &Path, which: &str) -> Result<String, String> {
+/// Makes the dropped landing commit `dropped`, which landed `paths`, anew
+/// on the scratch worktree's HEAD, on a temporary branch (which `finalize`
+/// needs), without hooks: the same entries landed, and the same `swl.toml`
+/// left. The new head, or why not.
+fn refinalize(
+    l: &Lander,
+    s: &Scratch,
+    source: &Path,
+    which: &str,
+    dropped: &str,
+    paths: &BTreeSet<String>,
+) -> Result<String, String> {
+    let err = |e: anyhow::Error| format!("{e:#}");
     let tmp = format!("swl-refresh-{}", std::process::id());
-    git(&s.dir, &["switch", "--quiet", "-C", &tmp]).map_err(|e| format!("{e:#}"))?;
-    let landed = finalize::land_all(&s.dir, l.reader, false, false);
+    git(&s.dir, &["switch", "--quiet", "-C", &tmp]).map_err(err)?;
+    let landed = finalize::land_exactly(&s.dir, l.reader, paths);
     let _ = git(&s.dir, &["switch", "--quiet", "--detach"]);
     let _ = git(source, &["branch", "--quiet", "-D", &tmp]);
-    Err(match landed {
-        Err(e) => format!("{e:#}"),
-        Ok(Landing::Committed(done)) => {
-            style::say(
-                l.cmd,
-                Tone::Plain,
-                format!("{which}: finalized anew: {}", done.subject),
-            );
-            return Ok(done.head);
-        }
-        Ok(Landing::Waiting(lines)) => {
-            format!("not every entry has landed:\n  {}", lines.join("\n  "))
-        }
-        Ok(Landing::NoManifest | Landing::Empty) => "it has no swl.toml entries".to_string(),
-        Ok(Landing::WouldLand(_)) => unreachable!("not a dry run"),
-    })
+    let done = landed.map_err(err)??;
+    let manifest = |rev: &str| git_ok(source, &["show", &format!("{rev}:{MANIFEST_FILE}")]);
+    if manifest(&done.head) != manifest(dropped) {
+        return Err(format!(
+            "its {MANIFEST_FILE} would differ from the dropped commit's"
+        ));
+    }
+    style::say(
+        l.cmd,
+        Tone::Plain,
+        format!("{which}: finalized anew: {}", done.subject),
+    );
+    Ok(done.head)
 }
 
 /// Rebases `part`'s branch onto its base's tip and pushes it with a lease,
@@ -385,9 +392,15 @@ pub(crate) fn refresh(l: &Lander, part: &Part) -> Result<Step> {
             ),
         );
     }
-    let drop_landing = part.consumer
-        && finalize::is_landing(source, &observed)?
-        && lock_moved(source, &observed, &base_tip)?;
+    let landed = match part.consumer {
+        true => finalize::own_landing(source, &observed)?,
+        false => None,
+    };
+    let landed = match landed {
+        Some(paths) if lock_moved(source, &observed, &base_tip)? => Some(paths),
+        _ => None,
+    };
+    let drop_landing = landed.is_some();
     let start = match drop_landing {
         true => rev(source, &format!("{observed}^"))?,
         false => observed.clone(),
@@ -453,8 +466,8 @@ pub(crate) fn refresh(l: &Lander, part: &Part) -> Result<Step> {
             ),
         );
     }
-    if drop_landing {
-        match refinalize(l, &scratch, source, which) {
+    if let Some(paths) = &landed {
+        match refinalize(l, &scratch, source, which, &observed, paths) {
             Ok(h) => head = h,
             Err(why) => {
                 return stop(

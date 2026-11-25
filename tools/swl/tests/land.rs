@@ -1332,8 +1332,8 @@ fn land_makes_the_consumer_landing_anew_on_a_master_whose_lock_moved() {
     failed(
         &out,
         4,
-        "and its landing commit, dropped to rebase it, cannot be made anew: not every entry has \
-         landed:\n  lib (swan-lake-common#1): stays: merged as",
+        "and its landing commit, dropped to rebase it, cannot be made anew: it landed lib, but \
+         what lands now is none:\n  lib (swan-lake-common#1): stays: merged as",
     );
     assert!(out_text(&out).contains("nothing was pushed"));
     assert_eq!(t.forge_head("swan-lake", "sl-0020-land"), head);
@@ -1580,4 +1580,138 @@ fn refresh_refuses_a_branch_with_merge_commits() {
     assert_eq!(t.forge_refs(), refs);
     assert_eq!(t.common_head(), merge);
     assert_ne!(merge, c2);
+}
+
+impl Change {
+    /// Common#1 merged by hand at its head, promoted and mirrored; the
+    /// merge commit.
+    fn merge_common_by_hand(&self) -> String {
+        let c2 = self.common_head();
+        let forge_common = self.f.forge_repo("swan-lake-common");
+        for branch in ["master", "current"] {
+            self.f.git(
+                &forge_common,
+                &["update-ref", &format!("refs/heads/{branch}"), &c2],
+            );
+        }
+        self.f.api.set_pr(
+            "swan-lake-common",
+            1,
+            "merged",
+            "refs/pull/1/head",
+            &c2,
+            Some(&c2),
+        );
+        self.sync_mirror();
+        c2
+    }
+
+    /// A bump of the consumer's master to a new commit of common's master
+    /// and `current`, as `swl bump` makes one; the new master.
+    fn bump_consumer_master(&self, value: &str) -> String {
+        let c = self.f.commit_on_forge("swan-lake-common", "master", value);
+        let forge_common = self.f.forge_repo("swan-lake-common");
+        self.f
+            .git(&forge_common, &["update-ref", "refs/heads/current", &c]);
+        self.sync_mirror();
+        let bumper = self
+            .f
+            .clone_elsewhere("swan-lake", &format!("bumper-{value}"));
+        stdout(&self.f.nix(&bumper, &["flake", "update", "lib"]));
+        self.f.git(
+            &bumper,
+            &["commit", "-qam", &format!("swl: bump common to {value}")],
+        );
+        self.f
+            .git(&bumper, &["push", "-q", "origin", "HEAD:master"]);
+        self.forge_head("swan-lake", "master")
+    }
+}
+
+#[test]
+fn refresh_makes_a_partial_landing_anew_with_the_same_entries() {
+    let t = Change::new("refresh-partial");
+    // A second entry, whose MR stays open: the landing is partial.
+    let zw = t.forge_head("zwanenzang", "master");
+    t.f.api.set_pr("zwanenzang", 5, "open", "zw-5", &zw, None);
+    let manifest = "[inputs.lib]\nrepo = \"swan-lake-common\"\nmr = 1\n\n\
+                    [inputs.\"lib/zwanenzang\"]\nrepo = \"zwanenzang\"\nmr = 5\n";
+    fs::write(t.consumer.join("swl.toml"), manifest).unwrap();
+    t.f.git(
+        &t.consumer,
+        &["commit", "-qam", "swl: manifest for zwanenzang#5"],
+    );
+    t.merge_common_by_hand();
+    let consumer = t.consumer.display().to_string();
+    stdout(&t.f.swl(&t.f.root, &["finalize", &consumer]));
+    t.f.git(&t.consumer, &["push", "-q", "origin", "sl-0020-land"]);
+    let landing = t.f.git(&t.consumer, &["rev-parse", "HEAD"]);
+    let partial = t.f.git(&t.consumer, &["show", "HEAD:swl.toml"]);
+    assert!(partial.contains("zwanenzang"), "{partial}");
+
+    let m2 = t.bump_consumer_master("c3");
+    let out = t.refresh(&[]);
+    let log = stdout(&out);
+    assert!(
+        log.contains(&format!(
+            "(3 commits, without swl's landing commit {}, as origin/master moved flake.lock)",
+            &landing[..12]
+        )),
+        "{log}"
+    );
+    assert!(
+        log.contains("swan-lake#2: finalized anew: swl: land swan-lake-common#1 (lib)"),
+        "{log}"
+    );
+    let head = t.forge_head("swan-lake", "sl-0020-land");
+    assert_eq!(t.f.git(&t.consumer, &["rev-parse", "HEAD"]), head);
+    assert_eq!(t.f.git(&t.consumer, &["rev-parse", "HEAD~4"]), m2);
+    assert_eq!(t.f.git(&t.consumer, &["show", "HEAD:swl.toml"]), partial);
+}
+
+#[test]
+fn refresh_keeps_a_commit_that_only_looks_like_a_landing() {
+    let t = Change::new("refresh-lookalike");
+    t.merge_common_by_hand();
+    // swl's subject and files, but its lock gains an input besides lib.
+    let lock_path = t.consumer.join("flake.lock");
+    let mut lock: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&lock_path).unwrap()).unwrap();
+    let path = serde_json::json!({"type": "path", "path": "/x"});
+    lock["nodes"]["x"] = serde_json::json!({"flake": false, "locked": path, "original": path});
+    lock["nodes"]["root"]["inputs"]["x"] = "x".into();
+    fs::write(
+        &lock_path,
+        serde_json::to_string_pretty(&lock).unwrap() + "\n",
+    )
+    .unwrap();
+    t.f.git(&t.consumer, &["rm", "-q", "swl.toml"]);
+    t.f.git(
+        &t.consumer,
+        &["commit", "-qam", "swl: land swan-lake-common#1 (lib)"],
+    );
+    t.f.git(&t.consumer, &["push", "-q", "origin", "sl-0020-land"]);
+    let lookalike = t.f.git(&t.consumer, &["rev-parse", "HEAD"]);
+    let m2 = t.bump_consumer_master("c3");
+    // Not dropped: rebased as any commit (here without a conflict), its
+    // lock change kept.
+    let log = stdout(&t.refresh(&[]));
+    assert!(
+        log.contains(&format!(
+            "rebase sl-0020-land of swan-lake#2 (3 commits) onto origin/master at {}, and push it \
+             with --force-with-lease=refs/heads/sl-0020-land:{}",
+            &m2[..12],
+            &lookalike[..12]
+        )),
+        "{log}"
+    );
+    assert!(!log.contains("finalized anew"), "{log}");
+    let head = t.forge_head("swan-lake", "sl-0020-land");
+    assert_eq!(
+        subjects(&t, "swan-lake", "sl-0020-land")[0],
+        "swl: land swan-lake-common#1 (lib)"
+    );
+    let rebased_lock =
+        t.f.git(&t.consumer, &["show", &format!("{head}:flake.lock")]);
+    assert!(rebased_lock.contains("\"/x\""), "{rebased_lock}");
 }

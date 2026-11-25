@@ -872,7 +872,7 @@ impl Lander<'_> {
                 step => return Ok(step),
             }
         }
-        match finalize::land_all(&c.dir, self.reader, self.opts.dry_run, true)? {
+        match finalize::land_all(&c.dir, self.reader, self.opts.dry_run)? {
             Landing::NoManifest => {}
             Landing::Empty => {
                 return stop(
