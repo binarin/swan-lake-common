@@ -57,7 +57,9 @@ swl finalize [--wait]                     # landed entries -> one lock commit
   `.envrc` when `direnv` is on PATH (else a note to run it). It ends with the
   checkouts and a `cd` hint. Rerunnable: an existing checkout directory is
   kept, and reported when it is on another branch (never changed); missing
-  ones are added. An interrupted `start` is finished by rerunning it.
+  ones are added. An interrupted `start` is finished by rerunning it. An
+  existing directory that is not a worktree of the repo's configured source
+  is refused.
 - `start --from CONSUMER#MR [--workspace DIR] [--no-fetch]` joins a
   published change, for example on another machine. With git (consumer repos
   are private), it reads `refs/pull/MR/head` from the consumer source's
@@ -144,25 +146,30 @@ The stages, in order:
 | stage | shared checkout | consumer |
 |---|---|---|
 | `local` | its branch is not on the remote (or detached with commits not in the base) | likewise |
-| `needs publish` | the remote branch is behind HEAD, or no consumer's `swl.toml` names an MR for it, or a consumer that overrides it has no entry, or the MR was closed | the branch has unpushed commits, or an overridden input's checkout differs from the lock without an entry |
-| `pushed` | pushed, but the MR cannot be read | pushed, no MR yet (or it cannot be read) |
+| `needs publish` | the remote branch is behind HEAD, or no consumer's `swl.toml` names an MR for it, or a consumer that overrides it has no entry, or the MR was closed | the branch has unpushed commits, or an overridden input's checkout differs from the lock without an entry, or its MR was closed |
+| `pushed` | pushed, but the MR cannot be read | pushed, and no MR yet, or it cannot be read (also with the landing commit pushed) |
 | `MR open`, `MR open (draft)` | the `swl.toml` entry's MR is open; a draft has a `WIP:` title or `draft` set | the MR whose `refs/pull/N/head` is the remote branch head (not looked up once that head is in the base) |
 | `CI pending`, `CI failing`, `CI green` | the combined commit status of the MR head | likewise |
 | `merged` | the MR is merged (its merge commit) | |
 | `promoted` | the merge commit is in the declared branch on the forge (`swan-lake-current` for common; an input without a ref is promoted when merged) | |
-| `landing pushed` | | the remote branch has no pending `swl.toml` entries and changes `flake.lock` |
-| `landed` | | the MR is merged, or the branch head is in the base |
+| `landing pushed`, `landing pushed, CI failing` | | the MR is open, and its branch has no pending `swl.toml` entries, had some (its commits since the merge base touch `swl.toml`), and changes `flake.lock` |
+| `landed` | merged, and every consumer that names it in `swl.toml` has landed | the MR is merged, or both the local and the remote branch heads are in the base |
 
 A shared checkout without an MR whose HEAD is in the rev each consumer locks,
 or already in its base, is `no MR needed`; a consumer whose HEAD is in its
-base is `no change`. A consumer MR with entries is not merged on its own: its
-next step waits for the entries' rows, then is `swl land` (not implemented
-yet; see the landing procedure below).
+base is `no change`. A consumer MR with entries is not merged on its own:
+while its own step waits for the owner (merge) or nobody (CI), its next step
+waits for the entries' rows, then is `swl land` (not implemented yet; see
+the landing procedure below). A draft or failing CI is its own step first.
 
 The next steps are `swl publish <consumer>` (anyone), `mark <repo>#N ready`
 (anyone), wait for CI (nobody), `merge <repo>#N` (owner),
-`promote <branch>` (owner), `swl land` (anyone), and
-`request merge when checks succeed` (owner) once the landing is pushed.
+`promote <branch>` (owner), `swl land` (anyone), `open the MR` (anyone) and
+`request merge when checks succeed` (owner) once the landing is pushed
+(`fix CI`, anyone, while it fails). Until slice 4b, whose `swl check` accepts
+a landing's lock change, the MR's `swl check` fails on that commit, so a
+pushed landing shows `landing pushed, CI failing`; the owner merges it by
+hand.
 
 By default `status` fetches each checkout's remote (as `ws add` does, once per
 source) so that the stages are current, and finds a consumer's MR with
@@ -171,11 +178,13 @@ history only. `--no-fetch` uses the refs already known and looks up no
 consumer MR. A forge, network or git error makes that row
 `unknown (<reason>)`; it is never an error of the command.
 
-MR state and CI come from the forge API with fj's login (see
-[Forge access](#forge-access)). A repo that cannot be read (private, and no
-login) falls back to git: the branch on the remote, `landing pushed` from the
-branch's contents, and `landed` when its head is in the base; its MR shows
-as `unknown (not readable anonymously, and no fj login: …)`.
+MR state and CI come from the forge API: anonymously, and for what that
+cannot see with fj's login (see [Forge access](#forge-access)). A repo that
+cannot be read (private, and no login) falls back to git: the branch on the
+remote, and `landed` when its head is in the base; its MR shows as
+`unknown (not readable anonymously, and no fj login: …)`, and a pushed
+landing as `pushed`. A login the forge rejects makes the row
+`unknown (fj login rejected: run fj auth login)`.
 
 `--from CONSUMER#MR` reads the consumer MR as `start --from` does (with git),
 then shows a row per `swl.toml` entry at its head and the consumer row. A
@@ -370,8 +379,10 @@ manifest never names unpushed commits. Rerunning finds the existing MRs,
 leaves a current manifest alone and pushes only new commits. Entries are
 added or updated, never removed by `publish`.
 
-Forge access is only through `fj`, which must be on PATH and logged in
-(`fj auth`); swl has no token configuration. swl parses fj 0.7's English
+`publish` pushes with git and opens MRs only through `fj`, which must be on
+PATH and logged in (`fj auth`); swl has no token configuration (`status`
+and `start` read fj's token, see [Forge access](#forge-access)). swl parses
+fj 0.7's English
 output, and passes `-H forgejo.lynx-lizard.ts.net`. `publish` fetches each
 checkout's base branch (an `origin/<branch>` base) and reads the remote
 branch state with `ls-remote`; it fetches nothing else. A squash-merged MR is
@@ -503,19 +514,23 @@ then push to master; `swl publish` refuses to push it.
 
 ### Forge access
 
-`status` and `start --from` read MR state and commit status with the login
-of `fj`: the token for
-`forgejo.lynx-lizard.ts.net` in fj's `keys.json`
-(`$XDG_DATA_HOME/forgejo-cli/keys.json`, default
+`status` and `start --from` read MR state and commit status anonymously
+first, so public repos never see a token. On a 404 they ask again with the
+login of `fj`: the token for `forgejo.lynx-lizard.ts.net` in fj's
+`keys.json` (`$XDG_DATA_HOME/forgejo-cli/keys.json`, default
 `~/.local/share/forgejo-cli/keys.json`; `SWL_FJ_KEYS` overrides the path).
 That covers the private consumer repos. They only read: the token goes to
-curl on stdin, never on a command line or into the output, and only to the
-forge (or a loopback test server). Without a login they read anonymously,
-and what that cannot see is `unknown`. swl has no token configuration of
-its own.
+curl on stdin, never on a command line or into the output, follows no
+redirect, and goes only to `https://` on the forge host (or a loopback test
+server; an address with user info is refused). An OAuth login whose
+`expires_at` has passed is no login, with a warning; a token the forge
+rejects (401 or 403) makes the row `unknown (fj login rejected: run fj auth
+login)`. Without a login what the anonymous API cannot see is `unknown`.
+swl has no token configuration of its own.
 
-`check`, `ci env` and `finalize` read MR state anonymously
-(`GET /api/v1/repos/binarin/<repo>/pulls/<n>`, through curl) and CI fetches
+`check`, `ci env` and `finalize` read MR state anonymously only, also with
+an fj login (`GET /api/v1/repos/binarin/<repo>/pulls/<n>`, through curl),
+and CI fetches
 `refs/pull/<n>/head` anonymously. So every repo named in a manifest must be
 public. Should one become private, give CI a dedicated read-only token as a
 secret, through nix `access-tokens` or a netrc for the fetch, and the same for
@@ -554,6 +569,9 @@ the override URLs) redirect them, for tests.
   the whole commit history of a large fork such as nixpkgs.
 - `finalize` relocks a root input as a whole: nested entries land when the
   parent (common) has bumped and promoted them.
+- `status` tells a landing from a plain lock bump by the branch's history:
+  commits since the merge base must touch `swl.toml`. A bump on a branch
+  that once had entries for other reasons looks like a landing.
 - `status` knows a shared MR only through a consumer's `swl.toml` entry: an
   MR opened by hand without one shows as `needs publish`. A consumer's MR is
   the pull ref at its branch head, so a push that Forgejo has not recorded
