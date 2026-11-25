@@ -70,7 +70,7 @@ pub struct Options {
 
 /// A write that this run did already is due again: the forge lags.
 #[derive(Debug)]
-struct Repeated(String);
+pub(crate) struct Repeated(pub(crate) String);
 
 impl std::fmt::Display for Repeated {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -82,7 +82,7 @@ impl std::error::Error for Repeated {}
 
 /// Where a run stopped.
 #[derive(Debug, PartialEq, Eq)]
-enum Step {
+pub(crate) enum Step {
     /// Something was written: read the state again.
     Progress,
     /// Nothing to do for this item.
@@ -93,7 +93,7 @@ enum Step {
     Stop(Waits, String),
 }
 
-fn stop(waits: Waits, msg: impl Into<String>) -> Result<Step> {
+pub(crate) fn stop(waits: Waits, msg: impl Into<String>) -> Result<Step> {
     Ok(Step::Stop(waits, msg.into()))
 }
 
@@ -117,7 +117,7 @@ fn schedule_what(which: &str, info: &PrInfo) -> String {
 
 /// Why the forge refused a push.
 #[derive(Debug, PartialEq, Eq)]
-enum Rejection {
+pub(crate) enum Rejection {
     /// Not a fast-forward of the branch as the forge has it now: it moved.
     Moved,
     /// Refused (a protected branch, a hook), with the forge's words.
@@ -126,7 +126,7 @@ enum Rejection {
 
 /// The rejection in git's error output of a push; `None` for another
 /// failure (offline, no such remote).
-fn push_rejection(msg: &str) -> Option<Rejection> {
+pub(crate) fn push_rejection(msg: &str) -> Option<Rejection> {
     let lower = msg.to_ascii_lowercase();
     if ["non-fast-forward", "fetch first", "stale info"]
         .iter()
@@ -177,7 +177,11 @@ fn shared_entries(manifests: &[(String, Manifest)]) -> Vec<SharedMr> {
     out
 }
 
-struct Lander<'a> {
+/// The steps of `land` that `bump` shares: merging an MR, promoting a
+/// branch, waiting for a mirror and for the forge. `cmd` (`swl land`, `swl
+/// bump`) prefixes the messages and is what they say to rerun.
+pub(crate) struct Lander<'a> {
+    cmd: &'static str,
     config: &'a Config,
     reader: &'a dyn PrReader,
     writer: &'a dyn ForgeWriter,
@@ -187,22 +191,42 @@ struct Lander<'a> {
     done: RefCell<BTreeSet<String>>,
 }
 
+impl<'a> Lander<'a> {
+    pub(crate) fn new(
+        cmd: &'static str,
+        config: &'a Config,
+        reader: &'a dyn PrReader,
+        writer: &'a dyn ForgeWriter,
+        opts: &'a Options,
+    ) -> Self {
+        Self {
+            cmd,
+            config,
+            reader,
+            writer,
+            opts,
+            done: RefCell::new(BTreeSet::new()),
+        }
+    }
+}
+
 impl Lander<'_> {
     /// Says what is (or with `--dry-run` would be) done. `Ok(false)` in a dry
     /// run; a [`Repeated`] error when this run did the same already.
-    fn act(&self, key: &str, what: &str) -> Result<bool> {
+    pub(crate) fn act(&self, key: &str, what: &str) -> Result<bool> {
+        let cmd = self.cmd;
         if self.opts.dry_run {
-            style::say("swl land", Tone::Plain, format!("would {what}"));
+            style::say(self.cmd, Tone::Plain, format!("would {what}"));
             return Ok(false);
         }
         if !self.done.borrow_mut().insert(key.to_string()) {
             return Err(Repeated(format!(
                 "{what}: done once in this run already, but the forge does not show it yet; rerun \
-                 swl land"
+                 {cmd}"
             ))
             .into());
         }
-        style::say("swl land", Tone::Plain, what);
+        style::say(self.cmd, Tone::Plain, what);
         Ok(true)
     }
 
@@ -213,6 +237,7 @@ impl Lander<'_> {
     /// Marks a draft MR ready by dropping its `WIP:` title prefix. A draft
     /// without one is for someone to mark ready on the forge.
     fn mark_ready(&self, which: &str, repo: &str, info: &PrInfo) -> Result<Option<Step>> {
+        let cmd = self.cmd;
         if !info.draft {
             return Ok(None);
         }
@@ -222,7 +247,7 @@ impl Lander<'_> {
                 Waits::Anyone,
                 format!(
                     "{which} is a draft without a WIP: title; mark it ready on the forge, then \
-                     rerun swl land"
+                     rerun {cmd}"
                 ),
             )
             .map(Some);
@@ -238,13 +263,14 @@ impl Lander<'_> {
 
     /// Steps 1 and 2 for one shared MR.
     fn shared(&self, rows: &[Row], (consumer, path, e): &SharedMr) -> Result<Step> {
+        let cmd = self.cmd;
         let which = format!("{}#{}", e.repo, e.mr);
         let _span = tracing::debug_span!("shared", %which, %path).entered();
         let Some(row) = rows
             .iter()
             .find(|r| r.follows.as_deref() == Some(which.as_str()))
         else {
-            return stop(Waits::Nobody, format!("{which}: no status; rerun swl land"));
+            return stop(Waits::Nobody, format!("{which}: no status; rerun {cmd}"));
         };
         if row.verdict.stage == Stage::Landed {
             return Ok(Step::Done);
@@ -269,7 +295,8 @@ impl Lander<'_> {
                 ),
             ),
             MrRead::Open { info, .. } => {
-                self.merge(&which, &e.repo, info, &format!("swl publish {consumer}"))
+                let rebase = self.rebase_step(&e.repo, info, &format!("swl publish {consumer}"));
+                self.merge(&which, &e.repo, info, &rebase)
             }
             MrRead::Merged {
                 merge_commit,
@@ -312,28 +339,36 @@ impl Lander<'_> {
     }
 
     /// Marks an open MR ready and merges it: now when its checks are green,
-    /// else when they succeed. `republish` is the command that updates its
-    /// branch after a rebase.
+    /// else when they succeed. `rebase` is the step that makes it mergeable
+    /// by fast-forward again when the base moved ([`Lander::rebase_step`]
+    /// for `land`).
     ///
     /// Forgejo merges a scheduled MR on a later commit status event only:
     /// scheduled on checks that are green already, it never merges. So a
     /// green MR is merged directly, and so is one that turns green right
     /// after its merge was scheduled. A direct merge that branch protection
     /// refuses leaves the schedule in place, or makes one.
-    fn merge(&self, which: &str, repo: &str, info: &PrInfo, republish: &str) -> Result<Step> {
+    pub(crate) fn merge(
+        &self,
+        which: &str,
+        repo: &str,
+        info: &PrInfo,
+        rebase: &str,
+    ) -> Result<Step> {
+        let cmd = self.cmd;
         let ci = self.ci_now(repo, &info.head_sha);
         tracing::debug!(%which, ?ci, "the head's combined commit status before merging");
         if let Some(CiState::Failing(s)) = &ci {
             return stop(
                 Waits::Anyone,
-                format!("{which}: CI failing ({s}); fix it, then rerun swl land"),
+                format!("{which}: CI failing ({s}); fix it, then rerun {cmd}"),
             );
         }
         if let Some(step) = self.mark_ready(which, repo, info)? {
             return Ok(step);
         }
         if ci == Some(CiState::Green) {
-            return self.merge_now(which, repo, info, republish, false);
+            return self.merge_now(which, repo, info, rebase, false);
         }
         if !self.act(&format!("merge {which}"), &schedule_what(which, info))? {
             return self.dry_stop(&format!("{which} merges when its checks succeed"));
@@ -347,23 +382,23 @@ impl Lander<'_> {
         if outcome == MergeOutcome::Scheduled {
             if self.ci_now(repo, &info.head_sha) == Some(CiState::Green) {
                 style::say(
-                    "swl land",
+                    self.cmd,
                     Tone::Plain,
                     format!(
                         "{which}: its checks turned green as the merge was scheduled, and \
                          no later status would start it"
                     ),
                 );
-                return self.merge_now(which, repo, info, republish, true);
+                return self.merge_now(which, repo, info, rebase, true);
             }
             return stop(
                 Waits::Nobody,
                 format!(
-                    "{which} waits for CI, then it merges (merge when checks succeed); rerun swl land"
+                    "{which} waits for CI, then it merges (merge when checks succeed); rerun {cmd}"
                 ),
             );
         }
-        self.merge_answer(which, repo, info, outcome, republish)
+        self.merge_answer(which, repo, info, outcome, rebase)
     }
 
     /// Merges an MR whose checks are green with a plain fast-forward merge.
@@ -376,9 +411,10 @@ impl Lander<'_> {
         which: &str,
         repo: &str,
         info: &PrInfo,
-        republish: &str,
+        rebase: &str,
         scheduled: bool,
     ) -> Result<Step> {
+        let cmd = self.cmd;
         let what = format!(
             "merge {which} at {} now, its checks being green (fast-forward only, deleting its \
              branch)",
@@ -393,7 +429,7 @@ impl Lander<'_> {
         match &outcome {
             MergeOutcome::Scheduled => stop(
                 Waits::Nobody,
-                format!("{which}: the forge did not merge it yet; rerun swl land"),
+                format!("{which}: the forge did not merge it yet; rerun {cmd}"),
             ),
             MergeOutcome::ChecksPending(_)
             | MergeOutcome::NeedsApproval(_)
@@ -407,7 +443,7 @@ impl Lander<'_> {
                 };
                 self.refusal(which, outcome, &note)
             }
-            _ => self.merge_answer(which, repo, info, outcome, republish),
+            _ => self.merge_answer(which, repo, info, outcome, rebase),
         }
     }
 
@@ -433,17 +469,18 @@ impl Lander<'_> {
     /// The stop for a refused direct merge; `note` says what became of the
     /// schedule.
     fn refusal(&self, which: &str, outcome: MergeOutcome, note: &str) -> Result<Step> {
+        let cmd = self.cmd;
         match outcome {
             MergeOutcome::ChecksPending(why) => stop(
                 Waits::Nobody,
                 format!(
                     "{which}: a required status check has not passed yet ({why}); {note}; rerun \
-                     swl land"
+                     {cmd}"
                 ),
             ),
             MergeOutcome::NeedsApproval(why) => stop(
                 Waits::Owner,
-                format!("approve {which} on the forge ({why}); {note}; then rerun swl land"),
+                format!("approve {which} on the forge ({why}); {note}; then rerun {cmd}"),
             ),
             MergeOutcome::Refused(why) => stop(
                 Waits::Owner,
@@ -471,23 +508,18 @@ impl Lander<'_> {
         repo: &str,
         info: &PrInfo,
         outcome: MergeOutcome,
-        republish: &str,
+        rebase: &str,
     ) -> Result<Step> {
-        let base_branch = self
-            .config
-            .base_for(repo)
-            .split_once('/')
-            .map_or(self.config.base_for(repo), |(_, b)| b)
-            .to_string();
+        let cmd = self.cmd;
         match outcome {
             MergeOutcome::Merged => {
-                style::say("swl land", Tone::Good, format!("{which} is merged"));
+                style::say(self.cmd, Tone::Good, format!("{which} is merged"));
                 Ok(Step::Progress)
             }
             MergeOutcome::Scheduled => stop(
                 Waits::Nobody,
                 format!(
-                    "{which} waits for CI, then it merges (merge when checks succeed); rerun swl land"
+                    "{which} waits for CI, then it merges (merge when checks succeed); rerun {cmd}"
                 ),
             ),
             _ if self.merged_now(repo, info.number) => Ok(Step::Progress),
@@ -497,35 +529,46 @@ impl Lander<'_> {
             ),
             MergeOutcome::ChecksPending(why) => stop(
                 Waits::Nobody,
-                format!(
-                    "{which}: a required status check has not passed yet ({why}); rerun swl land"
-                ),
+                format!("{which}: a required status check has not passed yet ({why}); rerun {cmd}"),
             ),
             MergeOutcome::NeedsApproval(why) => stop(
                 Waits::Owner,
-                format!("approve {which} on the forge ({why}), then rerun swl land"),
+                format!("approve {which} on the forge ({why}), then rerun {cmd}"),
             ),
             MergeOutcome::NotFastForward(why) => stop(
                 Waits::Anyone,
-                format!(
-                    "rebase {} onto {base_branch} (swl never force-pushes), then {republish} \
-                     ({which} is not mergeable by fast-forward: {why})",
-                    info.head_ref
-                ),
+                format!("{rebase} ({which} is not mergeable by fast-forward: {why})"),
             ),
             MergeOutcome::HeadMoved(why) => stop(
                 Waits::Anyone,
-                format!("{which}: its head moved ({why}); rerun swl land"),
+                format!("{which}: its head moved ({why}); rerun {cmd}"),
             ),
             MergeOutcome::TryLater(why) => stop(
                 Waits::Nobody,
-                format!("{which}: the forge is not ready ({why}); rerun swl land"),
+                format!("{which}: the forge is not ready ({why}); rerun {cmd}"),
             ),
         }
     }
 
+    /// `land`'s step for an MR whose branch is behind its base: rebase it,
+    /// then `republish`, the command that pushes it again.
+    fn rebase_step(&self, repo: &str, info: &PrInfo, republish: &str) -> String {
+        let base = self.config.base_for(repo);
+        let base_branch = base.split_once('/').map_or(base, |(_, b)| b);
+        format!(
+            "rebase {} onto {base_branch} (swl never force-pushes), then {republish}",
+            info.head_ref
+        )
+    }
+
     /// Step 2: fast-forwards `branch` on the forge to the merge commit.
-    fn promote(&self, which: &str, repo: &str, merge_commit: &str, branch: &str) -> Result<Step> {
+    pub(crate) fn promote(
+        &self,
+        which: &str,
+        repo: &str,
+        merge_commit: &str,
+        branch: &str,
+    ) -> Result<Step> {
         let rc = self.config.repo(repo)?;
         let src = &rc.source;
         let remote = base_remote(src, rc.base())?.unwrap_or_else(|| "origin".into());
@@ -567,7 +610,8 @@ impl Lander<'_> {
                     Waits::Nobody,
                     format!(
                         "promote {which}: {remote}'s {branch} moved since it was fetched; rerun \
-                         swl land"
+                         {}",
+                        self.cmd
                     ),
                 ),
                 Some(Rejection::Refused(reason)) => stop(
@@ -580,7 +624,14 @@ impl Lander<'_> {
 
     /// Waits for the declared source (common's GitHub mirror) to have the
     /// merge commit in `branch`.
-    fn mirror(&self, which: &str, url: &str, branch: &str, merge_commit: &str) -> Result<Step> {
+    pub(crate) fn mirror(
+        &self,
+        which: &str,
+        url: &str,
+        branch: &str,
+        merge_commit: &str,
+    ) -> Result<Step> {
+        let cmd = self.cmd;
         let deadline = Instant::now() + self.opts.timeout;
         let refname = format!("refs/heads/{branch}");
         loop {
@@ -597,13 +648,13 @@ impl Lander<'_> {
                 return stop(
                     Waits::Nobody,
                     format!(
-                        "{which}: waiting for {url} {branch} to have {} ({why}); rerun swl land",
+                        "{which}: waiting for {url} {branch} to have {} ({why}); rerun {cmd}",
                         short(merge_commit)
                     ),
                 );
             }
             style::say(
-                "swl land",
+                self.cmd,
                 Tone::Plain,
                 format!(
                     "{which}: {url} {branch} does not have {} yet; checking again in {}s",
@@ -617,15 +668,13 @@ impl Lander<'_> {
 
     /// Step 3 for one consumer checkout.
     fn consumer(&self, rows: &[Row], c: &Checkout) -> Result<Step> {
+        let cmd = self.cmd;
         let _span = tracing::debug_span!("consumer", name = %c.name).entered();
         let Some(row) = rows
             .iter()
             .find(|r| r.name == c.name && r.follows.is_none())
         else {
-            return stop(
-                Waits::Nobody,
-                format!("{}: no status; rerun swl land", c.name),
-            );
+            return stop(Waits::Nobody, format!("{}: no status; rerun {cmd}", c.name));
         };
         if matches!(row.verdict.stage, Stage::Landed | Stage::NoChange(_)) {
             return Ok(Step::Done);
@@ -715,7 +764,7 @@ impl Lander<'_> {
                     Waits::Anyone,
                     format!(
                         "{}: {MANIFEST_FILE} has no entries; git rm {MANIFEST_FILE}, commit, then \
-                         rerun swl land",
+                         rerun {cmd}",
                         c.name
                     ),
                 );
@@ -732,7 +781,7 @@ impl Lander<'_> {
             }
             Landing::WouldLand(lines) => {
                 style::say(
-                    "swl land",
+                    self.cmd,
                     Tone::Plain,
                     format!("would finalize {}:\n  {}", c.name, lines.join("\n  ")),
                 );
@@ -742,7 +791,7 @@ impl Lander<'_> {
             }
             Landing::Committed(done) => {
                 style::say(
-                    "swl land",
+                    self.cmd,
                     Tone::Good,
                     format!(
                         "{}: committed {} on {branch}: {}",
@@ -766,11 +815,19 @@ impl Lander<'_> {
             git(&c.dir, &["push", "--quiet", &remote, &refspec])?;
             return self.await_pull_head(&c.dir, &remote, &which, number);
         }
-        self.merge(&which, &c.name, info, &format!("swl publish {}", c.name))
+        let rebase = self.rebase_step(&c.name, info, &format!("swl publish {}", c.name));
+        self.merge(&which, &c.name, info, &rebase)
     }
 
     /// After a push: waits until the forge has updated the MR's pull ref.
-    fn await_pull_head(&self, dir: &Path, remote: &str, which: &str, n: u64) -> Result<Step> {
+    pub(crate) fn await_pull_head(
+        &self,
+        dir: &Path,
+        remote: &str,
+        which: &str,
+        n: u64,
+    ) -> Result<Step> {
+        let cmd = self.cmd;
         let head = git(dir, &["rev-parse", "HEAD"])?;
         let pull = format!("refs/pull/{n}/head");
         let deadline = Instant::now() + self.opts.timeout;
@@ -783,7 +840,7 @@ impl Lander<'_> {
                 return stop(
                     Waits::Nobody,
                     format!(
-                        "{which}: waiting for the forge to update the MR to {}; rerun swl land",
+                        "{which}: waiting for the forge to update the MR to {}; rerun {cmd}",
                         short(&head)
                     ),
                 );
@@ -1042,26 +1099,37 @@ fn remove_workspace(ws: &Workspace, config: &Config, dry_run: bool) -> Result<()
     Ok(())
 }
 
-fn exit(waits: Waits, msg: &str, dry_run: bool) -> ExitCode {
+/// Says what the next step waits for, `<cmd>: waits for <who>: <msg>`.
+pub(crate) fn say_waits(cmd: &str, waits: Waits, msg: &str) {
     let (who, tone) = match waits {
         Waits::Owner => ("the owner", Tone::Owner),
         Waits::Anyone => ("anyone", Tone::Warn),
         Waits::Nobody => ("nobody", Tone::Nobody),
     };
-    style::say("swl land", tone, format!("waits for {who}: {msg}"));
-    if dry_run {
-        return ExitCode::SUCCESS;
-    }
-    ExitCode::from(match waits {
+    style::say(cmd, tone, format!("waits for {who}: {msg}"));
+}
+
+/// The exit status of a run whose next step waits for `waits`.
+pub(crate) fn waits_code(waits: Waits) -> u8 {
+    match waits {
         Waits::Owner => EXIT_OWNER,
         Waits::Anyone => EXIT_ANYONE,
         Waits::Nobody => EXIT_NOBODY,
-    })
+    }
 }
 
-fn planned(then: &str) -> ExitCode {
+fn exit(waits: Waits, msg: &str, dry_run: bool) -> ExitCode {
+    say_waits("swl land", waits, msg);
+    if dry_run {
+        return ExitCode::SUCCESS;
+    }
+    ExitCode::from(waits_code(waits))
+}
+
+/// The end of a dry run that reached a write.
+pub(crate) fn planned(cmd: &str, then: &str) -> ExitCode {
     style::say(
-        "swl land",
+        cmd,
         Tone::Plain,
         format!("dry run, nothing was written; then: {then}"),
     );
@@ -1089,13 +1157,7 @@ pub fn run(
     writer: &dyn ForgeWriter,
     opts: &Options,
 ) -> Result<ExitCode> {
-    let lander = Lander {
-        config,
-        reader,
-        writer,
-        opts,
-        done: RefCell::new(BTreeSet::new()),
-    };
+    let lander = Lander::new("swl land", config, reader, writer, opts);
     for pass in 0..MAX_STEPS {
         let _span = tracing::debug_span!("land", pass).entered();
         let ws = Workspace::scan(root)?;
@@ -1110,7 +1172,7 @@ pub fn run(
         tracing::debug!(?step, "the pass ends");
         match step {
             Step::Progress => continue,
-            Step::Planned(then) => return Ok(planned(&then)),
+            Step::Planned(then) => return Ok(planned("swl land", &then)),
             Step::Stop(waits, msg) => return Ok(exit(waits, &msg, opts.dry_run)),
             Step::Done if !lander.landed_by_merge(&ws, &rows)? => {
                 style::say(
@@ -1195,18 +1257,12 @@ pub fn run_from(
                 dir.display()
             ),
         );
-        let lander = Lander {
-            config,
-            reader,
-            writer,
-            opts,
-            done: RefCell::new(BTreeSet::new()),
-        };
+        let lander = Lander::new("swl land", config, reader, writer, opts);
         for mr in shared_entries(&[(consumer.clone(), mr.manifest)]) {
             match lander.shared(&rows, &mr)? {
                 Step::Done => {}
                 Step::Progress => unreachable!("a dry run writes nothing"),
-                Step::Planned(then) => return Ok(planned(&then)),
+                Step::Planned(then) => return Ok(planned("swl land", &then)),
                 Step::Stop(waits, msg) => return Ok(exit(waits, &msg, true)),
             }
         }
