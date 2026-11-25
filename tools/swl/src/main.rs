@@ -4,6 +4,8 @@ mod ci;
 mod config;
 mod env;
 mod finalize;
+// `swl land` uses its writes from a later commit on.
+#[allow(dead_code)]
 mod forge;
 mod git;
 mod github;

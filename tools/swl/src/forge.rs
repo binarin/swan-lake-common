@@ -482,7 +482,9 @@ impl ForgeReader {
         Self { anon, token }
     }
 
-    fn fj_token(base: &str) -> Result<Option<String>> {
+    /// fj's usable token for the API `base`, if any; an expired login, or a
+    /// base that is not the forge, is an error.
+    pub fn fj_token(base: &str) -> Result<Option<String>> {
         let Some(path) = fj_keys_path() else {
             return Ok(None);
         };
@@ -539,6 +541,130 @@ impl PrReader for ForgeReader {
             Some(_) => "no such MR",
             None => NOT_FOUND_WITHOUT_LOGIN,
         }
+    }
+}
+
+/// What the forge said to a merge request (`POST .../pulls/{n}/merge`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeOutcome {
+    /// Merged now.
+    Merged,
+    /// Scheduled: it merges when its checks succeed (also when it was
+    /// scheduled before).
+    Scheduled,
+    /// The user may not merge it (permissions, branch protection, a merge
+    /// style the repo does not allow): for the owner.
+    Refused(String),
+    /// Not mergeable by fast-forward: the base moved, rebase the branch.
+    NotFastForward(String),
+    /// The MR head is not the commit asked for: it moved.
+    HeadMoved(String),
+    /// The forge is not ready (still checking mergeability); try again.
+    TryLater(String),
+}
+
+/// The outcome of a merge request from Forgejo's answer: 200 merged, 201
+/// scheduled for when checks succeed, 403 and 405 refusals, 409 conflicts.
+pub fn merge_outcome(code: u16, body: &str) -> Result<MergeOutcome> {
+    let message = serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|v| v.get("message")?.as_str().map(|m| m.trim().to_string()))
+        .filter(|m| !m.is_empty())
+        .unwrap_or_else(|| body.trim().to_string());
+    let lower = message.to_ascii_lowercase();
+    let why = if message.is_empty() {
+        format!("HTTP {code}")
+    } else {
+        format!("HTTP {code}: {message}")
+    };
+    Ok(match code {
+        200 | 204 => MergeOutcome::Merged,
+        201 | 202 => MergeOutcome::Scheduled,
+        409 if lower.contains("already scheduled") => MergeOutcome::Scheduled,
+        409 if lower.contains("head out of date") || lower.contains("does not match") => {
+            MergeOutcome::HeadMoved(why)
+        }
+        409 => MergeOutcome::NotFastForward(why),
+        405 if lower.contains("try again later") => MergeOutcome::TryLater(why),
+        401 => bail!(LOGIN_REJECTED),
+        403 | 405 => MergeOutcome::Refused(why),
+        _ => bail!("merge request: {why}"),
+    })
+}
+
+/// The forge writes of `swl land`: marking an MR ready and requesting its
+/// merge.
+pub trait ForgeWriter {
+    /// Sets the MR's title (a draft is marked ready by dropping `WIP:`).
+    fn set_title(&self, repo: &str, number: u64, title: &str) -> Result<()>;
+    /// Requests a fast-forward merge of `head` when checks succeed, deleting
+    /// the branch after the merge.
+    fn request_merge(&self, repo: &str, number: u64, head: &str) -> Result<MergeOutcome>;
+}
+
+/// The title without a draft prefix (Forgejo's `WIP:` and `[WIP]`).
+pub fn ready_title(title: &str) -> String {
+    let t = title.trim_start();
+    for prefix in ["WIP:", "[WIP]"] {
+        if t.len() >= prefix.len() && t[..prefix.len()].eq_ignore_ascii_case(prefix) {
+            return t[prefix.len()..].trim_start().to_string();
+        }
+    }
+    t.to_string()
+}
+
+/// The REST API with fj's login, for writes. The token goes to curl on
+/// stdin, only to the forge (or a loopback test server), and no redirect is
+/// followed.
+pub struct FjWriter {
+    base: String,
+    token: String,
+}
+
+impl FjWriter {
+    pub fn from_env() -> Result<Self> {
+        let base = api_base();
+        match ForgeReader::fj_token(&base)? {
+            Some(token) => Ok(Self { base, token }),
+            None => bail!(
+                "swl land writes to the forge with fj's login, and there is none for {FORGE_HOST}: \
+                 run fj auth login"
+            ),
+        }
+    }
+
+    fn send(&self, method: &str, path: &str, body: &Value) -> Result<(u16, String)> {
+        http(&Request {
+            method,
+            url: &format!("{}/{path}", self.base.trim_end_matches('/')),
+            token: Some(&self.token),
+            accept: "application/json",
+            body: Some(&body.to_string()),
+            what: "forge API",
+        })
+    }
+}
+
+impl ForgeWriter for FjWriter {
+    fn set_title(&self, repo: &str, number: u64, title: &str) -> Result<()> {
+        let path = format!("repos/{}/pulls/{number}", slug(repo));
+        match self.send("PATCH", &path, &serde_json::json!({ "title": title }))? {
+            (200 | 201, _) => Ok(()),
+            (401, _) => bail!(LOGIN_REJECTED),
+            (code, body) => bail!("PATCH {path}: HTTP {code}: {}", body.trim()),
+        }
+    }
+
+    fn request_merge(&self, repo: &str, number: u64, head: &str) -> Result<MergeOutcome> {
+        let path = format!("repos/{}/pulls/{number}/merge", slug(repo));
+        let body = serde_json::json!({
+            "Do": "fast-forward-only",
+            "merge_when_checks_succeed": true,
+            "delete_branch_after_merge": true,
+            "head_commit_id": head,
+        });
+        let (code, text) = self.send("POST", &path, &body)?;
+        merge_outcome(code, &text).with_context(|| format!("POST {path}"))
     }
 }
 
@@ -764,6 +890,50 @@ mod tests {
         // `?` ends the authority: this host is 127.0.0.1, as for curl.
         assert!(token_allowed("http://127.0.0.1?@evil.example/"));
         assert!(!token_allowed("ftp://127.0.0.1/"));
+    }
+
+    #[test]
+    fn merge_answers() {
+        let o = |code, body| merge_outcome(code, body).unwrap();
+        assert_eq!(o(200, ""), MergeOutcome::Merged);
+        assert_eq!(o(201, ""), MergeOutcome::Scheduled);
+        assert_eq!(
+            o(
+                409,
+                r#"{"message":"pull request is already scheduled to auto merge when checks succeed"}"#
+            ),
+            MergeOutcome::Scheduled
+        );
+        assert_eq!(
+            o(405, r#"{"message":"User not allowed to merge PR"}"#),
+            MergeOutcome::Refused("HTTP 405: User not allowed to merge PR".into())
+        );
+        assert!(matches!(o(403, "{}"), MergeOutcome::Refused(_)));
+        assert!(matches!(
+            o(409, r#"{"message":"head out of date"}"#),
+            MergeOutcome::HeadMoved(_)
+        ));
+        assert!(matches!(
+            o(409, r#"{"message":"Not fast-forward"}"#),
+            MergeOutcome::NotFastForward(_)
+        ));
+        assert!(matches!(
+            o(405, r#"{"message":"Please try again later"}"#),
+            MergeOutcome::TryLater(_)
+        ));
+        assert_eq!(
+            merge_outcome(401, "").unwrap_err().to_string(),
+            LOGIN_REJECTED
+        );
+        assert!(merge_outcome(500, "boom").is_err());
+    }
+
+    #[test]
+    fn ready_titles() {
+        assert_eq!(ready_title("WIP: swl: x"), "swl: x");
+        assert_eq!(ready_title("wip:swl: x"), "swl: x");
+        assert_eq!(ready_title("[WIP] swl: x"), "swl: x");
+        assert_eq!(ready_title("swl: x"), "swl: x");
     }
 
     #[test]
