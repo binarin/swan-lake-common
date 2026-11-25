@@ -16,6 +16,20 @@ pub struct Nix {
     bin: PathBuf,
 }
 
+/// `s` as a Nix string literal: `\`, `"` and `$` escaped, so that no text
+/// is ever interpolated as Nix code.
+fn nix_string(s: &str) -> String {
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        if matches!(c, '\\' | '"' | '$') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('"');
+    out
+}
+
 /// swl's own secrets, which nix (evaluating the MR's flake.nix, fetching its
 /// inputs) never sees.
 const SECRET_ENV: [&str; 2] = [crate::github::TOKEN_ENV, crate::forge::FJ_KEYS_ENV];
@@ -54,8 +68,10 @@ impl Nix {
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
 
+    /// `nix eval --json` of `expr`, in restricted mode (nothing fetched, no
+    /// environment), with `extra` options.
     fn eval_json(&self, expr: &str, extra: &[&str]) -> Result<Value> {
-        let mut args = vec!["eval", "--impure", "--json"];
+        let mut args = vec!["eval", "--json", "--option", "restrict-eval", "true"];
         args.extend(extra);
         args.extend(["--expr", expr]);
         let out = self.run(&args)?;
@@ -64,17 +80,21 @@ impl Nix {
 
     /// The `inputs` attribute set of the flake at `root`, evaluated from its
     /// `flake.nix` alone, without fetching any input. Missing `inputs` is
-    /// empty. In restricted mode: only `root` may be read, nothing fetched,
-    /// and `builtins.getEnv` is empty.
+    /// empty. Impure only to import the file: in restricted mode only `root`
+    /// (canonical) may be read, nothing fetched, and `builtins.getEnv` is
+    /// empty.
     pub fn declarations(&self, root: &Path) -> Result<BTreeMap<String, Value>> {
+        let root = root
+            .canonicalize()
+            .with_context(|| format!("resolving {}", root.display()))?;
         let file = root.join("flake.nix");
         let expr = format!(
             "(import {}).inputs or {{}}",
-            serde_json::to_string(&file.to_string_lossy())?
+            nix_string(&file.to_string_lossy())
         );
         let root_s = root.to_string_lossy();
         let v = self
-            .eval_json(&expr, &["--option", "restrict-eval", "true", "-I", &root_s])
+            .eval_json(&expr, &["--impure", "-I", &root_s])
             .with_context(|| format!("reading the inputs of {}", file.display()))?;
         match v {
             Value::Object(m) => Ok(m.into_iter().collect()),
@@ -83,13 +103,11 @@ impl Nix {
     }
 
     /// The attribute form of a flake reference, as `nix flake lock` records
-    /// it in a node's `original`.
+    /// it in a node's `original`. Pure and restricted: the URL is only ever
+    /// a Nix string literal.
     pub fn parse_flake_ref(&self, url: &str) -> Result<Value> {
-        self.eval_json(
-            &format!("builtins.parseFlakeRef {}", serde_json::to_string(url)?),
-            &[],
-        )
-        .with_context(|| format!("parsing the flake reference {url:?}"))
+        self.eval_json(&format!("builtins.parseFlakeRef {}", nix_string(url)), &[])
+            .with_context(|| format!("parsing the flake reference {url:?}"))
     }
 
     /// `nix flake lock ROOT` from the lock `reference`, with `(input, flake
@@ -146,6 +164,16 @@ impl Nix {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strings_are_never_code() {
+        assert_eq!(nix_string("a"), "\"a\"");
+        assert_eq!(
+            nix_string("x${builtins.toString 1}"),
+            "\"x\\${builtins.toString 1}\""
+        );
+        assert_eq!(nix_string("a\"b\\c"), "\"a\\\"b\\\\c\"");
+    }
 
     #[test]
     fn nix_never_sees_swls_secrets() {

@@ -11,7 +11,8 @@ use anyhow::{Context, Result};
 pub struct TempDir(PathBuf);
 
 impl TempDir {
-    /// A new empty directory `<tmp>/<prefix>-<pid>-<n>`.
+    /// A new empty directory `<tmp>/<prefix>-<pid>-<n>`, by its canonical
+    /// path.
     pub fn new(prefix: &str) -> Result<Self> {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -20,6 +21,10 @@ impl TempDir {
             fs::remove_dir_all(&dir).with_context(|| format!("removing {}", dir.display()))?;
         }
         fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        // Canonical, so that paths below it compare as nix resolves them.
+        let dir = dir
+            .canonicalize()
+            .with_context(|| format!("resolving {}", dir.display()))?;
         Ok(Self(dir))
     }
 

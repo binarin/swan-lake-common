@@ -475,10 +475,14 @@ Exit status 1 with one line per problem.
     the policy.
 
 `check` reads `flake.nix` with `nix eval --impure` (no input is fetched) and
-uses the real `nix` on PATH, never a swl wrapper. That eval runs in nix's
-restricted mode (`restrict-eval`, with only the repo readable): it fetches
-nothing, reads no file outside the repo and sees no environment variable.
-No nix call of swl gets `SWL_GITHUB_TOKEN` or `SWL_FJ_KEYS`.
+uses the real `nix` on PATH, never a swl wrapper. Its evals of the MR's
+text run in nix's restricted mode (`restrict-eval`): the declarations
+(impure only to import `flake.nix`, with only the repo readable) and each
+flake reference (pure, passed as an escaped string literal, never as Nix
+code). They fetch nothing, read no file outside the repo and see no
+environment variable. The relock (`nix flake lock`) fetches the moved
+inputs, as any lock does. No nix call of swl gets `SWL_GITHUB_TOKEN` or
+`SWL_FJ_KEYS`.
 
 ### `swl ci env [DIR]`
 
