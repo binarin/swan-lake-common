@@ -193,14 +193,28 @@ fn relock(
     run().map_err(|e| format!("{e:#}"))
 }
 
+/// Whether every one of an input's source URLs (`None`: a source without
+/// one) names `repo`; there must be some.
+fn sources_name_repo(config: &Config, urls: &[Option<String>], repo: &str) -> bool {
+    !urls.is_empty()
+        && urls
+            .iter()
+            .all(|u| u.as_deref().is_some_and(|u| config.url_names_repo(u, repo)))
+}
+
+/// The URLs of a lock node's `original` and `locked` sources.
+fn node_urls(original: Option<&Value>, locked: Option<&Value>) -> Vec<Option<String>> {
+    [original, locked]
+        .into_iter()
+        .map(|s| s.and_then(attrs_url))
+        .collect()
+}
+
 /// Whether a lock node is `repo`: both its `original` and its `locked`
 /// source name it, so that neither can point elsewhere.
 fn node_names_repo(config: &Config, node: &Value, repo: &str) -> bool {
-    ["original", "locked"].iter().all(|k| {
-        node.get(k)
-            .and_then(attrs_url)
-            .is_some_and(|u| config.url_names_repo(&u, repo))
-    })
+    let urls = node_urls(node.get("original"), node.get("locked"));
+    sources_name_repo(config, &urls, repo)
 }
 
 /// The lock rules for an MR whose `flake.lock` differs from the merge base
@@ -317,8 +331,9 @@ impl Decls<'_> {
     }
 }
 
-/// Whether the entry's input is one of `entry.repo`: by the lock node's
-/// URLs, or for a root input not yet locked, by its `flake.nix` URL.
+/// Whether the entry's input is one of `entry.repo`: by both of the lock
+/// node's sources, or for a root input not yet locked, by its `flake.nix`
+/// URL.
 fn entry_repo_error(
     path: &str,
     entry: &Entry,
@@ -328,8 +343,8 @@ fn entry_repo_error(
 ) -> Result<Option<String>> {
     let segments: Vec<String> = path.split('/').map(str::to_string).collect();
     let node = lock.and_then(|l| l.resolve(&segments).and_then(|k| l.node(&k)));
-    let mut urls = match node {
-        Some(node) => node.urls(),
+    let urls = match node {
+        Some(node) => node_urls(node.original.as_ref(), node.locked.as_ref()),
         None if segments.len() == 1 => {
             let (nix, d) = decls.get()?;
             let Some(url) = d
@@ -341,21 +356,24 @@ fn entry_repo_error(
                     "{path}: neither in flake.lock nor declared with a url in flake.nix"
                 )));
             };
-            attrs_url(&nix.parse_flake_ref(url)?).into_iter().collect()
+            vec![attrs_url(&nix.parse_flake_ref(url)?)]
         }
         None => return Ok(Some(format!("{path}: not in flake.lock"))),
     };
-    urls.sort();
-    urls.dedup();
-    if urls.iter().any(|u| config.url_names_repo(u, &entry.repo)) {
-        Ok(None)
-    } else {
-        Ok(Some(format!(
-            "{path}: the input is not the repo {:?} (its URLs: {})",
-            entry.repo,
-            urls.join(", ")
-        )))
+    if sources_name_repo(config, &urls, &entry.repo) {
+        return Ok(None);
     }
+    let mut shown: Vec<&str> = urls
+        .iter()
+        .map(|u| u.as_deref().unwrap_or("(no URL)"))
+        .collect();
+    shown.sort();
+    shown.dedup();
+    Ok(Some(format!(
+        "{path}: the input is not the repo {:?} (its URLs: {})",
+        entry.repo,
+        shown.join(", ")
+    )))
 }
 
 pub struct Outcome {
@@ -533,6 +551,43 @@ mod tests {
         );
         assert!(e(&[("GITHUB_EVENT_NAME", "schedule")]).is_err());
         assert!(e(&[]).is_err());
+    }
+
+    #[test]
+    fn an_entry_is_its_repo_by_both_sources_of_its_lock_node() {
+        let config = Config::default();
+        let common = "https://forgejo.lynx-lizard.ts.net/binarin/swan-lake-common";
+        let lock = |locked: &str| {
+            Lock::parse(
+                &serde_json::json!({"version": 7, "root": "root", "nodes": {
+                    "root": {"inputs": {"lib": "lib"}},
+                    "lib": {"original": {"type": "git", "url": common},
+                            "locked": {"type": "git", "url": locked, "rev": "a".repeat(40)}},
+                }})
+                .to_string(),
+            )
+            .unwrap()
+        };
+        let no_nix = || -> Result<Nix> { bail!("not needed") };
+        let mut decls = Decls {
+            root: Path::new("/nonexistent"),
+            nix: &no_nix,
+            cache: None,
+        };
+        let e = Entry {
+            repo: "swan-lake-common".into(),
+            mr: 1,
+        };
+        let ok = lock(common);
+        assert_eq!(
+            entry_repo_error("lib", &e, Some(&ok), &config, &mut decls).unwrap(),
+            None
+        );
+        let elsewhere = lock("https://evil.example/c");
+        let err = entry_repo_error("lib", &e, Some(&elsewhere), &config, &mut decls)
+            .unwrap()
+            .unwrap();
+        assert!(err.contains("git+https://evil.example/c"), "{err}");
     }
 
     #[test]

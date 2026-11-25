@@ -462,7 +462,8 @@ Exit status 1 with one line per problem.
     answer that cannot be had (offline, rate limited, an unknown revision)
     fails the check with the reason.
   - `swl.toml`, if present, parses, and for each entry: the input is that
-    repo (its lock node's URL by the config's URL patterns, or for a root
+    repo (both its lock node's `original` and `locked` URLs by the config's
+    URL patterns, or for a root
     input not yet in the lock, its `flake.nix` URL), and the MR exists and is
     open or merged (anonymous API).
 - On master:
