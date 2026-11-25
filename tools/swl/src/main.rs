@@ -144,12 +144,18 @@ enum WsCommands {
     #[command(about = "Add a worktree checkout: <consumer> or <repo>@<input>")]
     Add {
         name: String,
-        /// Check out this branch, creating it at the repo's base if missing [default: detached at the base]
+        /// Check out this branch: the local one, else one tracking the remote's, else a new one at the base [default: detached at the base]
         #[arg(long)]
         branch: Option<String>,
         /// Workspace directory [default: current directory]
         #[arg(long, value_name = "DIR")]
         workspace: Option<PathBuf>,
+        /// Do not fetch the source first; use the refs it already has
+        #[arg(long)]
+        no_fetch: bool,
+        /// Do not run `swl env` afterwards
+        #[arg(long)]
+        no_env: bool,
     },
 }
 
@@ -175,14 +181,19 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     name,
                     branch,
                     workspace,
+                    no_fetch,
+                    no_env,
                 },
         } => {
             let config = Config::load(config_flag)?;
+            let swl = if no_env { None } else { Some(current_exe()?) };
             ws_add::run(
                 &config,
                 &workspace_dir(workspace)?,
                 &name,
                 branch.as_deref(),
+                &ws_add::Fetcher::new(!no_fetch),
+                swl.as_deref(),
             )?;
         }
         Commands::Env { workspace, force } => {

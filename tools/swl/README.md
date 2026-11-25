@@ -29,7 +29,7 @@ skipped. Each input name can be overridden by only one checkout per workspace.
 ## Commands
 
 ```sh
-swl ws add swan-lake                      # worktree of the consumer, detached at the base
+swl ws add swan-lake                      # fetch, worktree detached at the base, then env
 swl ws add swan-lake-common@common --branch sl-0036-x
 swl env                                   # .envrc.local per consumer, and the wrappers
 swl status                                # local state of the shared checkouts
@@ -43,11 +43,23 @@ swl finalize [--wait]                     # landed entries -> one lock commit
 `ws add`, `env` and `status` use the current directory as the workspace unless
 `--workspace DIR` is given. The global `--config FILE` selects the repos config.
 
-- `ws add NAME [--branch B]` runs `git worktree add` in the repo's configured
-  source, which can be a bare repository or a main checkout. Without
-  `--branch`, the worktree is detached at the repo's `base`. With `--branch`,
-  an existing branch is checked out, or a new branch is created at `base`
-  without an upstream. `ws add` does not fetch: fetch the source first.
+- `ws add NAME [--branch B] [--no-fetch] [--no-env]` runs `git worktree add`
+  in the repo's configured source, which can be a bare repository or a main
+  checkout.
+  - First it fetches the source's remote that the `base` names (`origin` for
+    `origin/master`), so that the new worktree starts at the current base. A
+    base without a remote prefix is not fetched. `--no-fetch` skips the fetch
+    for offline work; a failed fetch is an error, not a stale base.
+  - Without `--branch`, the worktree is detached at `base`. With `--branch B`:
+    an existing local B is checked out, fast-forwarded first when it is
+    strictly behind `<remote>/B` (a diverged one is left with a warning;
+    swl never resets); else B is created at `<remote>/B` with that upstream,
+    to join a published branch; else B is created at `base` without an
+    upstream.
+  - Then it runs `env` for the workspace, unless `--no-env`, or while the
+    workspace has no consumer checkout yet. When `env` refuses (a
+    hand-written `.envrc.local`), the checkout is still added; fix it and
+    rerun `swl env` (`--force` replaces the file).
 - `env` writes each consumer's `.envrc.local` and `<ws>/.swl/bin/{nix,nh,deploy}`.
   It writes only files whose content changes, so that direnv does not reload
   needlessly. It refuses to replace a `.envrc.local` that it did not write
