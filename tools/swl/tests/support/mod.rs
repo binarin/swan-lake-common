@@ -691,8 +691,13 @@ impl Forge {
     /// Another consumer like swan-lake, locked to common's `current`, on the
     /// forge, with its source and its `[repos.<repo>]` in the config.
     pub fn add_consumer(&self, repo: &str) {
+        self.add_consumer_with(repo, CONSUMER_FLAKE);
+    }
+
+    /// Another consumer with its own `flake.nix` (`@FORGE@` for the forge).
+    pub fn add_consumer_with(&self, repo: &str, flake: &str) {
         let seed = self.root.join("seed").join(repo);
-        self.seed(&seed, CONSUMER_FLAKE, &format!("{repo}-1"));
+        self.seed(&seed, flake, &format!("{repo}-1"));
         stdout(&self.nix(&seed, &["flake", "lock"]));
         self.git(&seed, &["add", "flake.lock"]);
         self.git(&seed, &["commit", "-qm", "lock"]);

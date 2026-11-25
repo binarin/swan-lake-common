@@ -592,3 +592,51 @@ fn bump_updates_its_own_branch_and_mr() {
         assert_eq!(t.locked(c, &master, "lib"), second);
     }
 }
+
+/// A consumer whose input is named `common`, so that the common pin policy
+/// applies to its relock, which a `git+file:` common cannot pass.
+const CONSUMER_OF_COMMON: &str = r#"{
+  inputs.common.url = "git+file://@FORGE@/binarin/swan-lake-common?ref=current";
+  outputs = { self, common, ... }: {
+    value = builtins.readFile ./value.txt + "+" + common.value;
+  };
+}
+"#;
+
+#[test]
+fn bump_reports_a_failing_consumer_and_goes_on() {
+    let t = Bump::new("bump-failing");
+    t.f.add_consumer_with("aaa-consumer", CONSUMER_OF_COMMON);
+    // Common moved and was promoted by hand: every consumer lags.
+    let c2 = t.f.commit_on_forge(COMMON, "master", "c2");
+    t.f.git(
+        &t.f.forge_repo(COMMON),
+        &["update-ref", "refs/heads/current", &c2],
+    );
+    let out = t.bump(&[]);
+    // The first consumer fails its relock's pin policy; the others get
+    // their MRs.
+    failed(
+        &out,
+        2,
+        "swl bump: error: aaa-consumer: the relocked flake.lock breaks the common pin policy",
+    );
+    failed(&out, 2, "waits for nobody: nixos-config#1 waits for CI");
+    failed(&out, 2, "waits for nobody: swan-lake#1 waits for CI");
+    assert!(
+        t.f.git(
+            &t.f.forge_repo("aaa-consumer"),
+            &["branch", "--list", BRANCH]
+        )
+        .is_empty()
+    );
+    for c in CONSUMERS {
+        assert_eq!(t.locked(c, BRANCH, "lib"), c2);
+    }
+    let list = t.f.git(
+        &t.f.source("aaa-consumer"),
+        &["worktree", "list", "--porcelain"],
+    );
+    assert_eq!(list.matches("worktree ").count(), 1, "{list}");
+    t.no_worktrees_left();
+}

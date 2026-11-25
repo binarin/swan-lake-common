@@ -815,7 +815,8 @@ same branch.
    login), titled like the commit, and merged as `land` merges: directly
    when its checks are green, scheduled when they are pending, a refusal
    told by its reason. The consumer's other inputs are not touched. A
-   consumer that stops does not stop the others. A consumer whose common is
+   consumer that stops, or fails (a relock, the pin policy, the forge),
+   does not stop the others; a failure is reported at the end. A consumer whose common is
    not behind the promoted rev, but ahead or diverged, is reported and
    left.
 
@@ -830,8 +831,9 @@ source's objects, or rerun `swl bump` as the owner (which makes it anew).
 So common's master and `swan-lake-current` must be protected against the
 agents' pushes for that boundary to hold. The exit status is `land`'s: 0
 when everything is bumped or there is nothing to bump (and for a dry run),
-3 when a step waits for the owner, 4 for anyone, 5 for nobody, 2 on errors;
-with several consumers stopping, the most urgent of those, in that order.
+3 when a step waits for the owner, 4 for anyone, 5 for nobody, 2 on errors
+(also when one consumer failed and the others went on); with several
+consumers stopping, the most urgent of those, in that order.
 
 It is stateless and rerunnable: each run reads common's master and
 promotion branch, the locks, the bump branches, the forge's MRs and the

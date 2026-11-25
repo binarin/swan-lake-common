@@ -999,16 +999,11 @@ impl Bumper<'_> {
         subject: &str,
     ) -> Result<String> {
         let nix = self.nix()?;
-        let bytes = relock(nix, &scratch.dir, &c.lock, moves)
-            .with_context(|| format!("relocking {}", c.name))?;
+        let bytes = relock(nix, &scratch.dir, &c.lock, moves).context("relocking")?;
         let new: Value = serde_json::from_slice(&bytes)?;
         let decls = nix.declarations(&scratch.dir)?;
-        pin_policy::check(&decls, &new, &|url| nix.parse_flake_ref(url)).with_context(|| {
-            format!(
-                "{}: the relocked flake.lock breaks the common pin policy",
-                c.name
-            )
-        })?;
+        pin_policy::check(&decls, &new, &|url| nix.parse_flake_ref(url))
+            .context("the relocked flake.lock breaks the common pin policy")?;
         let body: String = moves
             .iter()
             .map(|(name, _, rev)| {
@@ -1065,16 +1060,23 @@ impl Bumper<'_> {
                     &format!("{then}; then the bump MRs of {}", names.join(", ")),
                 ));
             }
-            Common::Stopped(Step::Stop(waits, msg)) => return Ok(self.end(&[(waits, msg)], &[])),
+            Common::Stopped(Step::Stop(waits, msg)) => {
+                return Ok(self.end(&[(waits, msg)], &[], &[]));
+            }
             Common::Stopped(step) => bail!("common stopped at an unexpected step: {step:?}"),
         };
         let mut stops = Vec::new();
         let mut plans = Vec::new();
+        let mut errors = Vec::new();
         for c in &consumers {
             let step = match self.consumer(c, &target, &common_rc.source) {
                 Err(e) => match e.downcast_ref::<Repeated>() {
                     Some(r) => Step::Stop(Waits::Nobody, r.0.clone()),
-                    None => return Err(e),
+                    None => {
+                        tracing::debug!(consumer = %c.name, "the consumer failed: {e:#}");
+                        errors.push(format!("{}: {e:#}", c.name));
+                        continue;
+                    }
                 },
                 Ok(step) => step,
             };
@@ -1085,7 +1087,7 @@ impl Bumper<'_> {
                 Step::Stop(waits, msg) => stops.push((waits, msg)),
             }
         }
-        if stops.is_empty() && plans.is_empty() {
+        if stops.is_empty() && plans.is_empty() && errors.is_empty() {
             let msg = if self.lander.wrote() {
                 format!(
                     "done: {} lock common at {}",
@@ -1098,18 +1100,24 @@ impl Bumper<'_> {
             style::say(CMD, Tone::Good, msg);
             return Ok(ExitCode::SUCCESS);
         }
-        Ok(self.end(&stops, &plans))
+        Ok(self.end(&stops, &plans, &errors))
     }
 
-    /// Says what each stopped item waits for, and what a dry run planned.
-    /// The exit status is the most urgent wait's: the owner, anyone, then
-    /// nobody.
-    fn end(&self, stops: &[(Waits, String)], plans: &[String]) -> ExitCode {
+    /// Says what each stopped item waits for, what a dry run planned, and
+    /// the consumers that failed. The exit status is 2 with a failure, else
+    /// the most urgent wait's: the owner, anyone, then nobody.
+    fn end(&self, stops: &[(Waits, String)], plans: &[String], errors: &[String]) -> ExitCode {
         for (waits, msg) in stops {
             land::say_waits(CMD, *waits, msg);
         }
         for then in plans {
             land::planned(CMD, then);
+        }
+        for e in errors {
+            style::tell(CMD, Tone::Error, format!("error: {e}"));
+        }
+        if !errors.is_empty() {
+            return ExitCode::from(2);
         }
         match stops.iter().map(|(w, _)| land::waits_code(*w)).min() {
             Some(code) if !self.dry_run() => ExitCode::from(code),
