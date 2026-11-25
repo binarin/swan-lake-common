@@ -146,19 +146,11 @@ impl RemoteHistory {
 /// The head of `refname` in the repository at `url`, by `ls-remote`. Never
 /// prompts for credentials.
 pub fn remote_head(url: &str, refname: &str) -> Result<String, String> {
-    let out = Command::new(GIT)
-        .args(["ls-remote", "--end-of-options", url, refname])
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| format!("running {GIT}: {e}"))?;
-    if !out.status.success() {
-        return Err(last_line(
-            &String::from_utf8_lossy(&out.stderr),
-            "git ls-remote failed",
-        ));
+    let (code, stdout, stderr) = run_output(&["ls-remote", "--end-of-options", url, refname])?;
+    if code != 0 {
+        return Err(last_line(&stderr, "git ls-remote failed"));
     }
-    String::from_utf8_lossy(&out.stdout)
+    stdout
         .lines()
         .find(|l| l.split_whitespace().nth(1) == Some(refname))
         .and_then(|l| l.split_whitespace().next())
@@ -292,23 +284,33 @@ fn git(args: &[&str]) -> Result<(), String> {
 
 /// `(exit code, stderr)` of git, killed after [`TIMEOUT`].
 fn run(args: &[&str]) -> Result<(i32, String), String> {
+    run_output(args).map(|(code, _, err)| (code, err))
+}
+
+/// The text a child's pipe gives, read on a thread.
+fn read_all<R: Read + Send + 'static>(pipe: Option<R>) -> thread::JoinHandle<String> {
+    thread::spawn(move || {
+        let mut s = String::new();
+        if let Some(mut p) = pipe {
+            let _ = p.read_to_string(&mut s);
+        }
+        s
+    })
+}
+
+/// `(exit code, stdout, stderr)` of git, killed after [`TIMEOUT`].
+fn run_output(args: &[&str]) -> Result<(i32, String, String), String> {
     let mut child = Command::new(GIT)
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_NO_LAZY_FETCH", "1")
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("running {GIT}: {e}"))?;
-    let mut stderr = child.stderr.take();
-    let reader = thread::spawn(move || {
-        let mut s = String::new();
-        if let Some(e) = stderr.as_mut() {
-            let _ = e.read_to_string(&mut s);
-        }
-        s
-    });
+    let out_reader = read_all(child.stdout.take());
+    let reader = read_all(child.stderr.take());
     let deadline = Instant::now() + TIMEOUT;
     let status = loop {
         match child.try_wait() {
@@ -316,14 +318,17 @@ fn run(args: &[&str]) -> Result<(i32, String), String> {
             Ok(None) if Instant::now() >= deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(format!("git {} timed out", args.get(2).unwrap_or(&"")));
+                // The subcommand, after `-C <dir>` if given.
+                let what = args.get(if args.first() == Some(&"-C") { 2 } else { 0 });
+                return Err(format!("git {} timed out", what.unwrap_or(&"")));
             }
             Ok(None) => thread::sleep(Duration::from_millis(50)),
             Err(e) => return Err(e.to_string()),
         }
     };
     let err = reader.join().unwrap_or_default();
-    Ok((status.code().unwrap_or(-1), err))
+    let out = out_reader.join().unwrap_or_default();
+    Ok((status.code().unwrap_or(-1), out, err))
 }
 
 #[cfg(test)]

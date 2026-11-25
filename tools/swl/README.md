@@ -435,8 +435,11 @@ Exit status 1 with one line per problem.
     (`--override-input`) to its new locked source, into a scratch lock;
     nix then takes their inputs from their own `flake.lock` at that
     revision, with the consumer's `follows`, and the result must equal
-    HEAD's lock as a graph. That fetches the moved inputs' sources, as CI
-    does anyway. HEAD's lock passes the pin policy below. A partial landing
+    HEAD's lock as a graph (every field of every node). That fetches the
+    moved inputs' sources, as CI does anyway. It needs Nix 2.34 or later
+    (the version it is tested with): `--reference-lock-file`, and an
+    `--override-input` that keeps `flake.nix`'s `original` in the lock.
+    HEAD's lock passes the pin policy below. A partial landing
     (entries remain) passes; a removed entry whose input did not change is a
     note. Entries still at HEAD are checked as below.
 

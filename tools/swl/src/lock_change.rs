@@ -100,12 +100,12 @@ fn graph(lock: &Value, key: &str, active: &mut Vec<String>) -> Result<Value> {
         inputs.insert(name, v);
     }
     active.pop();
-    Ok(json!({
-        "locked": node.get("locked"),
-        "original": node.get("original"),
-        "flake": node.get("flake").unwrap_or(&Value::Bool(true)),
-        "inputs": inputs,
-    }))
+    // The whole node but its edges, which are replaced by their graphs.
+    let mut g = node.as_object().cloned().unwrap_or_default();
+    g.remove("inputs");
+    g.entry("flake").or_insert(Value::Bool(true));
+    g.insert("inputs".into(), Value::Object(inputs));
+    Ok(Value::Object(g))
 }
 
 /// The root inputs whose part of the lock differs between `old` and `new`.
@@ -187,7 +187,13 @@ fn graph_difference(a: &Value, b: &Value, path: &str) -> Option<String> {
     if a.get("follows").is_some() || b.get("follows").is_some() {
         return (a != b).then(|| format!("{path} (its follows)"));
     }
-    for field in ["locked", "original", "flake"] {
+    let fields: BTreeSet<&String> = [a, b]
+        .iter()
+        .filter_map(|v| v.as_object())
+        .flat_map(|m| m.keys())
+        .filter(|k| *k != "inputs")
+        .collect();
+    for field in fields {
         if a.get(field) != b.get(field) {
             return Some(format!("{path} (its {field})"));
         }
@@ -483,6 +489,13 @@ mod tests {
         assert_eq!(
             first_difference(&a, &b).unwrap().as_deref(),
             Some("the root input dep")
+        );
+        // Any field of a node, not only its sources.
+        let mut b = lock();
+        b["nodes"]["dep"]["parent"] = json!(["common"]);
+        assert_eq!(
+            first_difference(&a, &b).unwrap().as_deref(),
+            Some("common/dep (its parent)")
         );
         let mut b = lock();
         b["version"] = json!(8);
