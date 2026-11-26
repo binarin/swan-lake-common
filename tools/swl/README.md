@@ -230,8 +230,9 @@ wrappers' swl: swl 0.2.0 (abc1234 2026-11-26) at /nix/store/…-swl-0.2.0/bin/sw
 
 The wrappers' swl is the one `<ws>/.swl/bin/nix` execs, and its version is
 what it prints for `--version`. When the two versions differ, or that swl
-does not run (`wrappers' swl: unknown (<reason>)`: it is gone or not
-executable), a warning on stderr says to rerun `swl env`. Without wrappers
+does not run (`wrappers' swl: unknown (<reason>)`: it is gone, not
+executable, or its `--version` does not finish in 5 s, after which it is
+killed), a warning on stderr says to rerun `swl env`. Without wrappers
 yet the line says `none yet`, without a warning. `--from` prints neither
 line.
 

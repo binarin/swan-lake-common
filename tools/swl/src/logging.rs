@@ -6,9 +6,11 @@
 
 use std::{
     borrow::Cow,
-    env, io,
-    process::{Command, ExitStatus, Output},
-    time::Instant,
+    env,
+    io::{self, Read},
+    process::{Command, ExitStatus, Output, Stdio},
+    thread,
+    time::{Duration, Instant},
 };
 
 use tracing_subscriber::{EnvFilter, fmt::time::uptime};
@@ -121,6 +123,59 @@ pub fn output(cmd: &mut Command) -> io::Result<Output> {
     let out = cmd.output();
     finished(&line, started, out.as_ref().map(|o| &o.status));
     out
+}
+
+/// `cmd.output()` with stdin null, logged, but `None` when the command has
+/// not exited and closed its stdout and stderr within `timeout`; it is then
+/// killed.
+pub fn output_within(cmd: &mut Command, timeout: Duration) -> io::Result<Option<Output>> {
+    let line = command_line(cmd);
+    let started = Instant::now();
+    let spawned = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn();
+    let mut child = match spawned {
+        Ok(child) => child,
+        Err(e) => {
+            finished(&line, started, Err(&e));
+            return Err(e);
+        }
+    };
+    let stdout = read_all(child.stdout.take());
+    let stderr = read_all(child.stderr.take());
+    let deadline = started + timeout;
+    loop {
+        // Read to the end too: a child it left running may hold the pipes.
+        let exited = child.try_wait()?;
+        if let Some(status) = exited.filter(|_| stdout.is_finished() && stderr.is_finished()) {
+            finished(&line, started, Ok(&status));
+            return Ok(Some(Output {
+                status,
+                stdout: stdout.join().unwrap_or_default(),
+                stderr: stderr.join().unwrap_or_default(),
+            }));
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            tracing::debug!(target: "swl::cmd", ms = started.elapsed().as_millis(), "timed out: {line}");
+            return Ok(None);
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// The bytes a child's pipe gives, read on a thread.
+fn read_all<R: Read + Send + 'static>(pipe: Option<R>) -> thread::JoinHandle<Vec<u8>> {
+    thread::spawn(move || {
+        let mut bytes = Vec::new();
+        if let Some(mut p) = pipe {
+            let _ = p.read_to_end(&mut bytes);
+        }
+        bytes
+    })
 }
 
 /// `cmd.status()`, logged.

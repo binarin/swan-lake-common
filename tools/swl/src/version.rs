@@ -5,6 +5,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::LazyLock,
+    time::Duration,
 };
 
 use crate::{env::wrapper_target, shim::Tool, workspace::WRAPPER_DIR};
@@ -51,9 +52,18 @@ pub enum Wrapped {
     Broken(String),
 }
 
+/// How long the wrappers' swl may take for `--version` before it counts as
+/// not running, so that one that hangs does not hang `swl status`.
+const VERSION_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Reads the nix wrapper of the workspace at `root` and runs the swl it
 /// execs with `--version`.
 pub fn wrapped(root: &Path) -> Wrapped {
+    wrapped_within(root, VERSION_TIMEOUT)
+}
+
+/// [`wrapped`], with `--version` given `timeout`.
+fn wrapped_within(root: &Path, timeout: Duration) -> Wrapped {
     let wrapper = root.join(WRAPPER_DIR).join(Tool::Nix.name());
     let text = match std::fs::read_to_string(&wrapper) {
         Ok(text) => text,
@@ -66,8 +76,15 @@ pub fn wrapped(root: &Path) -> Wrapped {
             wrapper.display()
         ));
     };
-    let out = match crate::logging::output(Command::new(&exe).arg("--version")) {
-        Ok(out) => out,
+    let out = match crate::logging::output_within(Command::new(&exe).arg("--version"), timeout) {
+        Ok(Some(out)) => out,
+        Ok(None) => {
+            return Wrapped::Broken(format!(
+                "{} --version did not finish in {}s",
+                exe.display(),
+                timeout.as_secs_f64()
+            ));
+        }
         Err(e) => return Wrapped::Broken(format!("running {}: {e}", exe.display())),
     };
     let version = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -135,6 +152,35 @@ mod tests {
             "0.2.0 (unknown)"
         );
         assert!(line().starts_with(&format!("swl {} (", env!("CARGO_PKG_VERSION"))));
+    }
+
+    #[test]
+    fn a_wrappers_swl_that_hangs_on_version_is_broken_after_the_timeout() {
+        use std::{fs, os::unix::fs::PermissionsExt, time::Instant};
+
+        let tmp = crate::tempdir::TempDir::new("swl-version-test").unwrap();
+        let exe = tmp.path().join("swl");
+        fs::write(&exe, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
+        let bin = tmp.path().join(WRAPPER_DIR);
+        fs::create_dir_all(&bin).unwrap();
+        fs::write(
+            bin.join(Tool::Nix.name()),
+            format!(
+                "#!/bin/sh\nexec {} shim nix -- \"$@\"\n",
+                crate::env::shell_quote(exe.as_os_str())
+            ),
+        )
+        .unwrap();
+        let started = Instant::now();
+        assert_eq!(
+            wrapped_within(tmp.path(), Duration::from_millis(200)),
+            Wrapped::Broken(format!(
+                "{} --version did not finish in 0.2s",
+                exe.display()
+            ))
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]
