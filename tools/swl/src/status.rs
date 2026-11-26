@@ -22,7 +22,7 @@ use serde_json::Value;
 use crate::{
     ancestry,
     config::Config,
-    forge::{CiState, LOGIN_REJECTED, PrInfo, PrReader, PrState},
+    forge::{CiState, LOGIN_REJECTED, NOT_FOUND_WITHOUT_LOGIN, PrInfo, PrReader, PrState},
     git::{git, git_ok, short},
     lock::Lock,
     manifest::{Entry, MANIFEST_FILE, Manifest},
@@ -895,7 +895,7 @@ impl Ctx<'_> {
 
     /// The MR of `branch` into `base` in `repo`, in any state. A forge that
     /// cannot be asked is a detail line, a warning and `failed`, not the
-    /// row's state.
+    /// row's state; none found without fj's login, a detail line.
     fn branch_mr(
         &self,
         repo: &str,
@@ -905,6 +905,11 @@ impl Ctx<'_> {
         failed: &mut Option<String>,
     ) -> Option<PrInfo> {
         match self.reader.pr_of_branch(repo, base, branch) {
+            // Without fj's login a private repo answers 404 too.
+            Ok(None) if self.reader.not_found() == NOT_FOUND_WITHOUT_LOGIN => {
+                details.push(format!("MR of {branch}: {NOT_FOUND_WITHOUT_LOGIN}"));
+                None
+            }
             Ok(info) => info,
             Err(e) => {
                 details.push(format!("MR of {branch}: unknown ({e:#})"));

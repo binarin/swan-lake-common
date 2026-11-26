@@ -211,6 +211,8 @@ history (the commits from before a rebase), it is `merged`, next `remove the
 workspace`; with the merge commit in HEAD's history it is new work, `local`;
 with a merge commit not known here, `unknown`, next to check the MR.
 A lookup that fails is a detail line and a warning; the row stays as it is.
+Without fj's login, a lookup that finds none is a detail line too: a private
+repo answers so to anyone.
 When no consumer holds a change (each is `no change` or `not a change`), a
 line after the rows says so. A consumer MR with entries is not merged on its
 own: while its own step waits for the owner (merge) or nobody (CI), its next

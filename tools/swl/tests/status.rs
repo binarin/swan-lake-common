@@ -752,6 +752,22 @@ fn status_says_a_detached_consumer_is_not_a_change() {
         ),
         "{out}"
     );
+    assert!(!out.contains("MR of sl-0030-held: "), "{out}");
+    // Without fj's login, none found in the private repo is said to be
+    // so; the rows stay.
+    let out = stdout(&f.swl(&f.root, &["status", "--workspace", &ws_s]));
+    assert_eq!(
+        detail(&out, "MR of sl-0030-held: "),
+        "MR of sl-0030-held: not readable anonymously, and no fj login: no such MR, or the repo \
+         is private"
+    );
+    assert_row(
+        &out,
+        "nixos-config",
+        "not a change (detached at origin/master)",
+        "-",
+        "nobody",
+    );
     // The branch named like the workspace was looked up, with the login.
     assert!(
         f.authed_requests("nixos-config")
