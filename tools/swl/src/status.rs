@@ -21,6 +21,7 @@ use serde_json::Value;
 
 use crate::{
     ancestry,
+    bump::{COMMON_REPO, promotion_target},
     config::Config,
     forge::{CiState, LOGIN_REJECTED, NOT_FOUND_WITHOUT_LOGIN, PrInfo, PrReader, PrState},
     git::{git, git_ok, short},
@@ -237,6 +238,21 @@ fn open_verdict(
     }
 }
 
+/// Common as a consumer whose MR merged: landed once promoted and in the
+/// declared sources (once promoted, when none is declared), else as a
+/// merged shared MR; unknown when its promotion target cannot be read.
+fn consumer_promotion_verdict(p: &ConsumerPromotion) -> Verdict {
+    let promotion = match &p.promotion {
+        Ok(promotion) => promotion,
+        Err(e) => return error_verdict(e),
+    };
+    match (&promotion.on_forge, &promotion.declared_source) {
+        (Ok(true), Some((_, Ok(true)))) => verdict(Stage::Landed, "-", Waits::Nobody),
+        (Ok(true), None) if p.mirrors.is_empty() => verdict(Stage::Landed, "-", Waits::Nobody),
+        _ => merged_verdict(promotion),
+    }
+}
+
 fn merged_verdict(p: &Promotion) -> Verdict {
     match (&p.on_forge, &p.declared_source) {
         (Ok(true), Some((url, Ok(false)))) => verdict(
@@ -432,6 +448,19 @@ pub struct ConsumerFacts {
     /// A lookup of an MR by branch (the workspace's, or the topic branch's)
     /// that failed: why. The row stays as it is; land stops.
     pub branch_mr_error: Option<String>,
+    /// Common as the consumer, its MR merged: its promotion.
+    pub promotion: Option<Box<ConsumerPromotion>>,
+}
+
+/// The promotion of common as a consumer whose MR merged, as a shared MR's:
+/// the commit (the MR's merge commit), the declared sources that must have
+/// it, and where it stands (the first declared source without it), or why
+/// the branch and the declared sources cannot be read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsumerPromotion {
+    pub commit: String,
+    pub mirrors: Vec<String>,
+    pub promotion: Result<Promotion, String>,
 }
 
 /// A merged MR of a consumer's topic branch, which is gone on the remote,
@@ -463,7 +492,10 @@ pub fn land_from_note(which: &str, branch: &str) -> String {
 
 pub fn consumer_verdict(f: &ConsumerFacts) -> Verdict {
     let c = &f.name;
-    let landed = || verdict(Stage::Landed, "-", Waits::Nobody);
+    let landed = || match &f.promotion {
+        Some(p) => consumer_promotion_verdict(p),
+        None => verdict(Stage::Landed, "-", Waits::Nobody),
+    };
     if let MrFacts::Read {
         read: MrRead::Merged { .. },
         ..
@@ -767,6 +799,16 @@ fn remote_state(dir: &Path, head: &str, remote_head: Option<&str>) -> RemoteBran
     }
 }
 
+/// Whether `commit` is in `branch` on the forge: in `<remote>/<branch>` in
+/// `dir`, or the local branch without a remote.
+fn on_forge(dir: &Path, remote: Option<&str>, branch: &str, commit: &str) -> Result<bool, String> {
+    let tip = match remote {
+        Some(r) => format!("refs/remotes/{r}/{branch}"),
+        None => format!("refs/heads/{branch}"),
+    };
+    ancestor(dir, commit, &tip)
+}
+
 impl Ctx<'_> {
     fn nix(&self) -> Result<&Nix, String> {
         self.nix
@@ -826,24 +868,92 @@ impl Ctx<'_> {
             }
         };
         let branch = declared.branch.unwrap_or_else(|| base_branch.to_string());
-        let tip = match remote {
-            Some(r) => format!("refs/remotes/{r}/{branch}"),
-            None => format!("refs/heads/{branch}"),
-        };
-        let on_forge = ancestor(dir, merge_commit, &tip);
-        let declared_source = match declared.git_url {
-            Some(url) if self.fetcher.enabled() => {
-                let has = ancestry::remote_head(&url, &format!("refs/heads/{branch}"))
-                    .and_then(|tip| ancestry::is_ancestor(&url, merge_commit, &tip, false));
-                Some((url, has))
-            }
-            _ => None,
-        };
+        let on_forge = on_forge(dir, remote, &branch, merge_commit);
+        let declared_source = declared
+            .git_url
+            .and_then(|url| Some((url.clone(), self.source_has(&url, &branch, merge_commit)?)));
         Promotion {
             branch,
             on_forge,
             declared_source,
         }
+    }
+
+    /// Whether the declared source at `url` has `commit` in `branch`; `None`
+    /// when not fetching.
+    fn source_has(&self, url: &str, branch: &str, commit: &str) -> Option<Result<bool, String>> {
+        self.fetcher.enabled().then(|| {
+            ancestry::remote_head(url, &format!("refs/heads/{branch}"))
+                .and_then(|tip| ancestry::is_ancestor(url, commit, &tip, false))
+        })
+    }
+
+    /// The promotion of `commit`, common's change as a consumer in `dir`
+    /// with `base`, to the branch and declared sources that common's
+    /// consumers declare ([`promotion_target`]).
+    fn consumer_promotion(&self, dir: &Path, base: &str, commit: &str) -> ConsumerPromotion {
+        let target = match promotion_target(self.config, self.fetcher, "common's promotion") {
+            Ok(t) => t,
+            Err(e) => {
+                return ConsumerPromotion {
+                    commit: commit.to_string(),
+                    mirrors: Vec::new(),
+                    promotion: Err(format!("cannot read the declared branch: {e:#}")),
+                };
+            }
+        };
+        let remote = base.split_once('/').map(|(r, _)| r);
+        let on_forge = on_forge(dir, remote, &target.branch, commit);
+        let mut declared_source = None;
+        for url in &target.mirrors {
+            let Some(has) = self.source_has(url, &target.branch, commit) else {
+                break;
+            };
+            let missing = has != Ok(true);
+            if missing || declared_source.is_none() {
+                declared_source = Some((url.clone(), has));
+            }
+            if missing {
+                break;
+            }
+        }
+        ConsumerPromotion {
+            commit: commit.to_string(),
+            mirrors: target.mirrors.into_iter().collect(),
+            promotion: Ok(Promotion {
+                branch: target.branch,
+                on_forge,
+                declared_source,
+            }),
+        }
+    }
+
+    /// For common as a consumer whose MR merged: the promotion of its merge
+    /// commit, with a detail line. A change in the base without a merged
+    /// MR (such as a branch pushed at master) has none.
+    fn read_consumer_promotion(
+        &self,
+        dir: &Path,
+        f: &mut ConsumerFacts,
+        details: &mut Vec<String>,
+    ) {
+        let MrFacts::Read {
+            read: MrRead::Merged { merge_commit, .. },
+            ..
+        } = &f.mr
+        else {
+            return;
+        };
+        if f.name != COMMON_REPO {
+            return;
+        }
+        let p = self.consumer_promotion(dir, &f.base, merge_commit);
+        let text = match &p.promotion {
+            Ok(promotion) => promotion_text(promotion, !p.mirrors.is_empty()),
+            Err(e) => format!("unknown ({e})"),
+        };
+        details.push(format!("promotion of {}: {text}", short(merge_commit)));
+        f.promotion = Some(Box::new(p));
     }
 
     /// The MR `repo#n` from the forge, with CI or promotion as its state
@@ -974,25 +1084,32 @@ fn describe_mr(which: &str, read: &MrRead) -> String {
             merge_commit,
             promotion,
         } => {
-            let mut s = format!("{which}: merged as {}", short(merge_commit));
-            let Some(promotion) = promotion else {
-                return s;
-            };
-            match &promotion.on_forge {
-                Ok(true) => s.push_str(&format!(", in {}", promotion.branch)),
-                Ok(false) => s.push_str(&format!(", not in {} yet", promotion.branch)),
-                Err(e) => s.push_str(&format!(", promotion unknown ({e})")),
+            let s = format!("{which}: merged as {}", short(merge_commit));
+            match promotion {
+                Some(p) => format!("{s}, {}", promotion_text(p, true)),
+                None => s,
             }
-            match &promotion.declared_source {
-                Some((url, Ok(true))) => s.push_str(&format!("; {url} has it")),
-                Some((url, Ok(false))) => s.push_str(&format!("; {url} does not have it yet")),
-                Some((url, Err(e))) => s.push_str(&format!("; {url}: unknown ({e})")),
-                None => s.push_str("; the declared source is not checked"),
-            }
-            s
         }
         MrRead::Closed => format!("{which}: closed without merging"),
     }
+}
+
+/// `in <branch>; <declared source> has it`, and the like. Without a
+/// declared source in `p`: not checked when `declared`, else there is none.
+fn promotion_text(p: &Promotion, declared: bool) -> String {
+    let mut s = match &p.on_forge {
+        Ok(true) => format!("in {}", p.branch),
+        Ok(false) => format!("not in {} yet", p.branch),
+        Err(e) => format!("promotion unknown ({e})"),
+    };
+    match &p.declared_source {
+        Some((url, Ok(true))) => s.push_str(&format!("; {url} has it")),
+        Some((url, Ok(false))) => s.push_str(&format!("; {url} does not have it yet")),
+        Some((url, Err(e))) => s.push_str(&format!("; {url}: unknown ({e})")),
+        None if declared => s.push_str("; the declared source is not checked"),
+        None => s.push_str("; no declared source"),
+    }
+    s
 }
 
 /// Tracked changes only: git+file: sees tracked files only.
@@ -1412,7 +1529,30 @@ fn consumer_row(ctx: &Ctx, hops: &[Hop], ws: &Workspace, rows: &[Row], c: &Check
                 _ => {}
             }
         }
-        Ok(ConsumerFacts {
+        // Common at the base, its branch kept on the remote after its MR
+        // merged: that MR (by branch, at the branch head), to promote.
+        if c.name == COMMON_REPO
+            && mr == MrFacts::None
+            && head_in_base
+            && remote_in_base
+            && ctx.fetcher.enabled()
+            && let (Some(t), Some(rh)) = (&topic, &remote_head)
+            && let Some(info) =
+                ctx.branch_mr(&c.name, base_branch, t, &mut details, &mut branch_mr_error)
+            && let PrState::Merged { merge_commit } = &info.state
+            && info.head_sha == *rh
+        {
+            let read = MrRead::Merged {
+                merge_commit: merge_commit.clone(),
+                promotion: None,
+            };
+            details.push(describe_mr(&format!("{}#{}", c.name, info.number), &read));
+            mr = MrFacts::Read {
+                number: info.number,
+                read,
+            };
+        }
+        let mut facts = ConsumerFacts {
             name: c.name.clone(),
             base,
             topic,
@@ -1429,7 +1569,10 @@ fn consumer_row(ctx: &Ctx, hops: &[Hop], ws: &Workspace, rows: &[Row], c: &Check
             workspace_mr,
             merged_branch_mr,
             branch_mr_error,
-        })
+            promotion: None,
+        };
+        ctx.read_consumer_promotion(&c.dir, &mut facts, &mut details);
+        Ok(facts)
     })();
     match result {
         Ok(facts) => Row {
@@ -1757,7 +1900,7 @@ pub fn collect_from(
     let head_in_base = ancestor(&source, &head, &base) == Ok(true);
     let row = (|| -> Result<ConsumerFacts> {
         let landing_pushed = landing_at(&source, &head, &base)?;
-        Ok(ConsumerFacts {
+        let mut facts = ConsumerFacts {
             name: consumer.clone(),
             base: base.clone(),
             topic: Some(branches.first().map_or("(gone)", |b| b).to_string()),
@@ -1778,11 +1921,20 @@ pub fn collect_from(
             workspace_mr: None,
             merged_branch_mr: None,
             branch_mr_error: None,
-        })
+            promotion: None,
+        };
+        ctx.read_consumer_promotion(&source, &mut facts, &mut details);
+        Ok(facts)
     })();
     let row = row.map(|f| (consumer_verdict(&f), f));
+    // The MR head is the head of no branch: unknown, unless landed or
+    // common's merged MR to promote.
+    let headless = branches.is_empty()
+        && row
+            .as_ref()
+            .is_ok_and(|(v, f)| v.stage != Stage::Landed && f.promotion.is_none());
     rows.push(match row {
-        Ok((v, facts)) if branches.is_empty() && v.stage != Stage::Landed => Row {
+        Ok((_, facts)) if headless => Row {
             name: consumer.clone(),
             follows: None,
             under: Vec::new(),
@@ -2059,6 +2211,7 @@ mod tests {
             workspace_mr: None,
             merged_branch_mr: None,
             branch_mr_error: None,
+            promotion: None,
         }
     }
 
@@ -2409,6 +2562,88 @@ mod tests {
                 "fix it, then swl publish swan-lake".into(),
                 Waits::Anyone
             )
+        );
+    }
+
+    #[test]
+    fn common_as_a_consumer_lands_once_promoted_and_mirrored() {
+        let mirror = "https://github.com/binarin/swan-lake-common.git";
+        let with = |mirrors: &[&str], promotion: Result<Promotion, String>| ConsumerFacts {
+            name: COMMON_REPO.into(),
+            mr: read(MrRead::Merged {
+                merge_commit: "1c0ffee".into(),
+                promotion: None,
+            }),
+            promotion: Some(Box::new(ConsumerPromotion {
+                commit: "1c0ffee".into(),
+                mirrors: mirrors.iter().map(|m| m.to_string()).collect(),
+                promotion,
+            })),
+            ..consumer()
+        };
+        let at = |on_forge: Result<bool, String>, source: Option<Result<bool, String>>| {
+            with(
+                &[mirror],
+                Ok(Promotion {
+                    branch: "swan-lake-current".into(),
+                    on_forge,
+                    declared_source: source.map(|s| (mirror.to_string(), s)),
+                }),
+            )
+        };
+        assert_eq!(
+            cv(at(Ok(false), Some(Ok(false)))),
+            (
+                "merged".into(),
+                "promote swan-lake-current".into(),
+                Waits::Owner
+            )
+        );
+        assert_eq!(
+            cv(at(Ok(true), Some(Ok(false)))),
+            (
+                "promoted".into(),
+                format!("wait for {mirror} to have it"),
+                Waits::Nobody
+            )
+        );
+        assert_eq!(
+            cv(at(Ok(true), Some(Ok(true)))),
+            ("landed".into(), "-".into(), Waits::Nobody)
+        );
+        // The mirror not checked (--no-fetch): promoted, as a shared MR.
+        assert_eq!(
+            cv(at(Ok(true), None)),
+            ("promoted".into(), "swl land".into(), Waits::Anyone)
+        );
+        let unmirrored = |on_forge| {
+            with(
+                &[],
+                Ok(Promotion {
+                    branch: "swan-lake-current".into(),
+                    on_forge,
+                    declared_source: None,
+                }),
+            )
+        };
+        assert_eq!(cv(unmirrored(Ok(true))).0, "landed");
+        assert_eq!(cv(unmirrored(Ok(false))).0, "merged");
+        let unreadable = with(&[], Err("cannot read the declared branch: offline".into()));
+        assert_eq!(
+            cv(unreadable),
+            (
+                "unknown (cannot read the declared branch: offline)".into(),
+                "rerun swl status".into(),
+                Waits::Nobody
+            )
+        );
+        assert_eq!(
+            cv(ConsumerFacts {
+                promotion: None,
+                ..at(Ok(false), None)
+            })
+            .0,
+            "landed"
         );
     }
 }

@@ -242,10 +242,10 @@ The stages, in order:
 | `pushed` | pushed, but the MR cannot be read | pushed, and no MR yet, or it cannot be read (also with the landing commit pushed) |
 | `MR open`, `MR open (draft)` | the `swl.toml` entry's MR is open; a draft has a `WIP:` title or `draft` set | the MR whose `refs/pull/N/head` is the remote branch head (not looked up once that head is in the base) |
 | `CI pending`, `CI failing`, `CI green` | the combined commit status of the MR head | likewise |
-| `merged` | the MR is merged (its merge commit) | its branch is gone on the remote, and the MR of that branch merged without HEAD's commits outside the base (they predate a rebase): remove the workspace |
-| `promoted` | the merge commit is in the declared branch on the forge (`swan-lake-current` for common; an input without a ref is promoted when merged) | |
+| `merged` | the MR is merged (its merge commit) | its branch is gone on the remote, and the MR of that branch merged without HEAD's commits outside the base (they predate a rebase): remove the workspace; common, landed as below but not promoted yet: `promote <branch>`, for the owner |
+| `promoted` | the merge commit is in the declared branch on the forge (`swan-lake-current` for common; an input without a ref is promoted when merged) | common, landed as below and promoted, but not in a declared source yet: wait for it, nobody |
 | `landing pushed`, `landing pushed, CI failing` | | the MR is open, and its branch has no pending `swl.toml` entries, had some (its commits since the merge base touch `swl.toml`), and changes `flake.lock` |
-| `landed` | merged, and every consumer that names it in `swl.toml` has landed | the MR is merged, or both the local and the remote branch heads are in the base, or the branch is gone on the remote (a merge deletes it) and HEAD, in the base, is the head of the branch's merged MR or has its merge commit |
+| `landed` | merged, and every consumer that names it in `swl.toml` has landed | the MR is merged, or both the local and the remote branch heads are in the base, or the branch is gone on the remote (a merge deletes it) and HEAD, in the base, is the head of the branch's merged MR or has its merge commit; common as a consumer, its MR merged, also promoted and in the declared sources |
 
 A shared checkout without an MR whose HEAD is in the rev each consumer
 locks, or already in its base, is `no MR needed`; a consumer on a topic
@@ -271,6 +271,17 @@ with a merge commit not known here, `unknown`, next to check the MR.
 A lookup that fails is a detail line and a warning; the row stays as it is.
 Without fj's login, a lookup that finds none is a detail line too: a private
 repo answers so to anyone.
+Common as a consumer (a common-only change) goes on as a shared MR does
+once its MR merged (also when the merge kept its branch: the MR of that
+branch, at its head): the MR's merge commit must be in the branch that
+common's consumers declare for it and in their declared sources, the same
+that `swl bump` promotes (see [Bump](#bump)); until then it is `merged`
+(waits: owner, next: `promote swan-lake-current`) or `promoted` (waits:
+nobody, the mirror), with a detail line `promotion of <rev>: …`, and the
+workspace is not done. A change of common in its base without a merged MR
+(such as a branch pushed at master) is `landed` by git alone, and promotes
+nothing. When that branch or those sources cannot be read, it is
+`unknown`, next `rerun swl status` (waits: nobody).
 When no consumer holds a change (each is `no change` or `not a change`), a
 line after the rows says so. A consumer MR with entries is not merged on its
 own: while its own step waits for the owner (merge) or nobody (CI), its next
@@ -288,8 +299,11 @@ per source, with `--prune`) so that the stages are current, also "gone on
 the remote" whatever the git config's `fetch.prune`, and finds a consumer's
 MR with
 `git ls-remote <remote> 'refs/pull/*/head'`; the mirror check fetches commit
-history only. `--no-fetch` uses the refs already known and looks up no
-consumer MR, by pull ref or by branch. A forge, network or git error makes
+history only. For the promotion of common's merged MR as a consumer, it
+(and so `land`) also fetches the remote of each other repo of the swl
+config, to read the branch and the declared sources of common's consumers
+at their base, as `swl bump` does. `--no-fetch` uses the refs already known
+and looks up no consumer MR, by pull ref or by branch. A forge, network or git error makes
 that row `unknown (<reason>)`; it is never an error of the command.
 
 MR state and CI come from the forge API: anonymously, and for what that
@@ -893,6 +907,23 @@ whom. Rerun it to continue. The steps:
    for that branch, and at the remote branch head; else it stops for anyone
    to check it on the forge. A draft is marked ready. A consumer without
    entries just has its merge requested.
+
+   Common as a consumer (a common-only change), once its MR merged, is
+   promoted as in step 2, in its own consumer step: like any consumer step,
+   in the order of the consumers (by name), so only once those before it
+   are done. Its merge commit is pushed to the branch that common's
+   consumers declare (`swan-lake-current`), and their declared sources (the
+   GitHub mirror) are waited for. The branch and the sources are those that
+   `swl bump` promotes to (see [Bump](#bump)): one declared branch; when
+   they cannot be read (none or several branches declared, or a fetch
+   failed) it stops, waiting for nobody.
+   Earlier commits of master that were not promoted go along; each commit
+   that the push moves the branch over is listed first (`<rev> <subject>`),
+   as for any promotion. After the push it prints `next: swl bump`, to move
+   the consumers to it; it does not run `bump`. `land --from
+   swan-lake-common#N` of such a merged MR promotes it too, without a
+   workspace (in the one `--workspace DIR` names, when that exists), and
+   says it has landed only once promoted and mirrored.
 4. When every consumer MR is merged, the workspace is removed, unless
    `--keep`: each checkout is removed from its source with `git worktree
    remove`, after its now merged local branch is deleted with `git branch

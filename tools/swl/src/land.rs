@@ -13,7 +13,9 @@
 //!    source (common's GitHub mirror) must have it.
 //! 3. Each consumer: rebased as a shared MR is when behind its base, `swl
 //!    finalize` when every entry is satisfied, the landing commit pushed to
-//!    its MR branch, and its merge requested.
+//!    its MR branch, and its merge requested. Common as a consumer, its MR
+//!    merged, is promoted then as in step 2, to the branch and declared
+//!    sources that `bump` promotes ([`crate::bump::promotion_target`]).
 //! 4. When every consumer MR is merged, the workspace is removed (unless
 //!    `--keep`).
 //!
@@ -35,6 +37,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::{
     ancestry,
+    bump::COMMON_REPO,
     config::Config,
     env::GENERATED_MARKER,
     finalize::{self, Landing},
@@ -45,7 +48,10 @@ use crate::{
     manifest::{Entry, MANIFEST_FILE, Manifest},
     refresh::{self, Part, Place},
     start,
-    status::{self, MrFacts, MrRead, RemoteBranch, Row, RowFacts, Stage, Waits},
+    status::{
+        self, ConsumerFacts, ConsumerPromotion, MrFacts, MrRead, RemoteBranch, Row, RowFacts,
+        Stage, Waits,
+    },
     style::{self, Tone},
     workspace::{Checkout, Workspace},
     ws_add::{Fetcher, base_remote},
@@ -734,6 +740,47 @@ impl Lander<'_> {
         }
     }
 
+    /// Common as a consumer, its MR merged: promoted as a shared MR is in
+    /// step 2, to the branch and declared sources that common's consumers
+    /// declare.
+    fn promote_consumer(&self, which: &str, p: &ConsumerPromotion) -> Result<Step> {
+        let promotion = match &p.promotion {
+            Ok(promotion) => promotion,
+            Err(e) => return stop(Waits::Nobody, format!("{which}: {e}; rerun {}", self.cmd)),
+        };
+        let (commit, branch) = (&p.commit, &promotion.branch);
+        match &promotion.on_forge {
+            Err(err) => stop(
+                Waits::Owner,
+                format!("{which}: promote {branch} (cannot tell whether done: {err})"),
+            ),
+            Ok(false) => {
+                let step = self.promote(which, COMMON_REPO, commit, branch)?;
+                if step == Step::Progress {
+                    style::say(
+                        self.cmd,
+                        Tone::Good,
+                        format!(
+                            "{which}: promoted {branch} to {}; next: swl bump, to move the \
+                             consumers",
+                            short(commit)
+                        ),
+                    );
+                }
+                Ok(step)
+            }
+            Ok(true) => {
+                for url in &p.mirrors {
+                    match self.mirror(which, url, branch, commit)? {
+                        Step::Done => {}
+                        step => return Ok(step),
+                    }
+                }
+                Ok(Step::Done)
+            }
+        }
+    }
+
     /// Waits for the declared source (common's GitHub mirror) to have the
     /// merge commit in `branch`.
     pub(crate) fn mirror(
@@ -820,6 +867,13 @@ impl Lander<'_> {
         let RowFacts::Consumer(f) = &row.facts else {
             return stop_at(row);
         };
+        if let Some(p) = &f.promotion {
+            let which = match &f.mr {
+                MrFacts::Read { number, .. } => format!("{}#{number}", c.name),
+                _ => c.name.clone(),
+            };
+            return self.promote_consumer(&which, p);
+        }
         let Some(branch) = &f.topic else {
             return stop_at(row);
         };
@@ -1416,13 +1470,25 @@ pub fn run_from(
     let (consumer, n) = start::parse_from(from)?;
     let fetcher = Fetcher::new(true);
     let rows = status::collect_from(config, from, reader, &fetcher)?;
-    let landed = rows
+    let row = rows
         .iter()
-        .any(|r| r.name == consumer && r.follows.is_none() && r.verdict.stage == Stage::Landed);
-    if landed {
-        let workspace = workspace
+        .find(|r| r.name == consumer && r.follows.is_none());
+    let landed = row.is_some_and(|r| r.verdict.stage == Stage::Landed);
+    let promoting =
+        row.is_some_and(|r| matches!(&r.facts, RowFacts::Consumer(f) if f.promotion.is_some()));
+    let resolved = || {
+        workspace
             .map(|w| crate::workspace_location::resolve(config, cwd, Some(w)))
-            .transpose()?;
+            .transpose()
+    };
+    if promoting && !landed {
+        return match resolved()?.as_deref().filter(|w| w.exists()) {
+            Some(ws) => run(ws, config, reader, writer, opts),
+            None => promote_from(config, from, rows, reader, writer, opts),
+        };
+    }
+    if landed {
+        let workspace = resolved()?;
         return match workspace.as_deref().filter(|w| w.exists()) {
             Some(ws) => run(ws, config, reader, writer, opts),
             None => {
@@ -1469,6 +1535,64 @@ pub fn run_from(
     let dir = crate::workspace_location::for_land_from(config, cwd, &mr.branch, workspace)?;
     let root = start::run_from(config, cwd, from, Some(&dir), &fetcher, reader, swl)?.root;
     run(&root, config, reader, writer, opts)
+}
+
+/// `land --from` common's merged MR without a workspace: its promotion,
+/// which needs none, until it has landed. `rows` are the first pass's.
+fn promote_from(
+    config: &Config,
+    from: &str,
+    mut rows: Vec<Row>,
+    reader: &dyn PrReader,
+    writer: &dyn ForgeWriter,
+    opts: &Options,
+) -> Result<ExitCode> {
+    let lander = Lander::new("swl land", config, reader, writer, opts);
+    let (consumer, _) = start::parse_from(from)?;
+    for pass in 0..MAX_STEPS {
+        let _span = tracing::debug_span!("land", pass).entered();
+        if pass > 0 {
+            rows = status::collect_from(config, from, reader, &Fetcher::new(true))?;
+        }
+        let Some(row) = rows
+            .iter()
+            .find(|r| r.name == consumer && r.follows.is_none())
+        else {
+            bail!("{from}: no status");
+        };
+        let step = match &row.facts {
+            _ if row.verdict.stage == Stage::Landed => Step::Done,
+            RowFacts::Consumer(ConsumerFacts {
+                promotion: Some(p), ..
+            }) => match lander.promote_consumer(from, p) {
+                Err(e) => match e.downcast_ref::<Repeated>() {
+                    Some(r) => Step::Stop(Waits::Nobody, r.0.clone()),
+                    None => return Err(e),
+                },
+                Ok(step) => step,
+            },
+            _ => stop_at(row)?,
+        };
+        match step {
+            Step::Progress => continue,
+            Step::Planned(then) => return Ok(planned("swl land", &then)),
+            Step::Stop(waits, msg) => return Ok(exit("swl land", waits, &msg, opts.dry_run)),
+            Step::Done => {
+                style::say(
+                    "swl land",
+                    Tone::Good,
+                    format!("{from} has landed: nothing left to do"),
+                );
+                return Ok(ExitCode::SUCCESS);
+            }
+        }
+    }
+    Ok(exit(
+        "swl land",
+        Waits::Nobody,
+        "too many steps in one run; rerun swl land",
+        opts.dry_run,
+    ))
 }
 
 #[cfg(test)]
