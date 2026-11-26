@@ -1334,7 +1334,10 @@ fn publish_refuses_a_branch_whose_mr_merged_without_its_commits() {
             "merge_commit_sha": merge_commit,
         });
         w.api.responses.lock().unwrap().insert(
-            format!("/api/v1/repos/binarin/{repo}/pulls/master/{branch}"),
+            format!(
+                "/api/v1/repos/binarin/{repo}/pulls/master/{}",
+                branch.replace('#', "%23")
+            ),
             body.to_string(),
         );
     };
@@ -1438,21 +1441,22 @@ fn publish_refuses_a_branch_whose_mr_merged_without_its_commits() {
     );
 
     // A merge commit not known here: whether HEAD has it is unknown, a
-    // warning, and the branch is published.
-    w.git(&w.consumer, &["switch", "-qc", "unknown-merge", "feat"]);
-    merged("swan-lake", 7, "unknown-merge", &"1".repeat(40));
+    // warning, and the branch is published. (The branch's `#` is asked
+    // for percent-encoded.)
+    w.git(&w.consumer, &["switch", "-qc", "unknown#merge", "feat"]);
+    merged("swan-lake", 7, "unknown#merge", &"1".repeat(40));
     let out = w.swl(&w.root, &publish, &[]);
     stdout(&out);
     assert!(
         String::from_utf8_lossy(&out.stderr).contains(
-            "warning: swan-lake: swan-lake#7, the MR of unknown-merge, is merged as \
+            "warning: swan-lake: swan-lake#7, the MR of unknown#merge, is merged as \
              111111111111, which is not known here: whether HEAD has it is unknown"
         ),
         "{}",
         text(&out)
     );
     assert_eq!(
-        w.git(&w.forge_repo("swan-lake"), &["rev-parse", "unknown-merge"]),
+        w.git(&w.forge_repo("swan-lake"), &["rev-parse", "unknown#merge"]),
         w.git(&w.consumer, &["rev-parse", "HEAD"])
     );
 }

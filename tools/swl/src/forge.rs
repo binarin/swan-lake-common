@@ -376,6 +376,30 @@ fn read_open_pr_from(
     Ok(None)
 }
 
+/// `s` for a URL path: anything but letters, digits, `._-` and, with
+/// `keep_slash`, `/` percent-encoded.
+fn encode_path(s: &str, keep_slash: bool) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'/' if keep_slash => "/".to_string(),
+            b if b.is_ascii_alphanumeric() || b"._-".contains(&b) => (b as char).to_string(),
+            b => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+/// `repos/{owner}/{repo}/pulls/{base}/{branch}`, percent-encoded: the
+/// branch keeps its `/`, which the route's `*` takes; the base's `/` is
+/// `%2F`, which the route's `{base}` would otherwise end at.
+fn pr_of_branch_path(repo: &str, base: &str, branch: &str) -> String {
+    format!(
+        "repos/{}/pulls/{}/{}",
+        slug(repo),
+        encode_path(base, false),
+        encode_path(branch, true)
+    )
+}
+
 /// The MR from `branch` into `base`, from `GET
 /// /repos/{owner}/{repo}/pulls/{base}/{branch}`. Forgejo (17) answers with
 /// an MR of that head and base branch, open, closed or merged, also after
@@ -388,7 +412,7 @@ fn read_pr_of_branch(
     branch: &str,
     hint: &str,
 ) -> Result<Option<PrInfo>> {
-    let path = format!("repos/{}/pulls/{base}/{branch}", slug(repo));
+    let path = pr_of_branch_path(repo, base, branch);
     match api_get(api, &path, token)? {
         (200, body) => {
             let v: Value =
@@ -998,6 +1022,20 @@ mod tests {
 
     fn api(json: &str) -> Result<PrInfo> {
         PrInfo::from_api(&serde_json::from_str(json).unwrap())
+    }
+
+    #[test]
+    fn the_mr_of_a_branch_is_asked_for_percent_encoded() {
+        assert_eq!(
+            pr_of_branch_path("swan-lake", "master", "sl-0091-x"),
+            "repos/binarin/swan-lake/pulls/master/sl-0091-x"
+        );
+        // A `#` or `%` would end or change the path; the branch's `/` is
+        // the route's `*`, the base's is not.
+        assert_eq!(
+            pr_of_branch_path("swan-lake", "release/1.0", "a#b%c/d e"),
+            "repos/binarin/swan-lake/pulls/release%2F1.0/a%23b%25c/d%20e"
+        );
     }
 
     #[test]

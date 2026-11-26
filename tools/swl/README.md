@@ -1152,6 +1152,13 @@ Limits:
   MR of the branch (`GET /repos/{owner}/{repo}/pulls/{base}/{branch}`): a
   topic branch at the base whose name an older, merged MR had, with its
   merge commit in HEAD, reads as landed too.
+- `status`, `land` and `publish` look up the MR of a branch with `GET
+  /repos/{owner}/{repo}/pulls/{base}/{branch}` (percent-encoded), which
+  Forgejo answers with any one MR of that head and base: for a branch name
+  used again, possibly an older one. The tests' fake forge answers with the
+  highest-numbered, so which one Forgejo picks is not tested. A base branch
+  with a `/` is sent as `%2F`, also not tested against Forgejo: should its
+  router not decode it, the lookup finds no MR.
 - `swl check` guards against mistakes, not against a hostile MR author: on
   `pull_request` the MR's own workflow runs it, with the swl of the MR's own
   lock (`nix run .#swl`), so the MR can change both. A hardened setup would
