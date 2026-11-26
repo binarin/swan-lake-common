@@ -457,13 +457,15 @@ pub fn consumer_verdict(f: &ConsumerFacts) -> Verdict {
     {
         return landed();
     }
-    // At the base: done, unless the workspace's open MR is not checked out.
+    // At the base, with no overridden checkout changed: done, unless the
+    // workspace's open MR is not checked out.
+    let at_base_only = f.head_in_base && !f.dirty && f.unpublished_inputs.is_empty();
     let at_base = |stage: Stage| match &f.workspace_mr {
         Some((_, b)) => verdict(stage, switch_step(c, b), Waits::Anyone),
         None => verdict(stage, "-", Waits::Nobody),
     };
     let Some(branch) = &f.topic else {
-        return if f.head_in_base && !f.dirty {
+        return if at_base_only {
             at_base(Stage::NotAChange(f.head_at.clone()))
         } else {
             verdict(
@@ -482,7 +484,7 @@ pub fn consumer_verdict(f: &ConsumerFacts) -> Verdict {
         Waits::Anyone,
     );
     match f.remote {
-        RemoteBranch::Missing if f.head_in_base && !f.dirty => {
+        RemoteBranch::Missing if at_base_only => {
             return at_base(Stage::NoChange(format!("HEAD is in {}", f.base)));
         }
         RemoteBranch::Missing => {
@@ -1301,7 +1303,12 @@ fn consumer_row(ctx: &Ctx, hops: &[Hop], ws: &Workspace, rows: &[Row], c: &Check
                 .map(|n| n.to_string_lossy().to_lowercase());
             match (&topic, ws_branch) {
                 // At the base, not on the workspace's branch: is its MR open?
-                (t, Some(b)) if head_in_base && !dirty && t.as_ref() != Some(&b) => {
+                (t, Some(b))
+                    if head_in_base
+                        && !dirty
+                        && unpublished_inputs.is_empty()
+                        && t.as_ref() != Some(&b) =>
+                {
                     match ctx.branch_mr(&c.name, base_branch, &b, &mut details) {
                         Some(info) if info.state == PrState::Open => {
                             let which = format!("{}#{}", c.name, info.number);
@@ -2203,14 +2210,38 @@ mod tests {
             held_elsewhere(fresh).0,
             "no change (HEAD is in origin/master)"
         );
-        // Dirty, or with commits outside the base: local work.
+        // Dirty, or using a changed checkout without an entry: local work.
         assert_eq!(
             cv(ConsumerFacts {
                 dirty: true,
-                ..detached
+                ..detached.clone()
             })
             .0,
             "local"
+        );
+        assert_eq!(
+            cv(ConsumerFacts {
+                unpublished_inputs: vec!["common".into()],
+                ..detached
+            }),
+            (
+                "local".into(),
+                "check out a topic branch, then swl publish swan-lake".into(),
+                Waits::Anyone
+            )
+        );
+        assert_eq!(
+            cv(ConsumerFacts {
+                head_in_base: true,
+                remote: RemoteBranch::Missing,
+                unpublished_inputs: vec!["common".into()],
+                ..consumer()
+            }),
+            (
+                "local".into(),
+                "swl publish swan-lake".into(),
+                Waits::Anyone
+            )
         );
         // Commits on a branch whose MR merged without them.
         assert_eq!(
