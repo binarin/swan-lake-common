@@ -98,11 +98,18 @@ fn publishable(c: &Checkout, base: &str) -> Result<Branch> {
     })
 }
 
-/// Refuses a branch that is not on origin whose MR merged without HEAD's
-/// commits (as they were before a rebase): publishing it would open a new MR
-/// for landed work. A forge that cannot be asked is a warning.
+/// Refuses a branch that is not on origin, with commits outside the base,
+/// whose MR merged without them (as they were before a rebase): publishing
+/// it would open a new MR for landed work. A forge that cannot be asked is a
+/// warning.
 fn refuse_merged(c: &Checkout, repo: &str, b: &Branch, reader: &dyn PrReader) -> Result<()> {
-    if b.on_origin {
+    if b.on_origin
+        || git_ok(
+            &c.dir,
+            &["merge-base", "--is-ancestor", &b.head, &b.base_ref],
+        )
+        .is_some()
+    {
         return Ok(());
     }
     let info = match reader.pr_of_branch(repo, &b.base_branch, &b.name) {

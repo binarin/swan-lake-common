@@ -489,10 +489,10 @@ From a workspace, for the consumer checkout `<consumer>`:
    lists the dependencies).
 
 Everything is checked before anything is pushed. Refused: a branch that is
-not on `origin` whose MR, looked up as `status` does (`GET
-/repos/{owner}/{repo}/pulls/{base branch}/{branch}`, with fj's login for a
-private repo), merged without HEAD's commits outside the base (they predate
-a rebase): publishing would open a new MR for landed work, so remove the
+not on `origin`, with commits outside the base, whose MR, looked up as
+`status` does (`GET /repos/{owner}/{repo}/pulls/{base branch}/{branch}`,
+with fj's login for a private repo), merged without them (they predate a
+rebase): publishing would open a new MR for landed work, so remove the
 workspace, or put new work on a new branch (a lookup that fails is a
 warning). Also refused: a detached HEAD,
 the base branch itself (publish from a topic branch), a consumer branch that

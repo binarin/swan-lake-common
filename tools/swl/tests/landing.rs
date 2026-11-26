@@ -1404,4 +1404,32 @@ fn publish_refuses_a_branch_whose_mr_merged_without_its_commits() {
         w.git(&w.forge_repo("swan-lake"), &["rev-parse", "feat"]),
         w.git(&w.consumer, &["rev-parse", "HEAD"])
     );
+
+    // A branch whose HEAD is in the base has no commits that the merge
+    // lacks: not refused, though its MR merged as a later commit of master.
+    let consumer_elsewhere = w.root.join("consumer-elsewhere");
+    w.git(
+        &w.root,
+        &[
+            "clone",
+            "-q",
+            &w.forge_repo("swan-lake").display().to_string(),
+            &consumer_elsewhere.display().to_string(),
+        ],
+    );
+    fs::write(consumer_elsewhere.join("other.txt"), "other").unwrap();
+    w.git(&consumer_elsewhere, &["add", "other.txt"]);
+    w.git(&consumer_elsewhere, &["commit", "-qm", "other"]);
+    w.git(
+        &consumer_elsewhere,
+        &["push", "-q", "origin", "HEAD:master"],
+    );
+    let later = w.git(&consumer_elsewhere, &["rev-parse", "HEAD"]);
+    merged("swan-lake", 6, "at-base", &later);
+    w.git(&w.consumer, &["switch", "-qc", "at-base", &consumer_master]);
+    let out = stdout(&w.swl(&w.root, &publish, &[]));
+    assert!(
+        out.contains("swan-lake: HEAD is already in origin/master; no consumer MR to open"),
+        "{out}"
+    );
 }
