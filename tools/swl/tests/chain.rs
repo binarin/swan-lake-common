@@ -473,7 +473,7 @@ fn three_level_chain_through_the_wrappers() {
         status,
         format!(
             "\
-swan-lake                                     no change (HEAD is in master)  waits: nobody  next: -
+swan-lake                                     not a change (detached at master)  waits: nobody  next: -
 │  HEAD {consumer_rev}  detached  clean
 │  no pending swl.toml entries
 └─ common: swan-lake-common@common            local                       waits: anyone  {publish}
@@ -483,6 +483,8 @@ swan-lake                                     no change (HEAD is in master)  wai
          input zwanenzang  HEAD {zw_rev}  detached  dirty
          swan-lake: common/zwanenzang locked {zw_rev}, ahead 0, behind 0
          swan-lake-common@common: zwanenzang locked {zw_rev}, ahead 0, behind 0
+
+no consumer checkout holds a change: none has commits of its own or a pushed branch (swan-lake: not a change (detached at master))
 
 running swl: {version} at {swl}
 wrappers' swl: {version} at {swl}"

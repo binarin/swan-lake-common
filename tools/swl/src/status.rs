@@ -75,6 +75,9 @@ pub enum Stage {
     NoMrNeeded(String),
     /// A consumer with nothing of its own yet.
     NoChange(String),
+    /// A consumer checkout that is detached or on its base branch, at a
+    /// commit of its base: it does not hold the change.
+    NotAChange(String),
     Unknown(String),
 }
 
@@ -97,6 +100,7 @@ impl fmt::Display for Stage {
             Stage::Landed => f.write_str("landed"),
             Stage::NoMrNeeded(why) => write!(f, "no MR needed ({why})"),
             Stage::NoChange(why) => write!(f, "no change ({why})"),
+            Stage::NotAChange(why) => write!(f, "not a change ({why})"),
             Stage::Unknown(why) => write!(f, "unknown ({why})"),
         }
     }
@@ -397,6 +401,9 @@ pub struct ConsumerFacts {
     pub base: String,
     /// The topic branch; `None` when detached or on the base branch.
     pub topic: Option<String>,
+    /// Where HEAD is when not on a topic branch: `detached at
+    /// origin/master`, `detached at 1c0ffee`, `on master`.
+    pub head_at: String,
     /// Uncommitted changes to tracked files.
     pub dirty: bool,
     pub head_in_base: bool,
@@ -413,6 +420,28 @@ pub struct ConsumerFacts {
     /// The swl.toml entries' rows: `repo#n` and their verdicts.
     pub entries: Vec<(String, Verdict)>,
     pub mr: MrFacts,
+    /// An open MR of the consumer's repo on the workspace's branch (its
+    /// directory name lower-cased, as `swl start` names branches), while
+    /// the checkout is at its base on another branch or none: `(number,
+    /// branch)`.
+    pub workspace_mr: Option<(u64, String)>,
+}
+
+/// The step for a consumer checkout at its base that is not on the branch
+/// of the workspace's open MR.
+pub fn switch_step(checkout: &str, branch: &str) -> String {
+    format!("git -C {checkout} switch {branch}, then swl land")
+}
+
+/// What else joins the workspace's open MR: `swl land --from`, which
+/// keeps an existing checkout as it is, so it makes a workspace of its
+/// own.
+pub fn land_from_note(which: &str, branch: &str) -> String {
+    format!(
+        "{which} is open on {branch}, the workspace's branch; or swl land --from {which}, which \
+         makes a workspace of its own, ./{branch}, and needs the branches of its shared MRs not \
+         checked out here"
+    )
 }
 
 pub fn consumer_verdict(f: &ConsumerFacts) -> Verdict {
@@ -425,13 +454,14 @@ pub fn consumer_verdict(f: &ConsumerFacts) -> Verdict {
     {
         return landed();
     }
+    // At the base: done, unless the workspace's open MR is not checked out.
+    let at_base = |stage: Stage| match &f.workspace_mr {
+        Some((_, b)) => verdict(stage, switch_step(c, b), Waits::Anyone),
+        None => verdict(stage, "-", Waits::Nobody),
+    };
     let Some(branch) = &f.topic else {
         return if f.head_in_base && !f.dirty {
-            verdict(
-                Stage::NoChange(format!("HEAD is in {}", f.base)),
-                "-",
-                Waits::Nobody,
-            )
+            at_base(Stage::NotAChange(f.head_at.clone()))
         } else {
             verdict(
                 Stage::Local,
@@ -450,11 +480,7 @@ pub fn consumer_verdict(f: &ConsumerFacts) -> Verdict {
     );
     match f.remote {
         RemoteBranch::Missing if f.head_in_base && !f.dirty => {
-            return verdict(
-                Stage::NoChange(format!("HEAD is in {}", f.base)),
-                "-",
-                Waits::Nobody,
-            );
+            return at_base(Stage::NoChange(format!("HEAD is in {}", f.base)));
         }
         RemoteBranch::Missing => return publish.with_stage(Stage::Local),
         RemoteBranch::Behind if f.local_lock_change => {
@@ -833,6 +859,29 @@ impl Ctx<'_> {
         Ok(remote)
     }
 
+    /// The MR of `branch` into `base` in `repo`, in any state. A forge that
+    /// cannot be asked is a detail line and a warning, not the row's state.
+    fn branch_mr(
+        &self,
+        repo: &str,
+        base: &str,
+        branch: &str,
+        details: &mut Vec<String>,
+    ) -> Option<PrInfo> {
+        match self.reader.pr_of_branch(repo, base, branch) {
+            Ok(info) => info,
+            Err(e) => {
+                details.push(format!("MR of {branch}: unknown ({e:#})"));
+                style::tell(
+                    "swl",
+                    Tone::Warn,
+                    format!("warning: {repo}: cannot look up the MR of {branch}: {e:#}"),
+                );
+                None
+            }
+        }
+    }
+
     /// The MR of a consumer branch at `head`: the highest-numbered pull ref
     /// at that head, read with `ls-remote` (works for private repos).
     fn consumer_mr(&self, dir: &Path, remote: &str, repo: &str, head: &str) -> MrFacts {
@@ -1165,8 +1214,15 @@ fn consumer_row(ctx: &Ctx, hops: &[Hop], ws: &Workspace, rows: &[Row], c: &Check
         let base_branch = base.split_once('/').map_or(base.as_str(), |(_, b)| b);
         let remote = ctx.fetch(&c.dir, &base)?;
         let head = git(&c.dir, &["rev-parse", "HEAD"])?;
-        let topic = git_ok(&c.dir, &["symbolic-ref", "--quiet", "--short", "HEAD"])
-            .filter(|b| b != base_branch);
+        let on = git_ok(&c.dir, &["symbolic-ref", "--quiet", "--short", "HEAD"]);
+        let topic = on.clone().filter(|b| b != base_branch);
+        let head_at = match &on {
+            Some(b) => format!("on {b}"),
+            None if rev(&c.dir, &base).as_deref() == Some(head.as_str()) => {
+                format!("detached at {base}")
+            }
+            None => format!("detached at {}", short(&head)),
+        };
         let remote_head = match (&remote, &topic) {
             (Some(r), Some(b)) => rev(&c.dir, &format!("refs/remotes/{r}/{b}")),
             _ => None,
@@ -1223,11 +1279,34 @@ fn consumer_row(ctx: &Ctx, hops: &[Hop], ws: &Workspace, rows: &[Row], c: &Check
             MrFacts::NotLookedUp(why) => details.push(format!("MR: {why}")),
             _ => {}
         }
+        let dirty = is_dirty(&c.dir)?;
+        let mut workspace_mr = None;
+        if remote.is_some() && state == RemoteBranch::Missing && ctx.fetcher.enabled() {
+            let ws_branch = ws
+                .root
+                .file_name()
+                .map(|n| n.to_string_lossy().to_lowercase());
+            match (&topic, ws_branch) {
+                // At the base, not on the workspace's branch: is its MR open?
+                (t, Some(b)) if head_in_base && !dirty && t.as_ref() != Some(&b) => {
+                    match ctx.branch_mr(&c.name, base_branch, &b, &mut details) {
+                        Some(info) if info.state == PrState::Open => {
+                            let which = format!("{}#{}", c.name, info.number);
+                            details.push(land_from_note(&which, &b));
+                            workspace_mr = Some((info.number, b));
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
         Ok(ConsumerFacts {
             name: c.name.clone(),
             base,
             topic,
-            dirty: is_dirty(&c.dir)?,
+            head_at,
+            dirty,
             head_in_base,
             remote: state,
             remote_in_base,
@@ -1236,6 +1315,7 @@ fn consumer_row(ctx: &Ctx, hops: &[Hop], ws: &Workspace, rows: &[Row], c: &Check
             unpublished_inputs,
             entries: entry_verdicts(&manifest, rows),
             mr,
+            workspace_mr,
         })
     })();
     match result {
@@ -1327,9 +1407,38 @@ pub fn run(
     reader: &dyn PrReader,
     fetcher: &Fetcher,
 ) -> Result<()> {
-    crate::status_tree::print(&collect(ws, config, reader, fetcher)?);
+    let rows = collect(ws, config, reader, fetcher)?;
+    crate::status_tree::print(&rows);
+    if let Some(why) = holds_no_change(ws, &rows) {
+        let _ = writeln!(anstream::stdout(), "\n{why}");
+    }
     print_versions(ws);
     Ok(())
+}
+
+/// When no consumer checkout of the workspace holds a change, why: each is
+/// at its base (`no change` or `not a change`), without commits of its own
+/// or a pushed branch, so `swl land` has nothing to land.
+pub fn holds_no_change(ws: &Workspace, rows: &[Row]) -> Option<String> {
+    let mut at = Vec::new();
+    for c in ws.checkouts.iter().filter(|c| c.is_consumer()) {
+        let row = rows
+            .iter()
+            .find(|r| r.name == c.name && r.follows.is_none())?;
+        match &row.verdict.stage {
+            Stage::NoChange(_) | Stage::NotAChange(_) => {
+                at.push(format!("{}: {}", c.name, row.verdict.stage))
+            }
+            _ => return None,
+        }
+    }
+    (!at.is_empty()).then(|| {
+        format!(
+            "no consumer checkout holds a change: none has commits of its own or a pushed \
+             branch ({})",
+            at.join("; ")
+        )
+    })
 }
 
 /// After the rows: the running swl's version and that of the swl the
@@ -1539,6 +1648,7 @@ pub fn collect_from(
             name: consumer.clone(),
             base: base.clone(),
             topic: Some(branches.first().map_or("(gone)", |b| b).to_string()),
+            head_at: format!("on {}", branches.first().map_or("(gone)", |b| b)),
             dirty: false,
             head_in_base,
             remote: if branches.is_empty() {
@@ -1552,6 +1662,7 @@ pub fn collect_from(
             unpublished_inputs: Vec::new(),
             entries: entry_verdicts(&manifest, &rows),
             mr: MrFacts::Read { number: n, read },
+            workspace_mr: None,
         })
     })();
     let row = row.map(|f| (consumer_verdict(&f), f));
@@ -1820,6 +1931,7 @@ mod tests {
             name: "swan-lake".into(),
             base: "origin/master".into(),
             topic: Some("sl-1-x".into()),
+            head_at: "on sl-1-x".into(),
             dirty: false,
             head_in_base: false,
             remote: RemoteBranch::Same,
@@ -1829,6 +1941,7 @@ mod tests {
             unpublished_inputs: Vec::new(),
             entries: Vec::new(),
             mr: MrFacts::None,
+            workspace_mr: None,
         }
     }
 
@@ -1850,10 +1963,11 @@ mod tests {
         assert_eq!(
             s(ConsumerFacts {
                 topic: None,
+                head_at: "on master".into(),
                 head_in_base: true,
                 ..consumer()
             }),
-            "no change (HEAD is in origin/master)"
+            "not a change (on master)"
         );
         assert_eq!(
             s(ConsumerFacts {
@@ -2011,6 +2125,58 @@ mod tests {
                 ..consumer()
             }),
             "landed"
+        );
+    }
+
+    #[test]
+    fn a_consumer_at_its_base_does_not_hold_the_change() {
+        let detached = ConsumerFacts {
+            topic: None,
+            head_at: "detached at origin/master".into(),
+            head_in_base: true,
+            remote: RemoteBranch::Missing,
+            ..consumer()
+        };
+        assert_eq!(
+            cv(detached.clone()),
+            (
+                "not a change (detached at origin/master)".into(),
+                "-".into(),
+                Waits::Nobody
+            )
+        );
+        // The workspace's MR is open: switch to its branch.
+        let held_elsewhere = |f: ConsumerFacts| {
+            cv(ConsumerFacts {
+                workspace_mr: Some((7, "sl-1-y".into())),
+                ..f
+            })
+        };
+        assert_eq!(
+            held_elsewhere(detached.clone()),
+            (
+                "not a change (detached at origin/master)".into(),
+                "git -C swan-lake switch sl-1-y, then swl land".into(),
+                Waits::Anyone
+            )
+        );
+        let fresh = ConsumerFacts {
+            head_in_base: true,
+            remote: RemoteBranch::Missing,
+            ..consumer()
+        };
+        assert_eq!(
+            held_elsewhere(fresh).0,
+            "no change (HEAD is in origin/master)"
+        );
+        // Dirty, or with commits outside the base: local work.
+        assert_eq!(
+            cv(ConsumerFacts {
+                dirty: true,
+                ..detached
+            })
+            .0,
+            "local"
         );
     }
 

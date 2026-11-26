@@ -188,12 +188,26 @@ The stages, in order:
 | `landing pushed`, `landing pushed, CI failing` | | the MR is open, and its branch has no pending `swl.toml` entries, had some (its commits since the merge base touch `swl.toml`), and changes `flake.lock` |
 | `landed` | merged, and every consumer that names it in `swl.toml` has landed | the MR is merged, or both the local and the remote branch heads are in the base |
 
-A shared checkout without an MR whose HEAD is in the rev each consumer locks,
-or already in its base, is `no MR needed`; a consumer whose HEAD is in its
-base is `no change`. A consumer MR with entries is not merged on its own:
-while its own step waits for the owner (merge) or nobody (CI), its next step
-waits for the entries' rows, then is `swl land` (see [Landing](#landing)).
-A draft or failing CI is its own step first.
+A shared checkout without an MR whose HEAD is in the rev each consumer
+locks, or already in its base, is `no MR needed`; a consumer on a topic
+branch that is not on the remote, with its HEAD in its base, is `no change`.
+A consumer that is detached or on its base branch, at a commit of its base
+(as `swl ws add` leaves it), is `not a change (detached at origin/master)`:
+it does not hold the change. For a consumer at its base that is not on the
+workspace's branch (the workspace's directory name lower-cased, the branch
+`swl start` makes), `status` asks the forge for that branch's MR in the
+consumer's repo (`GET /repos/{owner}/{repo}/pulls/{base branch}/{branch}`);
+when it is open, the next step is `git -C <consumer> switch <branch>, then
+swl land` (anyone), and a detail line names the other way, `swl land --from
+<consumer>#<MR>`: as `start --from`, it keeps an existing checkout as it is,
+so it makes a workspace of its own (`./<branch>`) and needs the branches of
+the MR's shared entries not checked out in this one. A lookup that fails is
+a detail line and a warning; the row stays as it is. When no consumer holds
+a change (each is `no change` or `not a change`), a line after the rows says
+so. A consumer MR with entries is not merged on its own: while its own step
+waits for the owner (merge) or nobody (CI), its next step waits for the
+entries' rows, then is `swl land` (see [Landing](#landing)). A draft or
+failing CI is its own step first.
 
 The next steps are `swl publish <consumer>` (anyone), `mark <repo>#N ready`
 (anyone), wait for CI (nobody), `merge <repo>#N` (owner),
@@ -201,12 +215,12 @@ The next steps are `swl publish <consumer>` (anyone), `mark <repo>#N ready`
 `request merge when checks succeed` (owner) once the landing is pushed
 (`fix CI`, anyone, while it fails).
 
-By default `status` fetches each checkout's remote (as `ws add` does, once per
-source) so that the stages are current, and finds a consumer's MR with
+By default `status` fetches each checkout's remote (as `ws add` does, once
+per source) so that the stages are current, and finds a consumer's MR with
 `git ls-remote <remote> 'refs/pull/*/head'`; the mirror check fetches commit
 history only. `--no-fetch` uses the refs already known and looks up no
-consumer MR. A forge, network or git error makes that row
-`unknown (<reason>)`; it is never an error of the command.
+consumer MR, by pull ref or by branch. A forge, network or git error makes
+that row `unknown (<reason>)`; it is never an error of the command.
 
 MR state and CI come from the forge API: anonymously, and for what that
 cannot see with fj's login (see [Forge access](#forge-access)). A repo that

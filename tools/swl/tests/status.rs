@@ -695,3 +695,148 @@ fn status_shows_the_wrappers_swl_version_and_warns_when_it_differs() {
     );
     assert!(!err.contains("warning"), "{err}");
 }
+
+/// `swl start` with swan-lake on the branch, then `swl ws add nixos-config`,
+/// which leaves it detached at the base: the workspace of a change that only
+/// nixos-config's MR holds. nixos-config is private.
+fn detached_consumer(name: &str) -> (Forge, std::path::PathBuf, String) {
+    let f = Forge::new(name);
+    f.add_consumer("nixos-config");
+    f.api.make_private("nixos-config");
+    let keys = f.login().display().to_string();
+    let work = f.root.join("work");
+    fs::create_dir_all(&work).unwrap();
+    stdout(&f.swl(&work, &["start", "SL-0030-held", "swan-lake"]));
+    let ws = work.join("SL-0030-held");
+    let ws_s = ws.display().to_string();
+    stdout(&f.swl(
+        &f.root,
+        &["ws", "add", "nixos-config", "--workspace", &ws_s],
+    ));
+    (f, ws, keys)
+}
+
+#[test]
+fn status_says_a_detached_consumer_is_not_a_change() {
+    let (f, ws, keys) = detached_consumer("status-detached");
+    let ws_s = ws.display().to_string();
+    let status = || {
+        stdout(&f.swl_env(
+            &f.root,
+            &["status", "--workspace", &ws_s],
+            &[("SWL_FJ_KEYS", &keys)],
+        ))
+    };
+
+    // No MR of the workspace's branch: nothing to do, and said so.
+    let out = status();
+    assert_row(
+        &out,
+        "nixos-config",
+        "not a change (detached at origin/master)",
+        "-",
+        "nobody",
+    );
+    assert_row(
+        &out,
+        "swan-lake",
+        "no change (HEAD is in origin/master)",
+        "-",
+        "nobody",
+    );
+    assert!(
+        out.contains(
+            "\nno consumer checkout holds a change: none has commits of its own or a pushed \
+             branch (nixos-config: not a change (detached at origin/master); swan-lake: no \
+             change (HEAD is in origin/master))\n"
+        ),
+        "{out}"
+    );
+    // The branch named like the workspace was looked up, with the login.
+    assert!(
+        f.authed_requests("nixos-config")
+            .contains(&"/api/v1/repos/binarin/nixos-config/pulls/master/sl-0030-held".to_string()),
+        "{:?}",
+        f.api.seen_auth.lock().unwrap()
+    );
+
+    // nixos-config#7 is open on the workspace's branch: switch to it.
+    let head = f.commit_on_forge("nixos-config", "sl-0030-held", "nixos-config-2");
+    f.git(
+        &f.forge_repo("nixos-config"),
+        &["update-ref", "refs/pull/7/head", &head],
+    );
+    f.api
+        .set_pr("nixos-config", 7, "open", "sl-0030-held", &head, None);
+    let out = status();
+    assert_row(
+        &out,
+        "nixos-config",
+        "not a change (detached at origin/master)",
+        "git -C nixos-config switch sl-0030-held, then swl land",
+        "anyone",
+    );
+    assert!(
+        detail(&out, "nixos-config#7 is open on sl-0030-held").contains(
+            "the workspace's branch; or swl land --from nixos-config#7, which makes a workspace \
+             of its own, ./sl-0030-held, and needs the branches of its shared MRs not checked \
+             out here"
+        ),
+        "{out}"
+    );
+    assert!(out.contains("no consumer checkout holds a change"), "{out}");
+
+    // A forge that cannot be asked: a warning and a detail line, the same
+    // rows.
+    let out = f.swl_env(
+        &f.root,
+        &["status", "--workspace", &ws_s],
+        &[
+            ("SWL_FJ_KEYS", &keys),
+            ("SWL_FORGE_API", "http://127.0.0.1:9/api/v1"),
+        ],
+    );
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        err.contains("swl: warning: nixos-config: cannot look up the MR of sl-0030-held: "),
+        "{err}"
+    );
+    let out = stdout(&out);
+    assert_row(
+        &out,
+        "nixos-config",
+        "not a change (detached at origin/master)",
+        "-",
+        "nobody",
+    );
+    assert!(
+        detail(&out, "MR of sl-0030-held: unknown (").contains("forge API unreachable"),
+        "{out}"
+    );
+
+    // The hint works: on the branch, the checkout holds the change.
+    let consumer = ws.join("nixos-config");
+    f.git(&consumer, &["switch", "-q", "sl-0030-held"]);
+    let out = status();
+    assert_row(
+        &out,
+        "nixos-config",
+        "CI pending (no status yet)",
+        "wait for CI",
+        "nobody",
+    );
+    assert!(
+        !out.contains("no consumer checkout holds a change"),
+        "{out}"
+    );
+    // A checkout detached elsewhere in the base says where.
+    f.git(&consumer, &["switch", "-q", "--detach", "origin/master~1"]);
+    let short = f.git(&consumer, &["rev-parse", "--short=12", "HEAD"]);
+    assert_row(
+        &status(),
+        "nixos-config",
+        &format!("not a change (detached at {short})"),
+        "git -C nixos-config switch sl-0030-held, then swl land",
+        "anyone",
+    );
+}
