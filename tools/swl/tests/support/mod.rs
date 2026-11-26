@@ -213,6 +213,19 @@ impl FakeApi {
         {
             return ("200 OK".into(), self.list_prs(&repo, query));
         }
+        if let Some((base, head)) = path
+            .strip_prefix(&format!("/api/v1/repos/binarin/{repo}/pulls/"))
+            .and_then(|r| r.split_once('/'))
+            .filter(|_| allowed)
+        {
+            return match self.pr_of_branch(&repo, base, head) {
+                Some(b) => ("200 OK".into(), b),
+                None => (
+                    "404 Not Found".into(),
+                    r#"{"message":"The target couldn't be found."}"#.to_string(),
+                ),
+            };
+        }
         let found = allowed
             .then(|| {
                 self.responses
@@ -270,6 +283,31 @@ impl FakeApi {
             .take(limit)
             .collect();
         serde_json::Value::Array(page).to_string()
+    }
+
+    /// `GET .../pulls/{base}/{head}`: an MR from the branch `head` (its
+    /// `head.label`, which stays when the branch is deleted) into `base`, in
+    /// any state; of several, the highest-numbered.
+    fn pr_of_branch(&self, repo: &str, base: &str, head: &str) -> Option<String> {
+        let prefix = format!("/api/v1/repos/binarin/{repo}/pulls/");
+        let prs: Vec<(String, String)> = self
+            .responses
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(p, _)| {
+                p.strip_prefix(&prefix)
+                    .is_some_and(|n| n.parse::<u64>().is_ok())
+            })
+            .map(|(p, b)| (p.clone(), b.clone()))
+            .collect();
+        prs.into_iter()
+            .map(|(p, b)| {
+                serde_json::from_str::<serde_json::Value>(&self.live(&p, repo, b)).unwrap()
+            })
+            .filter(|v| v["head"]["label"] == head && v["base"]["ref"] == base)
+            .max_by_key(|v| v["number"].as_u64())
+            .map(|v| v.to_string())
     }
 
     /// An open MR's head as the forge has it, with `follow_pull_refs`.
@@ -456,7 +494,7 @@ impl FakeApi {
             "draft": title.to_ascii_uppercase().starts_with("WIP:"),
             "title": title,
             "body": req["body"],
-            "head": { "sha": sha, "ref": head, "repo": { "full_name": format!("binarin/{repo}") } },
+            "head": { "sha": sha, "ref": head, "label": head, "repo": { "full_name": format!("binarin/{repo}") } },
             "base": { "ref": base },
             "merge_commit_sha": null,
         })
@@ -554,7 +592,9 @@ impl FakeApi {
             .collect()
     }
 
-    /// An MR: `state` is `open`, `draft`, `merged` or `closed`.
+    /// An MR: `state` is `open`, `draft`, `merged` or `closed`. Its
+    /// `head.label`, the head branch, is `head_ref`, but for a `refs/pull/…`
+    /// one (a deleted branch), which keeps the label it had.
     pub fn set_pr(
         &self,
         repo: &str,
@@ -564,20 +604,31 @@ impl FakeApi {
         head: &str,
         merge_commit: Option<&str>,
     ) {
+        let path = format!("/api/v1/repos/binarin/{repo}/pulls/{n}");
+        let label = match head_ref.starts_with("refs/") {
+            false => serde_json::Value::from(head_ref),
+            true => self
+                .responses
+                .lock()
+                .unwrap()
+                .get(&path)
+                .and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok())
+                .map_or(serde_json::Value::Null, |v| v["head"]["label"].clone()),
+        };
         let body = serde_json::json!({
             "number": n,
             "state": if matches!(state, "open" | "draft") { "open" } else { "closed" },
             "merged": state == "merged",
             "draft": state == "draft",
             "title": if state == "draft" { "WIP: t" } else { "t" },
-            "head": { "sha": head, "ref": head_ref, "repo": { "full_name": format!("binarin/{repo}") } },
+            "head": { "sha": head, "ref": head_ref, "label": label, "repo": { "full_name": format!("binarin/{repo}") } },
             "base": { "ref": "master" },
             "merge_commit_sha": merge_commit,
         });
-        self.responses.lock().unwrap().insert(
-            format!("/api/v1/repos/binarin/{repo}/pulls/{n}"),
-            body.to_string(),
-        );
+        self.responses
+            .lock()
+            .unwrap()
+            .insert(path, body.to_string());
     }
 
     /// A new commit status of `sha`, which becomes its combined status:

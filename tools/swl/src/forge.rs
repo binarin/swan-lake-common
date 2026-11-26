@@ -177,6 +177,12 @@ pub trait PrReader {
         let _ = (repo, branch);
         bail!("this reader does not list MRs")
     }
+    /// The MR from `branch` into `base`, in any state, by the forge's
+    /// lookup of head and base branch; also once the branch is deleted.
+    fn pr_of_branch(&self, repo: &str, base: &str, branch: &str) -> Result<Option<PrInfo>> {
+        let _ = (repo, base, branch);
+        bail!("this reader does not look up MRs by branch")
+    }
     /// What a 404 means for this reader.
     fn not_found(&self) -> &'static str {
         NOT_FOUND
@@ -370,6 +376,30 @@ fn read_open_pr_from(
     Ok(None)
 }
 
+/// The MR from `branch` into `base`, from `GET
+/// /repos/{owner}/{repo}/pulls/{base}/{branch}`. Forgejo (17) answers with
+/// an MR of that head and base branch, open, closed or merged, also after
+/// its branch was deleted, and 404 without one; of several, any one.
+fn read_pr_of_branch(
+    api: &str,
+    token: Option<&str>,
+    repo: &str,
+    base: &str,
+    branch: &str,
+    hint: &str,
+) -> Result<Option<PrInfo>> {
+    let path = format!("repos/{}/pulls/{base}/{branch}", slug(repo));
+    match api_get(api, &path, token)? {
+        (200, body) => {
+            let v: Value =
+                serde_json::from_str(&body).with_context(|| format!("GET {path}: not JSON"))?;
+            PrInfo::from_api(&v).map(Some)
+        }
+        (404, _) => Ok(None),
+        (code, _) => Err(http_error(&path, code, token, hint)),
+    }
+}
+
 /// The anonymous Forgejo API, through curl. The manifest repos must be
 /// public for this to work.
 pub struct AnonApi {
@@ -395,6 +425,10 @@ impl PrReader for AnonApi {
 
     fn open_pr_from(&self, repo: &str, branch: &str) -> Result<Option<PrInfo>> {
         read_open_pr_from(&self.base, None, repo, branch, ANON_HINT)
+    }
+
+    fn pr_of_branch(&self, repo: &str, base: &str, branch: &str) -> Result<Option<PrInfo>> {
+        read_pr_of_branch(&self.base, None, repo, base, branch, ANON_HINT)
     }
 }
 
@@ -608,6 +642,13 @@ impl PrReader for ForgeReader {
         self.read(
             || self.anon.open_pr_from(repo, branch),
             |t| read_open_pr_from(&self.anon.base, Some(t), repo, branch, AUTH_HINT),
+        )
+    }
+
+    fn pr_of_branch(&self, repo: &str, base: &str, branch: &str) -> Result<Option<PrInfo>> {
+        self.read(
+            || self.anon.pr_of_branch(repo, base, branch),
+            |t| read_pr_of_branch(&self.anon.base, Some(t), repo, base, branch, AUTH_HINT),
         )
     }
 
