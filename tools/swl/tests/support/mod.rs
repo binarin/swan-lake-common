@@ -861,6 +861,57 @@ impl Forge {
         fs::write(config, text).unwrap();
     }
 
+    /// A mirror of common's forge repo, as GitHub's, which has what the
+    /// forge has only after [`Forge::sync_mirror`]: a url pattern of the
+    /// config, and what swan-lake's master declares lib from.
+    pub fn mirror_common(&self) -> PathBuf {
+        let mirror = self.root.join("mirror/binarin/swan-lake-common");
+        self.git(
+            &self.root,
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                &self.forge_repo("swan-lake-common").display().to_string(),
+                &mirror.display().to_string(),
+            ],
+        );
+        let config = self.root.join("repos.toml");
+        let text = fs::read_to_string(&config).unwrap().replacen(
+            "url_patterns = [",
+            &format!(
+                "url_patterns = [\"git+file://{}/mirror/binarin/{{repo}}\", ",
+                self.root.display()
+            ),
+            1,
+        );
+        fs::write(&config, text).unwrap();
+        let seed = self.clone_elsewhere("swan-lake", "mirror-seed");
+        let flake = fs::read_to_string(seed.join("flake.nix")).unwrap();
+        fs::write(
+            seed.join("flake.nix"),
+            flake.replace(
+                &format!("{}/binarin/swan-lake-common", self.forge.display()),
+                &mirror.display().to_string(),
+            ),
+        )
+        .unwrap();
+        stdout(&self.nix(&seed, &["flake", "lock"]));
+        self.git(&seed, &["commit", "-qam", "lib from the mirror"]);
+        self.git(&seed, &["push", "-q", "origin", "HEAD:master"]);
+        fs::remove_dir_all(&seed).unwrap();
+        mirror
+    }
+
+    /// The mirror of [`Forge::mirror_common`] gets the forge's branches.
+    pub fn sync_mirror(&self, mirror: &Path) {
+        let forge = self.forge_repo("swan-lake-common").display().to_string();
+        self.git(
+            mirror,
+            &["fetch", "-q", &forge, "+refs/heads/*:refs/heads/*"],
+        );
+    }
+
     pub fn source(&self, repo: &str) -> PathBuf {
         self.sources.join(format!("{repo}.git"))
     }

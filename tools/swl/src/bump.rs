@@ -110,24 +110,25 @@ impl Drop for Scratch {
     }
 }
 
-fn rev_parse(dir: &Path, refname: &str) -> Option<String> {
+pub(crate) fn rev_parse(dir: &Path, rev: &str) -> Option<String> {
     git_ok(
         dir,
         &[
             "rev-parse",
             "--verify",
             "--quiet",
-            &format!("{refname}^{{commit}}"),
+            "--end-of-options",
+            &format!("{rev}^{{commit}}"),
         ],
     )
 }
 
-fn is_ancestor(dir: &Path, a: &str, b: &str) -> bool {
+pub(crate) fn is_ancestor(dir: &Path, a: &str, b: &str) -> bool {
     git_ok(dir, &["merge-base", "--is-ancestor", a, b]).is_some()
 }
 
 /// The branch of a base such as `origin/master`.
-fn base_branch(base: &str) -> &str {
+pub(crate) fn base_branch(base: &str) -> &str {
     base.split_once('/').map_or(base, |(_, b)| b)
 }
 
@@ -521,6 +522,16 @@ fn target_of(config: &Config, consumers: &[Consumer], cmd: &str) -> Result<Promo
         bail!("the declared branch {branch:?} is not a branch name");
     }
     Ok(PromotionTarget { branch, mirrors })
+}
+
+/// Common's promotion target, from the config's repos that lock common at
+/// their base, as `bump` promotes it; for `land` and `promote`.
+pub(crate) fn promotion_target(
+    config: &Config,
+    fetcher: &Fetcher,
+    cmd: &str,
+) -> Result<PromotionTarget> {
+    target_of(config, &consumers(config, fetcher)?, cmd)
 }
 
 /// Where common stands for the consumers.

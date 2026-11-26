@@ -19,6 +19,7 @@ mod nix;
 mod nix_args;
 mod package;
 mod pin_policy;
+mod promote;
 mod publish;
 mod refresh;
 mod shim;
@@ -185,6 +186,25 @@ enum Commands {
         #[arg(long)]
         check: bool,
         /// Seconds to wait for the mirror and the forge
+        #[arg(long, default_value_t = 300, value_name = "SECONDS")]
+        timeout: u64,
+        /// Seconds between checks while waiting
+        #[arg(long, default_value_t = 10, value_name = "SECONDS")]
+        interval: u64,
+    },
+    // In `about`, not a doc comment, so that rustdoc does not read the
+    // placeholder as an HTML tag.
+    #[command(
+        about = "Fast-forward common's promotion branch to <rev> of its master, then wait for its declared sources",
+        after_help = "Exit status: 0 when promoted and mirrored, also when it was already (and for a dry run), 3 when the next step waits for the owner, 5 for nobody (the mirror: rerun later), 2 on errors."
+    )]
+    Promote {
+        /// A commit of common's master [default: its origin/master]
+        rev: Option<String>,
+        /// Print what would be pushed; write nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// Seconds to wait for the mirror
         #[arg(long, default_value_t = 300, value_name = "SECONDS")]
         timeout: u64,
         /// Seconds between checks while waiting
@@ -513,6 +533,21 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 &ancestry::RemoteHistory::from_env(),
                 &opts,
             );
+        }
+        Commands::Promote {
+            rev,
+            dry_run,
+            timeout,
+            interval,
+        } => {
+            let config = Config::load(config_flag)?;
+            let opts = land::Options {
+                dry_run,
+                keep: false,
+                timeout: Duration::from_secs(timeout),
+                interval: Duration::from_secs(interval),
+            };
+            return promote::run(&config, rev.as_deref(), &opts);
         }
         Commands::Publish {
             consumer,

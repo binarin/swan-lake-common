@@ -692,6 +692,21 @@ impl Lander<'_> {
                 ),
             );
         }
+        let range = format!("{tip}..{merge_commit}");
+        let promoted = git(src, &["log", "--reverse", "--format=%h %s", &range])?;
+        if !promoted.is_empty() {
+            let lines: Vec<&str> = promoted.lines().collect();
+            style::say(
+                self.cmd,
+                Tone::Plain,
+                format!(
+                    "{which}: {branch} at {} gets {} commit(s):\n  {}",
+                    short(&tip),
+                    lines.len(),
+                    lines.join("\n  ")
+                ),
+            );
+        }
         let what = format!("promote {which}: {cmd}");
         if !self.act(&format!("promote {which}"), &what)? {
             return self.dry_stop(&format!(
@@ -1272,8 +1287,10 @@ pub(crate) fn waits_code(waits: Waits) -> u8 {
     }
 }
 
-fn exit(waits: Waits, msg: &str, dry_run: bool) -> ExitCode {
-    say_waits("swl land", waits, msg);
+/// The end of a `cmd` run whose next step waits for `waits`: its exit
+/// status, success for a dry run.
+pub(crate) fn exit(cmd: &str, waits: Waits, msg: &str, dry_run: bool) -> ExitCode {
+    say_waits(cmd, waits, msg);
     if dry_run {
         return ExitCode::SUCCESS;
     }
@@ -1339,12 +1356,12 @@ pub fn run(
                 "{why}; commit on a topic branch and swl publish the consumer, or join a \
                  published change with swl land --from <consumer>#<MR>"
             );
-            return Ok(exit(Waits::Anyone, &msg, opts.dry_run));
+            return Ok(exit("swl land", Waits::Anyone, &msg, opts.dry_run));
         }
         match step {
             Step::Progress => continue,
             Step::Planned(then) => return Ok(planned("swl land", &then)),
-            Step::Stop(waits, msg) => return Ok(exit(waits, &msg, opts.dry_run)),
+            Step::Stop(waits, msg) => return Ok(exit("swl land", waits, &msg, opts.dry_run)),
             Step::Done if !lander.landed_by_merge(&ws, &rows)? => {
                 style::say(
                     "swl land",
@@ -1373,6 +1390,7 @@ pub fn run(
         }
     }
     Ok(exit(
+        "swl land",
         Waits::Nobody,
         "too many steps in one run; rerun swl land",
         opts.dry_run,
@@ -1437,7 +1455,7 @@ pub fn run_from(
                 Step::Done => {}
                 Step::Progress => unreachable!("a dry run writes nothing"),
                 Step::Planned(then) => return Ok(planned("swl land", &then)),
-                Step::Stop(waits, msg) => return Ok(exit(waits, &msg, true)),
+                Step::Stop(waits, msg) => return Ok(exit("swl land", waits, &msg, true)),
             }
         }
         style::say(

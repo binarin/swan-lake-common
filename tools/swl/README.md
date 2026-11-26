@@ -13,7 +13,8 @@ master (`swl check`), and `swl finalize` turns landed entries into a lock
 bump. `swl start` sets up the workspace for a change, `swl status` shows
 where it stands, `swl refresh` rebases its MR branches onto their bases,
 and `swl land` takes it to master. `swl bump` moves
-common's inputs forward and the consumers after it. `plan` is not part of
+common's inputs forward and the consumers after it; `swl promote` promotes
+what reached common's master without a consumer. `plan` is not part of
 swl yet.
 
 ## Workspace layout
@@ -48,6 +49,7 @@ swl finalize [--wait]                     # landed entries -> one lock commit
 swl land [--dry-run] [--keep] [--from swan-lake#12]   # merge, promote, finalize, merge, clean up
 swl refresh [--dry-run]                   # the change's MR branches rebased onto their bases, pushed with a lease
 swl bump [--dry-run] [--check]            # common's inputs forward, promoted, a bump MR per consumer
+swl promote [<rev>] [--dry-run]           # common's swan-lake-current fast-forwarded to master (or <rev> of it)
 swl hook zsh|bash                         # the shell function swl, which cds after start: eval "$(swl hook zsh)"
 ```
 
@@ -177,7 +179,7 @@ terminal.
 
 `publish`, `check`, `ci env`, `finalize`, `land` and `refresh` are
 described under [Manifest and landing](#manifest-and-landing), `bump` under
-[Bump](#bump).
+[Bump](#bump), `promote` under [Promote](#promote).
 
 ## Status
 
@@ -868,7 +870,9 @@ whom. Rerun it to continue. The steps:
    `swan-lake-current`; zwanenzang, pinned at master, needs none): when
    that branch on the forge is an ancestor of the merge commit,
    `git push origin <merge commit>:refs/heads/<branch>` from the repo's
-   source, never forced; skipped when it has the commit. A refused push (a
+   source, never forced, after listing each commit it moves the branch over
+   (`<rev> <subject>`; also earlier commits of master not promoted yet);
+   skipped when it has the commit. A refused push (a
    protected branch) waits for the owner, with the exact command; a push
    that is no longer a fast-forward (the branch moved since the fetch)
    waits for nobody: rerun. Then the
@@ -1186,6 +1190,41 @@ Limits:
   /repos/{owner}/{repo}/pulls?state=open`, by its head branch) before one is
   opened; one that the pull ref does not show at the pushed head yet waits
   for nobody: rerun.
+
+## Promote
+
+`swl promote [<rev>] [--dry-run] [--timeout S] [--interval S]`
+fast-forwards common's promotion branch to `<rev>` (default common's
+`origin/master`), for what reached master without a consumer (pushed or
+merged directly), and then waits for the declared sources. Like `bump` it
+needs no workspace and runs from anywhere: it works in common's source from
+the config (see [Config](#config)). The branch (`swan-lake-current`) and the
+sources (the GitHub mirror) are those that `bump` promotes to (see
+[Bump](#bump)): declared by the config's repos that lock common at their
+base, one branch, else it refuses.
+
+It fetches common's remote, then:
+- refuses (an error) a `<rev>` that is not a commit of `origin/master`'s
+  history, or not known;
+- when the branch has the rev already, pushes nothing;
+- when the branch is an ancestor of the rev, lists each commit it moves the
+  branch over (`<rev> <subject>`), then `git push origin
+  <rev>:refs/heads/<branch>` from the source, never forced, and prints
+  `next: swl bump`, to move the consumers to it (it does not run `bump`). A
+  refused push (a protected branch) waits for the owner, with the command,
+  as in `land`; a branch that moved since the fetch waits for nobody:
+  rerun;
+- else (the branch has commits the rev lacks) it refuses, for the owner;
+- then, also when nothing was pushed, each declared source must have the
+  rev in the branch: polled every `--interval` (default 10 s) for up to
+  `--timeout` (default 300 s), as `land`; after that, rerun.
+
+There is no confirmation prompt. `--dry-run` fetches and reads as a run does
+and prints the push it would do, writing nothing. Exit status as `bump`'s: 0
+when promoted and in the declared sources, also when it was already (and for
+a dry run), 3 when it waits for the owner, 5 for nobody (the mirror), 2 on
+errors. Only common is promoted: the forks' `swan-lake-current…` branches
+are not.
 
 ## Limits
 
