@@ -773,7 +773,27 @@ impl Lander<'_> {
         else {
             return stop(Waits::Nobody, format!("{}: no status; rerun {cmd}", c.name));
         };
-        if matches!(row.verdict.stage, Stage::Landed | Stage::NoChange(_)) {
+        if let (Stage::NoChange(_) | Stage::NotAChange(_), RowFacts::Consumer(f)) =
+            (&row.verdict.stage, &row.facts)
+        {
+            // The workspace's open MR is not checked out: landing the rest
+            // would remove the workspace without it.
+            let Some((n, branch)) = &f.workspace_mr else {
+                return Ok(Step::Done);
+            };
+            let which = format!("{}#{n}", c.name);
+            return stop(
+                Waits::Anyone,
+                format!(
+                    "{}: {}; next: {}\n  {}",
+                    c.name,
+                    row.verdict.stage,
+                    status::switch_step(&c.dir.display().to_string(), branch),
+                    status::land_from_note(&which, branch)
+                ),
+            );
+        }
+        if row.verdict.stage == Stage::Landed {
             return Ok(Step::Done);
         }
         let RowFacts::Consumer(f) = &row.facts else {
@@ -1306,6 +1326,15 @@ pub fn run(
             Ok(step) => step,
         };
         tracing::debug!(?step, "the pass ends");
+        if step == Step::Done
+            && let Some(why) = status::holds_no_change(&ws, &rows)
+        {
+            let msg = format!(
+                "{why}; commit on a topic branch and swl publish the consumer, or join a \
+                 published change with swl land --from <consumer>#<MR>"
+            );
+            return Ok(exit(Waits::Anyone, &msg, opts.dry_run));
+        }
         match step {
             Step::Progress => continue,
             Step::Planned(then) => return Ok(planned("swl land", &then)),

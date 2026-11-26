@@ -454,7 +454,7 @@ fn land_keeps_checkouts_with_work_it_would_delete() {
 }
 
 #[test]
-fn land_has_nothing_to_land_in_a_fresh_workspace() {
+fn land_refuses_a_fresh_workspace_that_holds_no_change() {
     let f = Forge::new("land-fresh");
     let keys = f.login().display().to_string();
     let work = f.root.join("work");
@@ -469,14 +469,28 @@ fn land_has_nothing_to_land_in_a_fresh_workspace() {
         ],
     ));
     let ws = work.join("SL-0021-fresh").display().to_string();
-    let log = stdout(&f.swl_env(
+    let out = f.swl_env(
         &f.root,
         &["land", "--workspace", &ws],
         &[("SWL_FJ_KEYS", &keys)],
-    ));
-    assert!(log.contains("nothing to land"), "{log}");
-    assert!(work.join("SL-0021-fresh/swan-lake").exists(), "{log}");
+    );
+    failed(
+        &out,
+        4,
+        "swl land: waits for anyone: no consumer checkout holds a change: none has commits of \
+         its own or a pushed branch (swan-lake: no change (HEAD is in origin/master)); commit on a topic branch and swl publish the consumer, or join a \
+         published change with swl land --from <consumer>#<MR>",
+    );
+    assert!(!text(&out).contains("nothing to land"), "{}", text(&out));
+    assert!(work.join("SL-0021-fresh/swan-lake").exists());
     assert!(f.api.writes().is_empty());
+    // A dry run says the same, and exits 0.
+    let log = stdout(&f.swl_env(
+        &f.root,
+        &["land", "--dry-run", "--workspace", &ws],
+        &[("SWL_FJ_KEYS", &keys)],
+    ));
+    assert!(log.contains("no consumer checkout holds a change"), "{log}");
 
     // Colour: never into a pipe by default; with --color always or
     // CLICOLOR_FORCE; never with NO_COLOR or --color never.
@@ -485,10 +499,14 @@ fn land_has_nothing_to_land_in_a_fresh_workspace() {
         all.extend(args);
         let mut env = env.to_vec();
         env.push(("SWL_FJ_KEYS", &keys));
-        let out = stdout(&f.swl_env(&f.root, &all, &env));
+        let out = out_text(&f.swl_env(&f.root, &all, &env));
         let plain = out.replace("\x1b[1mswl land\x1b[0m: ", "swl land: ");
+        let plain = plain.replace("\x1b[33m", "").replace("\x1b[0m", "");
         assert!(!plain.contains('\x1b'), "{out:?}");
-        assert!(plain.contains("swl land: nothing to land"), "{out:?}");
+        assert!(
+            plain.contains("swl land: waits for anyone: no consumer checkout holds a change"),
+            "{out:?}"
+        );
         out != plain
     };
     assert!(!colored(&[], &[]));
@@ -496,6 +514,83 @@ fn land_has_nothing_to_land_in_a_fresh_workspace() {
     assert!(colored(&[], &[("CLICOLOR_FORCE", "1")]));
     assert!(!colored(&[], &[("CLICOLOR_FORCE", "1"), ("NO_COLOR", "1")]));
     assert!(!colored(&["--color", "never"], &[("CLICOLOR_FORCE", "1")]));
+}
+
+#[test]
+fn land_refuses_a_workspace_whose_consumer_is_detached_at_the_base() {
+    let f = Forge::new("land-detached");
+    f.add_consumer("nixos-config");
+    f.api.make_private("nixos-config");
+    let keys = f.login().display().to_string();
+    let work = f.root.join("work");
+    fs::create_dir_all(&work).unwrap();
+    stdout(&f.swl(
+        &work,
+        &["start", "SL-0022-held", "swan-lake-common@lib", "swan-lake"],
+    ));
+    let ws = work.join("SL-0022-held");
+    let ws_s = ws.display().to_string();
+    stdout(&f.swl(
+        &f.root,
+        &["ws", "add", "nixos-config", "--workspace", &ws_s],
+    ));
+    let land = || {
+        f.swl_env(
+            &f.root,
+            &["land", "--workspace", &ws_s, "--timeout", "0"],
+            &[("SWL_FJ_KEYS", &keys)],
+        )
+    };
+
+    // Without an MR of the workspace's branch: no change to land.
+    let out = land();
+    failed(
+        &out,
+        4,
+        "no consumer checkout holds a change: none has commits of its own or a pushed branch \
+         (nixos-config: not a change (detached at origin/master); swan-lake: no \
+         change (HEAD is in origin/master))",
+    );
+    assert!(!text(&out).contains("nothing to land"), "{}", text(&out));
+
+    // nixos-config#9 is open on the workspace's branch, which the checkout
+    // is not on: switch it there, or land --from it elsewhere.
+    let head = f.commit_on_forge("nixos-config", "sl-0022-held", "nixos-config-2");
+    f.git(
+        &f.forge_repo("nixos-config"),
+        &["update-ref", "refs/pull/9/head", &head],
+    );
+    f.api
+        .set_pr("nixos-config", 9, "open", "sl-0022-held", &head, None);
+    let consumer = ws.join("nixos-config");
+    let out = land();
+    failed(
+        &out,
+        4,
+        &format!(
+            "swl land: waits for anyone: nixos-config: not a change (detached at origin/master); \
+             next: git -C {} switch sl-0022-held, then swl land\n  nixos-config#9 is open on \
+             sl-0022-held, the workspace's branch; or swl land --from nixos-config#9, which makes \
+             a workspace of its own, ./sl-0022-held, and needs the branches of its shared MRs not \
+             checked out here",
+            consumer.display()
+        ),
+    );
+    assert!(f.api.writes().is_empty(), "{:?}", f.api.writes());
+    assert!(consumer.exists());
+
+    // As the hint says: on the branch, land goes on to the MR.
+    f.git(&consumer, &["switch", "-q", "sl-0022-held"]);
+    let out = land();
+    assert!(
+        f.api
+            .writes()
+            .iter()
+            .any(|w| w.starts_with("POST /api/v1/repos/binarin/nixos-config/pulls/9/merge")),
+        "{}\n{:?}",
+        text(&out),
+        f.api.writes()
+    );
 }
 
 #[test]

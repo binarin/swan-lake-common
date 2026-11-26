@@ -804,6 +804,17 @@ whom. Rerun it to continue. The steps:
    merged MR (its MR merged, or its pushed branch, now in the base, the
    head of a merged MR) has nothing to land and stays.
 
+A consumer at its base (`no change`, `not a change`) is skipped, unless the
+workspace's branch has an open MR in its repo (see [Status](#status)): then
+`land` stops there, for anyone, with `git -C <checkout> switch <branch>,
+then swl land` and the `swl land --from` alternative, before anything is
+merged or removed. When every consumer is at its base, the workspace does
+not hold a change: `land` refuses, for anyone, saying where each consumer
+is, instead of saying it has nothing to land. The hint is not `swl land
+--from` alone because `start --from` keeps an existing checkout as it is:
+into this workspace it would leave the consumer detached, and elsewhere it
+makes a second workspace.
+
 `--dry-run` reads as a run does and prints the first writes it would do and
 what follows, writing nothing (no forge request other than reads, no push,
 commit or removal), and needs no fj login for that (only for private
