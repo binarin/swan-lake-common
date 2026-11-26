@@ -16,6 +16,7 @@ mod logging;
 mod manifest;
 mod nix;
 mod nix_args;
+mod package;
 mod pin_policy;
 mod publish;
 mod refresh;
@@ -263,7 +264,13 @@ enum WsCommands {
     },
 }
 
-fn current_exe() -> Result<PathBuf> {
+/// The swl that the workspace's wrappers and CI's nix wrapper exec, and
+/// that `status` reports as running: the package's wrapper when it set
+/// `SWL_SELF`, else this executable.
+fn swl_exe() -> Result<PathBuf> {
+    if let Some(path) = &package::get().self_path {
+        return Ok(path.clone());
+    }
     std::env::current_exe()
         .and_then(|p| p.canonicalize())
         .context("locating the swl executable")
@@ -290,7 +297,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 },
         } => {
             let config = Config::load(config_flag)?;
-            let swl = if no_env { None } else { Some(current_exe()?) };
+            let swl = if no_env { None } else { Some(swl_exe()?) };
             ws_add::run(
                 &config,
                 &workspace_dir(workspace)?,
@@ -311,7 +318,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             let config = Config::load(config_flag)?;
             let cwd = std::env::current_dir().context("current directory")?;
             let fetcher = ws_add::Fetcher::new(!no_fetch);
-            let swl = current_exe()?;
+            let swl = swl_exe()?;
             match from {
                 Some(from) => start::run_from(
                     &config,
@@ -338,7 +345,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
         Commands::Env { workspace, force } => {
             let config = Config::load(config_flag)?;
             let ws = Workspace::scan(&workspace_dir(workspace)?)?;
-            env::run(&ws, &config, &current_exe()?, force)?;
+            env::run(&ws, &config, &swl_exe()?, force)?;
         }
         Commands::Status {
             workspace,
@@ -388,7 +395,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     workspace.as_deref(),
                     &reader,
                     writer,
-                    &current_exe()?,
+                    &swl_exe()?,
                     &opts,
                 ),
                 None => land::run(&workspace_dir(workspace)?, &config, &reader, writer, &opts),
@@ -483,7 +490,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
         Commands::Ci {
             command: CiCommands::Env { dir },
         } => {
-            return ci::run_env(&workspace_dir(dir)?, &AnonApi::from_env(), &current_exe()?);
+            return ci::run_env(&workspace_dir(dir)?, &AnonApi::from_env(), &swl_exe()?);
         }
         Commands::Ci {
             command:
@@ -511,6 +518,8 @@ fn run(cli: Cli) -> Result<ExitCode> {
 }
 
 fn main() -> ExitCode {
+    // SAFETY: first in main, before any thread is started.
+    unsafe { package::take() };
     let cli = Cli::parse();
     // The shims stay silent on stderr unless SWL_LOG asks for diagnostics.
     let shim = matches!(

@@ -21,27 +21,32 @@ in
       # lastModifiedDate is YYYYMMDDHHMMSS, in UTC.
       commitDate =
         d: "${builtins.substring 0 4 d}-${builtins.substring 4 2 d}-${builtins.substring 6 2 d}";
+      version = (builtins.fromTOML (builtins.readFile (src + "/Cargo.toml"))).package.version;
+      # What packages.swl sets as SWL_COMMIT and SWL_COMMIT_DATE; empty when
+      # common has no rev or date.
+      commit = commonSelf.shortRev or commonSelf.dirtyShortRev or "";
+      date = lib.optionalString (commonSelf ? lastModifiedDate) (commitDate commonSelf.lastModifiedDate);
+      meta = {
+        description = "Swan Lake cross-repo workspaces: checkouts, input overrides, nix/nh/deploy shims, manifests and CI checks";
+        mainProgram = "swl";
+        platforms = lib.platforms.linux;
+      };
     in
     {
-      packages.swl = pkgs.rustPlatform.buildRustPackage {
-        pname = "swl";
-        version = (builtins.fromTOML (builtins.readFile (src + "/Cargo.toml"))).package.version;
+      # The compiled swl, from its fileset only: it is rebuilt when swl's own
+      # sources change, not on every commit of common.
+      packages.swl-unwrapped = pkgs.rustPlatform.buildRustPackage {
+        pname = "swl-unwrapped";
+        inherit version;
         src = lib.fileset.toSource {
           root = src;
           fileset = lib.fileset.unions (map (p: src + "/${p}") srcPaths);
         };
         cargoLock.lockFile = src + "/Cargo.lock";
-        # `swl --version` names the commit of common it is built from, so swl
-        # is rebuilt on every commit of common. A dirty tree gives the
-        # `-dirty` rev; a tree without a rev, `(unknown)`.
-        env.SWL_COMMIT = commonSelf.shortRev or commonSelf.dirtyShortRev or "";
-        env.SWL_COMMIT_DATE = lib.optionalString (
-          commonSelf ? lastModifiedDate
-        ) (commitDate commonSelf.lastModifiedDate);
         # swl runs git for worktrees and status, and curl for the forge API.
         # It is not wrapped with a PATH: the shim must find the caller's
-        # nix, nh and deploy, and the generated wrappers exec this binary by
-        # its store path. From the caller's PATH come fj, for `swl publish`;
+        # nix, nh and deploy, and the generated wrappers exec swl by its
+        # store path. From the caller's PATH come fj, for `swl publish`;
         # nix, for `swl env` to make the workspace's GC root of this store
         # path; and direnv, optional, for `swl start` to allow the consumers'
         # .envrc. `status`, `start`, `land` and `bump` use fj's login from its
@@ -59,13 +64,46 @@ in
         preCheck = ''
           export SWL_TEST_NIX_STORE=$TMPDIR/swl-test-store
         '';
-        meta = {
-          description = "Swan Lake cross-repo workspaces: checkouts, input overrides, nix/nh/deploy shims, manifests and CI checks";
-          mainProgram = "swl";
-          platforms = lib.platforms.linux;
+        meta = meta // {
+          description = "${meta.description} (without the commit of common)";
         };
       };
+      # swl as it is used: a wrapper around swl-unwrapped, rebuilt cheaply on
+      # every commit of common. `swl --version` names that commit: a dirty
+      # tree gives the `-dirty` rev; a tree without a rev, `(unknown)`.
+      # SWL_SELF is the wrapper itself, which `swl env` pins, so that the
+      # workspace's wrappers and `swl status` see the rev too.
+      packages.swl =
+        pkgs.runCommand "swl-${version}"
+          {
+            nativeBuildInputs = [ pkgs.makeWrapper ];
+            passthru.unwrapped = self'.packages.swl-unwrapped;
+            inherit meta version;
+          }
+          ''
+            makeWrapper ${lib.getExe self'.packages.swl-unwrapped} $out/bin/swl \
+              --set SWL_COMMIT ${lib.escapeShellArg commit} \
+              --set SWL_COMMIT_DATE ${lib.escapeShellArg date} \
+              --set SWL_SELF $out/bin/swl
+          '';
       apps.swl = mkApp self'.packages.swl;
+      # That the wrapper's `swl --version` names common's rev and date.
+      checks.swl-wrapper =
+        let
+          expected =
+            if commit == "" then
+              "swl ${version} (unknown)"
+            else
+              "swl ${version} (${commit}${lib.optionalString (date != "") " ${date}"})";
+        in
+        pkgs.runCommand "swl-wrapper-test" { } ''
+          actual=$(${lib.getExe self'.packages.swl} --version)
+          if [ "$actual" != ${lib.escapeShellArg expected} ]; then
+            echo "swl --version printed '$actual', not "${lib.escapeShellArg expected} >&2
+            exit 1
+          fi
+          touch $out
+        '';
       # The CI check that an MR changing swl bumps its version, on scratch git
       # repos.
       checks.swl-version-bump =
@@ -88,7 +126,7 @@ in
             PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -v test_check_swl_version_bump
             touch $out
           '';
-      checks.swl = self'.packages.swl.overrideAttrs (old: {
+      checks.swl = self'.packages.swl-unwrapped.overrideAttrs (old: {
         nativeCheckInputs = old.nativeCheckInputs ++ [
           pkgs.rustfmt
           pkgs.clippy

@@ -1558,7 +1558,7 @@ pub fn holds_no_change(ws: &Workspace, rows: &[Row]) -> Option<String> {
 /// After the rows: the running swl's version and that of the swl the
 /// wrappers exec, with a warning when they differ.
 fn print_versions(ws: &Workspace) {
-    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("swl"));
+    let exe = crate::swl_exe().unwrap_or_else(|_| PathBuf::from("swl"));
     let (lines, warning) = crate::version::status_lines(
         &crate::version::line(),
         &exe,

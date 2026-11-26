@@ -1,20 +1,36 @@
 //! `swl --version`: one line, the Cargo version and the commit of common
-//! that the package sets.
+//! that the package's wrapper sets at runtime.
 
 use std::process::Command;
 
-#[test]
-fn version_is_one_line_with_the_cargo_version_and_the_commit() {
-    let out = Command::new(env!("CARGO_BIN_EXE_swl"))
+fn version(env: &[(&str, &str)]) -> String {
+    let mut c = Command::new(env!("CARGO_BIN_EXE_swl"));
+    for var in ["SWL_COMMIT", "SWL_COMMIT_DATE", "SWL_SELF"] {
+        c.env_remove(var);
+    }
+    let out = c
+        .envs(env.iter().copied())
         .arg("--version")
         .output()
         .unwrap();
     assert!(out.status.success(), "{out:?}");
-    let text = String::from_utf8(out.stdout).unwrap();
-    let want = match (option_env!("SWL_COMMIT"), option_env!("SWL_COMMIT_DATE")) {
-        (Some(c), Some(d)) if !c.is_empty() && !d.is_empty() => format!("({c} {d})"),
-        (Some(c), _) if !c.is_empty() => format!("({c})"),
-        _ => "(unknown)".to_string(),
-    };
-    assert_eq!(text, format!("swl {} {want}\n", env!("CARGO_PKG_VERSION")));
+    String::from_utf8(out.stdout).unwrap()
+}
+
+#[test]
+fn version_is_one_line_with_the_cargo_version_and_the_commit_from_the_environment() {
+    let v = env!("CARGO_PKG_VERSION");
+    assert_eq!(
+        version(&[("SWL_COMMIT", "abc1234"), ("SWL_COMMIT_DATE", "2026-11-26")]),
+        format!("swl {v} (abc1234 2026-11-26)\n")
+    );
+    assert_eq!(
+        version(&[("SWL_COMMIT", "abc1234-dirty"), ("SWL_COMMIT_DATE", "")]),
+        format!("swl {v} (abc1234-dirty)\n")
+    );
+    assert_eq!(
+        version(&[("SWL_COMMIT", ""), ("SWL_COMMIT_DATE", "2026-11-26")]),
+        format!("swl {v} (unknown)\n")
+    );
+    assert_eq!(version(&[]), format!("swl {v} (unknown)\n"));
 }

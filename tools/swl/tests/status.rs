@@ -696,6 +696,101 @@ fn status_shows_the_wrappers_swl_version_and_warns_when_it_differs() {
     assert!(!err.contains("warning"), "{err}");
 }
 
+#[test]
+fn the_wrappers_exec_the_package_wrapper_that_swl_self_names() {
+    let f = Forge::new("status-self");
+    let work = f.root.join("work");
+    fs::create_dir_all(&work).unwrap();
+    // A stand-in for the package's wrapper, at a path that needs quoting.
+    let pkg_dir = f.root.join("package swl's/bin");
+    fs::create_dir_all(&pkg_dir).unwrap();
+    let pkg = pkg_dir.join("swl");
+    let q = |p: &Path| format!("'{}'", p.display().to_string().replace('\'', r"'\''"));
+    fs::write(
+        &pkg,
+        format!(
+            "#!/bin/sh\nexport SWL_COMMIT=abc1234 SWL_COMMIT_DATE=2026-11-26 SWL_SELF={}\nexec {} \"$@\"\n",
+            q(&pkg),
+            q(Path::new(env!("CARGO_BIN_EXE_swl")))
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&pkg, fs::Permissions::from_mode(0o755)).unwrap();
+    // A deploy that reports what it inherits.
+    let toolbin = f.root.join("deploybin");
+    fs::create_dir_all(&toolbin).unwrap();
+    fs::write(
+        toolbin.join("deploy"),
+        "#!/bin/sh\necho \"${SWL_COMMIT-unset} ${SWL_COMMIT_DATE-unset} ${SWL_SELF-unset}\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(toolbin.join("deploy"), fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}:{}",
+        toolbin.display(),
+        f.root.join("fakebin").display(),
+        f.base_path
+    );
+    let run = |exe: &Path, dir: &Path, args: &[&str]| {
+        let mut c = std::process::Command::new(exe);
+        f.env(&mut c, &path);
+        c.current_dir(dir).args(args);
+        // A child that another test forks while the script is written holds
+        // it open for writing until it execs: retry that.
+        loop {
+            match c.output() {
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                    std::thread::sleep(std::time::Duration::from_millis(20))
+                }
+                out => break out.unwrap(),
+            }
+        }
+    };
+
+    stdout(&run(&pkg, &work, &["start", "SL-0014-w", "swan-lake"]));
+    let ws = work.join("SL-0014-w");
+    let ws_s = ws.display().to_string();
+    let nix = ws.join(".swl/bin/nix");
+    let wrapper = fs::read_to_string(&nix).unwrap();
+    assert!(
+        support::line(&wrapper, "exec ").starts_with(&format!("exec {} ", q(&pkg))),
+        "{wrapper}"
+    );
+
+    let version = format!("swl {} (abc1234 2026-11-26)", env!("CARGO_PKG_VERSION"));
+    let out = run(
+        &pkg,
+        &f.root,
+        &["status", "--workspace", &ws_s, "--no-fetch"],
+    );
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    let out = stdout(&out);
+    assert_eq!(
+        support::line(&out, "running swl: "),
+        format!("running swl: {version} at {}", pkg.display()),
+        "{out}"
+    );
+    assert_eq!(
+        support::line(&out, "wrappers' swl: "),
+        format!("wrappers' swl: {version} at {}", pkg.display()),
+        "{out}"
+    );
+    assert!(!err.contains("warning"), "{err}");
+
+    // What swl runs does not inherit the variables.
+    let out = run(&ws.join(".swl/bin/deploy"), &work, &[]);
+    assert_eq!(stdout(&out), "unset unset unset");
+
+    // Without the variables, swl env pins the binary itself.
+    stdout(&f.swl(&f.root, &["env", "--workspace", &ws_s]));
+    let wrapper = fs::read_to_string(&nix).unwrap();
+    let exe = Path::new(env!("CARGO_BIN_EXE_swl")).canonicalize().unwrap();
+    assert!(
+        support::line(&wrapper, "exec ").starts_with(&format!("exec {} ", exe.display())),
+        "{wrapper}"
+    );
+}
+
 /// `swl start` with swan-lake on the branch, then `swl ws add nixos-config`,
 /// which leaves it detached at the base: the workspace of a change that only
 /// nixos-config's MR holds. nixos-config is private.

@@ -246,8 +246,9 @@ landing as `pushed`. A login the forge rejects makes the row
 then shows a row per `swl.toml` entry at its head and the consumer row. A
 cross-repo list of all open changes is not part of swl.
 
-For a workspace, after the rows, `status` names the running swl and the one
-the wrappers exec (see [Version](#version)):
+For a workspace, after the rows, `status` names the running swl (at the
+package's wrapper that `SWL_SELF` names, when set) and the one the wrappers
+exec (see [Version](#version)):
 
 ```
 running swl: swl 0.2.0 (abc1234 2026-11-26) at /nix/store/…-swl-0.2.0/bin/swl
@@ -282,18 +283,28 @@ shim`) log nothing unless `SWL_LOG` is set; `SWL_SHIM_LOG` is separate.
 `swl --version` prints one line: `swl 0.2.0 (abc1234 2026-11-26)`. First
 the version in `tools/swl/Cargo.toml`, the only place it is written (the
 package reads it from there). Then the short rev and the commit date (UTC)
-of the swan-lake-common commit the package is built from: the flake's
-`shortRev` and `lastModifiedDate`, which `modules/swl.nix` passes to the
-build as `SWL_COMMIT` and `SWL_COMMIT_DATE`. So swl is rebuilt on every
-commit of common. A build from a dirty tree shows the rev with `-dirty`
-(`abc1234-dirty`); a build without a rev, such as a plain `cargo build`,
-shows `swl 0.2.0 (unknown)`.
+of the swan-lake-common commit the package is from: the flake's `shortRev`
+and `lastModifiedDate`, which swl reads at runtime from `SWL_COMMIT` and
+`SWL_COMMIT_DATE`.
+
+`modules/swl.nix` builds the binary as `packages.swl-unwrapped`, from swl's
+sources only (see below), so that it is rebuilt only when they change.
+`packages.swl`, which the dev shell, `homeModules.swl` and `nix run .#swl`
+use, is a wrapper around it, remade on every commit of common, that sets
+`SWL_COMMIT`, `SWL_COMMIT_DATE` and `SWL_SELF`, the wrapper's own path. A
+dirty tree shows the rev with `-dirty` (`abc1234-dirty`); without a rev, or
+without the wrapper (`swl-unwrapped`, a plain `cargo build`), it is
+`swl 0.2.0 (unknown)`. `swl env` pins `SWL_SELF` when it is set, else the
+running executable, so that the workspace's wrappers, its GC root and the
+version in `swl status` go through the package's wrapper. swl removes the
+three variables from its environment when it starts, so that what it runs
+does not inherit them.
 
 Every MR that changes swl bumps its version in `Cargo.toml` (and the swl
 entry of `Cargo.lock`). Before 1.0: the minor version for a breaking change
 or a new feature, the patch version for a fix. swl's sources are the paths
 below `tools/swl` that `tools/swl/src-fileset.json` lists, which is also the
-source fileset of the package, and that list itself. The `swl version`
+source fileset of `swl-unwrapped`, and that list itself. The `swl version`
 workflow (`.forgejo/workflows/swl-version.yaml`) enforces the rule on MRs
 with `scripts/check-swl-version-bump.py`: when the MR changes a source
 since its merge base with the target branch, the version at its head must
@@ -376,8 +387,10 @@ export SWAN_LAKE_OVERRIDES='common←swan-lake-common@common common/zwanenzang�
 ```
 
 Each wrapper is one `exec` of this `swl` by its absolute path, so the
-consumers' dev shells need no change (with `--config FILE` before `shim` when
-the config was chosen explicitly):
+consumers' dev shells need no change (with `--config FILE` before `shim`
+when the config was chosen explicitly). That `swl` is the package's wrapper
+that `SWL_SELF` names, else the running executable; see
+[Version](#version):
 
 ```sh
 #!/bin/sh

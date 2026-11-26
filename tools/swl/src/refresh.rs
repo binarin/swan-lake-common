@@ -226,7 +226,7 @@ fn lock_moved(dir: &Path, head: &str, base_tip: &str) -> Result<bool> {
 fn rerun_env(cmd: &str, root: &Path, config: &Config) {
     let result = (|| -> Result<()> {
         let ws = Workspace::scan(root)?;
-        env::run(&ws, config, &crate::current_exe()?, false)
+        env::run(&ws, config, &crate::swl_exe()?, false)
     })();
     if let Err(e) = result {
         style::say(

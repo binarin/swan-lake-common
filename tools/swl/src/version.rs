@@ -11,18 +11,20 @@ use std::{
 use crate::{env::wrapper_target, shim::Tool, workspace::WRAPPER_DIR};
 
 /// What `swl --version` prints after `swl `: the Cargo version, then the
-/// short rev and commit date of common that the package sets at build time
-/// (`SWL_COMMIT`, `SWL_COMMIT_DATE`): `0.2.0 (abc1234 2026-11-26)`.
+/// short rev and commit date of common that the package's wrapper sets at
+/// runtime (`SWL_COMMIT`, `SWL_COMMIT_DATE`): `0.2.0 (abc1234 2026-11-26)`.
 pub static VERSION: LazyLock<String> = LazyLock::new(|| {
+    let package = crate::package::get();
     describe(
         env!("CARGO_PKG_VERSION"),
-        option_env!("SWL_COMMIT"),
-        option_env!("SWL_COMMIT_DATE"),
+        package.commit.as_deref(),
+        package.commit_date.as_deref(),
     )
 });
 
-/// `<version> (<commit> <date>)`, without what is unset or empty; a build
-/// without a commit (plain cargo) is `<version> (unknown)`.
+/// `<version> (<commit> <date>)`, without what is unset or empty; without a
+/// commit (a cargo build, run without the package's wrapper) it is
+/// `<version> (unknown)`.
 fn describe(version: &str, commit: Option<&str>, date: Option<&str>) -> String {
     let known: Vec<&str> = [commit, date]
         .into_iter()
