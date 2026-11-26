@@ -518,11 +518,10 @@ fn bump_stops_for_what_is_not_its_own() {
         3,
         &format!(
             "waits for the owner: common: master at {} has 1 commit(s) not promoted to current \
-             that are not swl bump's ({} swan-lake-common: c2); promote them first (git -C {} \
-             push origin {c2}:refs/heads/current), then rerun swl bump",
+             that are not swl bump's ({} swan-lake-common: c2); promote them first (swl promote \
+             {c2}), then rerun swl bump",
             short(&c2),
             &c2[..7],
-            t.common_source()
         ),
     );
     assert_eq!(t.forge_refs(), refs_c2);

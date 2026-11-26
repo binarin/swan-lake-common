@@ -617,12 +617,11 @@ impl Bumper<'_> {
                 Waits::Owner,
                 format!(
                     "common: {master} at {} has {} commit(s) not promoted to {promoted} that are \
-                     not swl bump's ({}); promote them first (git -C {} push {remote} \
-                     {head}:refs/heads/{promoted}), then rerun {CMD}",
+                     not swl bump's ({}); promote them first (swl promote {head}), then rerun \
+                     {CMD}",
                     short(&head),
                     foreign.len(),
                     foreign.join("; "),
-                    src.display()
                 ),
             )?));
         }

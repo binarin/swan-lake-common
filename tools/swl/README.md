@@ -1173,8 +1173,10 @@ mirror, and goes on from there.
   bump `. So a landed MR whose single commit has that form counts too
   (it is on master, so the owner pushed or merged it).
 - Behind master by any other commit (an unpromoted landing): it stops for
-  the owner and writes nothing; it does not promote that landing as a side
-  effect. Promote it (as `swl land` does for its MR) or wait, then rerun.
+  the owner and writes nothing, listing those commits; it does not promote
+  that landing as a side effect. Promote it with `swl promote <master rev>`
+  (as the message says; see [Promote](#promote)), or wait for its `swl
+  land`, then rerun.
   The promotion branch with commits that master lacks stops for the owner
   too.
 - Common bumped and promoted, or nothing to bump: on to the consumers. A
