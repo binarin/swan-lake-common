@@ -24,6 +24,7 @@ pub const DEFAULT_BASE: &str = "origin/master";
 #[serde(deny_unknown_fields)]
 pub struct Config {
     url_patterns: Option<Vec<String>>,
+    workspaces: Option<PathBuf>,
     #[serde(default)]
     repos: BTreeMap<String, RepoConfig>,
     /// The file read and where its path came from; `None` for no file.
@@ -109,6 +110,20 @@ impl Config {
         Ok(toml::from_str(text)?)
     }
 
+    /// Workspace names live below this directory, independently of the cwd.
+    /// Relative config values are relative to the config file, not the caller.
+    pub fn workspaces(&self) -> Result<PathBuf> {
+        let path =
+            expand_home(self.workspaces.as_deref().unwrap_or_else(|| {
+                Path::new("~/personal-workspace/swan-lake-umbrella/workspaces")
+            }))?;
+        let base = self.source.as_ref().and_then(|(p, _)| p.parent());
+        Ok(match base {
+            Some(base) => base.join(path),
+            None => std::path::absolute(path)?,
+        })
+    }
+
     /// The configured repos, by name.
     pub fn repos(&self) -> impl Iterator<Item = (&str, &RepoConfig)> {
         self.repos.iter().map(|(name, rc)| (name.as_str(), rc))
@@ -150,6 +165,17 @@ impl Config {
             .chain(extra.iter().cloned())
             .any(|candidate| normalize_url(&candidate) == url)
     }
+}
+
+/// Expand only `~` and `~/…`; named users and shell substitutions are not paths.
+pub fn expand_home(path: &Path) -> Result<PathBuf> {
+    if let Ok(rest) = path.strip_prefix("~") {
+        let home = env::var_os("HOME")
+            .filter(|h| !h.is_empty())
+            .ok_or_else(|| anyhow!("HOME is not set; cannot expand {}", path.display()))?;
+        return Ok(PathBuf::from(home).join(rest));
+    }
+    Ok(path.to_path_buf())
 }
 
 /// Lower-cases, drops the query and fragment, a trailing `/` or `.git` and the

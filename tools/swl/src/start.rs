@@ -397,7 +397,7 @@ pub fn run_new(
     }
     let branch = branch.map_or_else(|| name.to_lowercase(), str::to_string);
     let items = new_items(config, checkouts, &branch)?;
-    let root = workspace.map_or_else(|| cwd.join(name), Path::to_path_buf);
+    let root = crate::workspace_location::for_start(config, cwd, name, workspace)?;
     execute(config, &root, &items, fetcher, swl)
 }
 
@@ -422,7 +422,7 @@ pub fn run_from(
     for item in &items[1..] {
         config.repo(&ws_add::checkout_repo(&item.name)?)?;
     }
-    let root = workspace.map_or_else(|| cwd.join(&mr.branch), Path::to_path_buf);
+    let root = crate::workspace_location::for_start(config, cwd, &mr.branch, workspace)?;
     execute(config, &root, &items, fetcher, swl)
 }
 

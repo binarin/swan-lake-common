@@ -451,14 +451,13 @@ pub fn switch_step(checkout: &str, branch: &str) -> String {
     format!("git -C {checkout} switch {branch}, then swl land")
 }
 
-/// What else joins the workspace's open MR: `swl land --from`, which
-/// keeps an existing checkout as it is, so it makes a workspace of its
-/// own.
+/// Joining elsewhere needs an explicit new path: `land --from` otherwise
+/// reuses the matching workspace and keeps its existing checkouts as they are.
 pub fn land_from_note(which: &str, branch: &str) -> String {
     format!(
-        "{which} is open on {branch}, the workspace's branch; or swl land --from {which}, which \
-         makes a workspace of its own, ./{branch}, and needs the branches of its shared MRs not \
-         checked out here"
+        "{which} is open on {branch}, the workspace's branch; or swl land --from {which} \
+         --workspace <new-path>, which makes a workspace of its own and needs the branches of \
+         its shared MRs not checked out here"
     )
 }
 

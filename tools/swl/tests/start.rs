@@ -145,6 +145,8 @@ fn start_from_joins_an_open_and_a_merged_mr() {
     f.api.make_private("swan-lake");
     let work = f.root.join("work");
     fs::create_dir_all(&work).unwrap();
+    let unrelated = f.root.join("unrelated");
+    fs::create_dir_all(&unrelated).unwrap();
 
     // An open common MR from its branch `feature`.
     let feature = f.commit_on_forge("swan-lake-common", "feature", "c2");
@@ -182,7 +184,8 @@ fn start_from_joins_an_open_and_a_merged_mr() {
 
     let keys = f.login();
     let login = [("SWL_FJ_KEYS", keys.to_str().unwrap())];
-    let out = stdout(&f.swl_env(&work, &from, &login));
+    let out = stdout(&f.swl_env(&unrelated, &from, &login));
+    assert!(!unrelated.join("sl-0003-join").exists());
     assert!(out.contains("swan-lake#5: branch sl-0003-join"), "{out}");
     let consumer = ws.join("swan-lake");
     let common = ws.join("swan-lake-common@lib");
@@ -229,6 +232,15 @@ fn start_from_joins_an_open_and_a_merged_mr() {
         fs::read_to_string(&cd_file).unwrap(),
         consumer.display().to_string()
     );
+
+    // A new spelling of the branch's workspace is not silently duplicated.
+    let renamed = work.join("SL-3-JOIN");
+    fs::rename(&ws, &renamed).unwrap();
+    let collision = f.swl_env(&unrelated, &from, &login);
+    failed(&collision, 2, "existing workspace");
+    assert!(support::text(&collision).contains("SL-3-JOIN"));
+    assert!(!ws.exists());
+    fs::rename(&renamed, &ws).unwrap();
 
     // An MR whose head is no branch's head any more: refused.
     let master = f.git(&f.forge_repo("swan-lake"), &["rev-parse", "master"]);

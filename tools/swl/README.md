@@ -51,9 +51,39 @@ swl bump [--dry-run] [--check]            # common's inputs forward, promoted, a
 swl hook zsh|bash                         # the shell function swl, which cds after start: eval "$(swl hook zsh)"
 ```
 
-`ws add`, `env` and `status` use the current directory as the workspace unless
-`--workspace DIR` is given; `start` creates one below it. The global
-`--config FILE` selects the repos config.
+`start` creates workspaces below the repos config's `workspaces` directory,
+regardless of the current directory (also with `--from`). Its default is
+`~/personal-workspace/swan-lake-umbrella/workspaces`. `start --workspace DIR`
+still creates or resumes an explicit directory instead.
+
+`status`, `land`, `refresh`, `publish`, `env` and `ws add` select the enclosing
+workspace when run anywhere inside it, including inside a checkout. They also
+accept `--workspace NAME|TICKET|PATH` from anywhere. `status`, `land`, `refresh`
+and `env` accept the same selector as an optional positional argument; `publish`
+and `ws add` keep their existing consumer/checkout positional argument:
+
+```sh
+swl status sl-88
+swl env --workspace SL-0088-swl-version
+swl refresh sl-88 --dry-run
+swl publish swan-lake --workspace sl-88
+swl ws add swan-lake-common@common --workspace sl-88
+```
+
+Names are looked up directly below `workspaces`, case-insensitively and ignoring
+leading zeros in ticket numbers: `sl-88` finds `SL-0088-swl-version`, as does
+`sl-88-SWL-VERSION`. A ticket-only selector matches any suffix, not a numeric
+prefix (`sl-8` does not match `sl-88`). Multiple matches are an error listing
+all candidates, even when one has the exact requested spelling. A full name
+can disambiguate different suffixes; an explicit path can disambiguate different
+spellings of the same name.
+
+Absolute paths, `~/…`, `./…` and paths containing `/` bypass name lookup.
+Configured names take precedence over bare relative directories; if no name
+matches, an existing bare relative directory still works for compatibility.
+Outside a recognizable workspace, commands without a selector retain the old
+current-directory behavior (so `ws add` can build up an empty directory).
+The global `--config FILE` selects the repos config.
 
 The global `--color auto|always|never` colours the output: the `swl <cmd>:`
 prefix bold, errors red, warnings yellow, what waits for the owner magenta,
@@ -65,7 +95,7 @@ argument parser itself (`--help`, usage errors), which colours itself on a
 terminal.
 
 - `start NAME CHECKOUT... [--workspace DIR] [--branch B] [--no-fetch]` sets up
-  the workspace for one change: `DIR` (default `./NAME`) with each checkout
+  the workspace for one change: `DIR` (default `<workspaces>/NAME`) with each checkout
   (at least one consumer, plus `<repo>@<input>` shared checkouts) on branch
   `B` (default `NAME` lower-cased: workspace `SL-0060-foo`, branches
   `sl-0060-foo`), added as `ws add --branch B` does, fetching each source
@@ -75,8 +105,11 @@ terminal.
   `$SWL_CD_FILE` when that is set (see `hook` below). Rerunnable: an
   existing checkout directory is kept, and reported when it is on another
   branch (never changed); missing ones are added. An interrupted `start` is
-  finished by rerunning it. An existing directory that is not a worktree of
-  the repo's configured source is refused.
+  finished by rerunning it. A differently spelled equivalent workspace name
+  (case or ticket zero-padding) is refused with a hint to use the existing
+  workspace, rather than creating a duplicate. This also applies to
+  `start --from` and explicit directories' sibling names. An existing directory
+  that is not a worktree of the repo's configured source is refused.
 - `start --from CONSUMER#MR [--workspace DIR] [--no-fetch]` joins a
   published change, for example on another machine. With git (consumer repos
   are private), it reads `refs/pull/MR/head` from the consumer source's
@@ -84,7 +117,7 @@ terminal.
   none (the MR was merged, its branch deleted, or the branch moved on) or
   several, it refuses. It
   fetches that head and reads its `swl.toml`. The workspace is `DIR`
-  (default `./<consumer branch>`): the consumer on its branch, tracking the
+  (default `<workspaces>/<consumer branch>`): the consumer on its branch, tracking the
   remote's, and for each entry `[inputs.<path>] repo, mr` the checkout
   `<repo>@<last segment of path>` (`common/zwanenzang` gives
   `zwanenzang@zwanenzang`): on an open MR's head branch, or detached at a
@@ -148,7 +181,7 @@ described under [Manifest and landing](#manifest-and-landing), `bump` under
 
 ## Status
 
-`swl status [--workspace DIR] [--no-fetch]` for a workspace, and
+`swl status [WORKSPACE] [--workspace NAME|TICKET|PATH] [--no-fetch]` for a workspace, and
 `swl status --from CONSUMER#MR [--no-fetch]` for a published change without
 one. It prints one row per shared checkout, per `swl.toml` entry that no
 checkout follows, and per consumer, as a tree per consumer:
@@ -225,9 +258,9 @@ workspace's branch (the workspace's directory name lower-cased, the branch
 consumer's repo (`GET /repos/{owner}/{repo}/pulls/{base branch}/{branch}`);
 when it is open, the next step is `git -C <consumer> switch <branch>, then
 swl land` (anyone), and a detail line names the other way, `swl land --from
-<consumer>#<MR>`: as `start --from`, it keeps an existing checkout as it is,
-so it makes a workspace of its own (`./<branch>`) and needs the branches of
-the MR's shared entries not checked out in this one. A consumer with commits
+<consumer>#<MR> --workspace <new-path>`: as `start --from`, it keeps an existing
+checkout as it is, so joining elsewhere needs an explicit new directory and the
+branches of the MR's shared entries not checked out in this one. A consumer with commits
 outside its base on a branch that is not on the remote is looked up
 likewise: when that branch's MR merged and its merge commit is not in HEAD's
 history (the commits from before a rebase), it is `merged`, next `remove the
@@ -350,6 +383,9 @@ it on as `--config <absolute path>`, so the shim uses the same config as the
 `.envrc.local` files.
 
 ```toml
+# Optional; this is the default. ~/ is expanded using HOME.
+workspaces = "~/personal-workspace/swan-lake-umbrella/workspaces"
+
 # Optional. Flake URLs that name the repo {repo}; these are the defaults.
 url_patterns = [
   "github:binarin/{repo}",
@@ -365,6 +401,11 @@ base = "origin/master"        # optional; the default
 source = "/home/binarin/personal-workspace/swan-lake-umbrella/zwanenzang"
 urls = ["git+https://example.org/mirror/zwanenzang"]   # optional extra forms
 ```
+
+`workspaces` may be absolute or relative to the config file's directory;
+`~` and `~/…` expand to `$HOME`. It need not exist yet: `start` creates it.
+This setting does not relocate or rename existing workspaces; use explicit paths
+for workspaces outside it.
 
 URLs are compared after lower-casing and after dropping the query, a trailing
 `/` or `.git`, and the user in `scheme://user@host`. So, for example,
@@ -508,7 +549,7 @@ a descendant of the old rev on the declared branch). Anything else in the
 lock is refused. A branch with entries lands once they are merged: its lock
 commit comes from `swl finalize`.
 
-### `swl publish [--workspace DIR] <consumer>`
+### `swl publish [--workspace NAME|TICKET|PATH] <consumer>`
 
 From a workspace, for the consumer checkout `<consumer>`:
 
@@ -737,12 +778,17 @@ rest has landed. `swl publish` refuses to push a lock change.
 
 ### Landing
 
-`swl land [--dry-run] [--keep] [--workspace DIR] [--timeout S] [--interval S]`
+`swl land [WORKSPACE] [--dry-run] [--keep] [--workspace NAME|TICKET|PATH] [--timeout S] [--interval S]`
 takes the workspace's change to master, and `swl land --from CONSUMER#MR`
 does so for a published change: it runs `swl start --from` first (or reuses
-its workspace, `--workspace DIR` or `./<consumer branch>`) and lands there;
+its workspace, `--workspace NAME|TICKET|PATH` or
+`<workspaces>/<consumer branch>`) and lands there;
 a consumer MR that `swl status --from` shows as landed has nothing left to
-do (with `--workspace DIR` of an existing workspace, that is removed).
+do (with `--workspace` selecting an existing workspace, that is removed).
+The default `land --from` lookup reuses a uniquely matching full branch-name
+workspace, including a differently cased or zero-padded name (not a ticket-prefix
+search); ambiguity is an error. This is an existing-operation lookup, unlike `start`'s duplicate-name
+refusal.
 
 It is stateless: each run reads the state as `swl status` does (the
 checkouts, the manifests, the forge and the mirror), does what it can, and
@@ -864,9 +910,9 @@ branch) fails, `land` stops there too, to rerun, rather than land the rest
 and remove the workspace. When every consumer is at its base, the workspace does
 not hold a change: `land` refuses, for anyone, saying where each consumer
 is, instead of saying it has nothing to land. The hint is not `swl land
---from` alone because `start --from` keeps an existing checkout as it is:
-into this workspace it would leave the consumer detached, and elsewhere it
-makes a second workspace.
+--from` alone because it reuses a matching workspace and `start --from` keeps
+an existing checkout as it is: into this workspace it would leave the consumer
+detached. To join elsewhere, pass `--workspace <new-path>` explicitly.
 
 `--dry-run` reads as a run does and prints the first writes it would do and
 what follows, writing nothing (no forge request other than reads, no push,
@@ -895,7 +941,7 @@ repeated: the run stops, rerun it.
 
 ### Refresh
 
-`swl refresh [--dry-run] [--workspace DIR] [--timeout S] [--interval S]`
+`swl refresh [WORKSPACE] [--dry-run] [--workspace NAME|TICKET|PATH] [--timeout S] [--interval S]`
 rebases the change's open MR branches onto their bases' current tips and
 pushes them, bottom-up: the shared MRs that the consumers' `swl.toml`
 entries name (nested input paths first), then the consumers' own MRs. It

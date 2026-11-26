@@ -25,7 +25,7 @@ use std::{
     cell::RefCell,
     collections::BTreeSet,
     fs,
-    path::{Path, PathBuf},
+    path::Path,
     process::ExitCode,
     thread,
     time::{Duration, Instant},
@@ -1402,7 +1402,10 @@ pub fn run_from(
         .iter()
         .any(|r| r.name == consumer && r.follows.is_none() && r.verdict.stage == Stage::Landed);
     if landed {
-        return match workspace.filter(|w| w.exists()) {
+        let workspace = workspace
+            .map(|w| crate::workspace_location::resolve(config, cwd, Some(w)))
+            .transpose()?;
+        return match workspace.as_deref().filter(|w| w.exists()) {
             Some(ws) => run(ws, config, reader, writer, opts),
             None => {
                 style::say(
@@ -1416,7 +1419,7 @@ pub fn run_from(
     }
     if opts.dry_run {
         let mr = start::read_consumer_mr(config, &consumer, n, &fetcher)?;
-        let dir: PathBuf = workspace.map_or_else(|| cwd.join(&mr.branch), Path::to_path_buf);
+        let dir = crate::workspace_location::for_land_from(config, cwd, &mr.branch, workspace)?;
         if dir.exists() {
             return run(&dir, config, reader, writer, opts);
         }
@@ -1444,7 +1447,9 @@ pub fn run_from(
         );
         return Ok(ExitCode::SUCCESS);
     }
-    let root = start::run_from(config, cwd, from, workspace, &fetcher, reader, swl)?.root;
+    let mr = start::read_consumer_mr(config, &consumer, n, &fetcher)?;
+    let dir = crate::workspace_location::for_land_from(config, cwd, &mr.branch, workspace)?;
+    let root = start::run_from(config, cwd, from, Some(&dir), &fetcher, reader, swl)?.root;
     run(&root, config, reader, writer, opts)
 }
 

@@ -769,7 +769,8 @@ impl Forge {
         fs::write(fakebin.join("direnv"), FAKE_DIRENV).unwrap();
         fs::set_permissions(fakebin.join("direnv"), fs::Permissions::from_mode(0o755)).unwrap();
         let mut config = format!(
-            "url_patterns = [\"git+file://{}/binarin/{{repo}}\"]\n",
+            "workspaces = \"{}\"\nurl_patterns = [\"git+file://{}/binarin/{{repo}}\"]\n",
+            f.root.join("work").display(),
             f.forge.display()
         );
         for repo in ["zwanenzang", "swan-lake-common", "swan-lake"] {

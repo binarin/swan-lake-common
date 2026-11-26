@@ -889,9 +889,9 @@ fn status_says_a_detached_consumer_is_not_a_change() {
     );
     assert!(
         detail(&out, "nixos-config#7 is open on sl-0030-held").contains(
-            "the workspace's branch; or swl land --from nixos-config#7, which makes a workspace \
-             of its own, ./sl-0030-held, and needs the branches of its shared MRs not checked \
-             out here"
+            "the workspace's branch; or swl land --from nixos-config#7 --workspace <new-path>, \
+             which makes a workspace of its own and needs the branches of its shared MRs not \
+             checked out here"
         ),
         "{out}"
     );

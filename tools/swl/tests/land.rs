@@ -209,10 +209,13 @@ fn land_runs_to_the_end_over_reruns() {
     let log = stdout(&t.land_from(&["--dry-run", "--workspace", &ws]));
     assert!(log.contains("would mark swan-lake-common#1 ready"), "{log}");
     assert!(!log.contains("would run swl start"), "{log}");
-    // Without one (by default ./<consumer branch>): the plan for the shared
-    // MRs, and nothing created.
+    // The default lookup reuses the existing workspace, despite its case.
     let log = stdout(&t.land_from(&["--dry-run"]));
-    let default_ws = t.f.root.join("work/sl-0020-land");
+    assert!(!log.contains("would run swl start"), "{log}");
+    assert!(log.contains("would mark swan-lake-common#1 ready"), "{log}");
+    // Without one: the plan for the shared MRs, and nothing created.
+    let default_ws = t.f.root.join("work/new-workspace");
+    let log = stdout(&t.land_from(&["--dry-run", "--workspace", default_ws.to_str().unwrap()]));
     assert!(
         log.contains(&format!(
             "would run swl start --from swan-lake#2 (the workspace {})",
@@ -589,9 +592,9 @@ fn land_refuses_a_workspace_whose_consumer_is_detached_at_the_base() {
         &format!(
             "swl land: waits for anyone: nixos-config: not a change (detached at origin/master); \
              next: git -C {} switch sl-0022-held, then swl land\n  nixos-config#9 is open on \
-             sl-0022-held, the workspace's branch; or swl land --from nixos-config#9, which makes \
-             a workspace of its own, ./sl-0022-held, and needs the branches of its shared MRs not \
-             checked out here",
+             sl-0022-held, the workspace's branch; or swl land --from nixos-config#9 --workspace \
+             <new-path>, which makes a workspace of its own and needs the branches of its shared \
+             MRs not checked out here",
             consumer.display()
         ),
     );

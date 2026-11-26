@@ -29,6 +29,7 @@ mod style;
 mod tempdir;
 mod version;
 mod workspace;
+mod workspace_location;
 mod ws_add;
 
 use std::{ffi::OsString, path::PathBuf, process::ExitCode, time::Duration};
@@ -83,7 +84,7 @@ enum Commands {
         /// Join a published consumer MR, e.g. swan-lake#12, with the shared MRs its swl.toml names
         #[arg(long, value_name = "CONSUMER#MR")]
         from: Option<String>,
-        /// Workspace directory [default: ./<name>, with --from ./<consumer branch>]
+        /// Workspace directory [default: configured workspaces/<name or consumer branch>]
         #[arg(long, value_name = "DIR")]
         workspace: Option<PathBuf>,
         /// Branch of every checkout [default: <name> lower-cased]
@@ -95,8 +96,11 @@ enum Commands {
     },
     /// Write each consumer's .envrc.local and the workspace's nix, nh and deploy wrappers
     Env {
-        /// Workspace directory [default: current directory]
-        #[arg(long, value_name = "DIR")]
+        /// Workspace name, ticket ID or path (alternative to --workspace)
+        #[arg(value_name = "WORKSPACE", conflicts_with = "workspace")]
+        workspace_name: Option<PathBuf>,
+        /// Workspace name, ticket ID or path [default: enclosing workspace]
+        #[arg(long, value_name = "WORKSPACE")]
         workspace: Option<PathBuf>,
         /// Overwrite a .envrc.local that swl did not write
         #[arg(long)]
@@ -104,8 +108,15 @@ enum Commands {
     },
     /// Where the change stands: per checkout or MR its stage, the next step and who it waits for
     Status {
-        /// Workspace directory [default: current directory]
-        #[arg(long, value_name = "DIR", conflicts_with = "from")]
+        /// Workspace name, ticket ID or path (alternative to --workspace)
+        #[arg(
+            value_name = "WORKSPACE",
+            conflicts_with = "workspace",
+            conflicts_with = "from"
+        )]
+        workspace_name: Option<PathBuf>,
+        /// Workspace name, ticket ID or path [default: enclosing workspace]
+        #[arg(long, value_name = "WORKSPACE", conflicts_with = "from")]
         workspace: Option<PathBuf>,
         /// A published consumer MR, e.g. swan-lake#12, without a workspace
         #[arg(long, value_name = "CONSUMER#MR")]
@@ -125,8 +136,11 @@ enum Commands {
         /// Keep the workspace when everything has landed
         #[arg(long)]
         keep: bool,
-        /// Workspace directory [default: current directory; with --from, ./<consumer branch>]
-        #[arg(long, value_name = "DIR")]
+        /// Workspace name, ticket ID or path (alternative to --workspace)
+        #[arg(value_name = "WORKSPACE", conflicts_with = "workspace")]
+        workspace_name: Option<PathBuf>,
+        /// Workspace name, ticket ID or path [default: enclosing workspace; with --from, configured workspaces/<consumer branch>]
+        #[arg(long, value_name = "WORKSPACE")]
         workspace: Option<PathBuf>,
         /// A published consumer MR, e.g. swan-lake#12: swl start --from it first (or reuse its workspace)
         #[arg(long, value_name = "CONSUMER#MR")]
@@ -146,8 +160,11 @@ enum Commands {
         /// Print what would be rebased and pushed; write nothing
         #[arg(long)]
         dry_run: bool,
-        /// Workspace directory [default: current directory]
-        #[arg(long, value_name = "DIR")]
+        /// Workspace name, ticket ID or path (alternative to --workspace)
+        #[arg(value_name = "WORKSPACE", conflicts_with = "workspace")]
+        workspace_name: Option<PathBuf>,
+        /// Workspace name, ticket ID or path [default: enclosing workspace]
+        #[arg(long, value_name = "WORKSPACE")]
         workspace: Option<PathBuf>,
         /// Seconds to wait for the forge to show a pushed head
         #[arg(long, default_value_t = 300, value_name = "SECONDS")]
@@ -178,8 +195,8 @@ enum Commands {
     Publish {
         /// The consumer checkout, e.g. swan-lake
         consumer: String,
-        /// Workspace directory [default: current directory]
-        #[arg(long, value_name = "DIR")]
+        /// Workspace name, ticket ID or path [default: enclosing workspace]
+        #[arg(long, value_name = "WORKSPACE")]
         workspace: Option<PathBuf>,
     },
     /// Commit, on the consumer's branch, the relock of the swl.toml entries that have landed
@@ -255,8 +272,8 @@ enum WsCommands {
         /// Check out this branch: the local one, else one tracking the remote's, else a new one at the base [default: detached at the base]
         #[arg(long)]
         branch: Option<String>,
-        /// Workspace directory [default: current directory]
-        #[arg(long, value_name = "DIR")]
+        /// Workspace name, ticket ID or path [default: enclosing workspace]
+        #[arg(long, value_name = "WORKSPACE")]
         workspace: Option<PathBuf>,
         /// Do not fetch the source first; use the refs it already has
         #[arg(long)]
@@ -303,7 +320,11 @@ fn run(cli: Cli) -> Result<ExitCode> {
             let swl = if no_env { None } else { Some(swl_exe()?) };
             ws_add::run(
                 &config,
-                &workspace_dir(workspace)?,
+                &workspace_location::resolve(
+                    &config,
+                    &std::env::current_dir()?,
+                    workspace.as_deref(),
+                )?,
                 &name,
                 branch.as_deref(),
                 &ws_add::Fetcher::new(!no_fetch),
@@ -347,23 +368,38 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 hook::write_cd_file("swl start", dir);
             }
         }
-        Commands::Env { workspace, force } => {
+        Commands::Env {
+            workspace,
+            workspace_name,
+            force,
+        } => {
             let config = Config::load(config_flag)?;
-            let ws = Workspace::scan(&workspace_dir(workspace)?)?;
+            let workspace = workspace.or(workspace_name);
+            let ws = Workspace::scan(&workspace_location::resolve(
+                &config,
+                &std::env::current_dir()?,
+                workspace.as_deref(),
+            )?)?;
             env::run(&ws, &config, &swl_exe()?, force)?;
         }
         Commands::Status {
+            workspace_name,
             workspace,
             from,
             no_fetch,
         } => {
             let config = Config::load(config_flag)?;
+            let workspace = workspace.or(workspace_name);
             let fetcher = ws_add::Fetcher::new(!no_fetch);
             let reader = forge::ForgeReader::from_env();
             match from {
                 Some(from) => status::run_from(&config, &from, &reader, &fetcher)?,
                 None => status::run(
-                    &Workspace::scan(&workspace_dir(workspace)?)?,
+                    &Workspace::scan(&workspace_location::resolve(
+                        &config,
+                        &std::env::current_dir()?,
+                        workspace.as_deref(),
+                    )?)?,
                     &config,
                     &reader,
                     &fetcher,
@@ -371,6 +407,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             }
         }
         Commands::Land {
+            workspace_name,
             dry_run,
             keep,
             workspace,
@@ -379,6 +416,16 @@ fn run(cli: Cli) -> Result<ExitCode> {
             interval,
         } => {
             let config = Config::load(config_flag)?;
+            let workspace = workspace.or(workspace_name);
+            let workspace = if from.is_none() {
+                Some(workspace_location::resolve(
+                    &config,
+                    &std::env::current_dir()?,
+                    workspace.as_deref(),
+                )?)
+            } else {
+                workspace
+            };
             let opts = land::Options {
                 dry_run,
                 keep,
@@ -403,16 +450,24 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     &swl_exe()?,
                     &opts,
                 ),
-                None => land::run(&workspace_dir(workspace)?, &config, &reader, writer, &opts),
+                None => land::run(
+                    workspace.as_deref().expect("resolved above without --from"),
+                    &config,
+                    &reader,
+                    writer,
+                    &opts,
+                ),
             };
         }
         Commands::Refresh {
+            workspace_name,
             dry_run,
             workspace,
             timeout,
             interval,
         } => {
             let config = Config::load(config_flag)?;
+            let workspace = workspace.or(workspace_name);
             let opts = land::Options {
                 dry_run,
                 keep: false,
@@ -420,7 +475,11 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 interval: Duration::from_secs(interval),
             };
             return refresh::run(
-                &workspace_dir(workspace)?,
+                &workspace_location::resolve(
+                    &config,
+                    &std::env::current_dir()?,
+                    workspace.as_deref(),
+                )?,
                 &config,
                 &forge::ForgeReader::from_env(),
                 &opts,
@@ -460,7 +519,11 @@ fn run(cli: Cli) -> Result<ExitCode> {
             workspace,
         } => {
             let config = Config::load(config_flag)?;
-            let ws = Workspace::scan(&workspace_dir(workspace)?)?;
+            let ws = Workspace::scan(&workspace_location::resolve(
+                &config,
+                &std::env::current_dir()?,
+                workspace.as_deref(),
+            )?)?;
             publish::run(
                 &ws,
                 &config,
