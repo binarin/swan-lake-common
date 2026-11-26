@@ -322,15 +322,23 @@ fn direnv_allow(consumers: &[PathBuf]) {
     }
 }
 
+/// A workspace that `swl start` set up.
+#[derive(Debug)]
+pub struct Started {
+    pub root: PathBuf,
+    /// The first consumer's checkout, which the `cd` hint names.
+    pub cd: Option<PathBuf>,
+}
+
 /// Adds the missing checkouts, keeps the existing ones, then `swl env` and
-/// `direnv allow`. Returns the workspace directory.
+/// `direnv allow`.
 pub fn execute(
     config: &Config,
     root: &Path,
     items: &[Item],
     fetcher: &Fetcher,
     swl: &Path,
-) -> Result<PathBuf> {
+) -> Result<Started> {
     std::fs::create_dir_all(root).with_context(|| format!("creating {}", root.display()))?;
     let root = root.canonicalize()?;
     let mut summary = Vec::new();
@@ -365,10 +373,11 @@ pub fn execute(
     for line in summary {
         println!("{line}");
     }
-    if let Some(first) = consumers.first() {
+    let cd = consumers.into_iter().next();
+    if let Some(first) = &cd {
         println!("cd {}", first.display());
     }
-    Ok(root)
+    Ok(Started { root, cd })
 }
 
 /// `swl start <name> <checkout>...`.
@@ -382,17 +391,17 @@ pub fn run_new(
     branch: Option<&str>,
     fetcher: &Fetcher,
     swl: &Path,
-) -> Result<()> {
+) -> Result<Started> {
     if name.is_empty() || name.contains('/') || name.starts_with('.') {
         bail!("{name:?} is not a workspace name, e.g. SL-0060-foo");
     }
     let branch = branch.map_or_else(|| name.to_lowercase(), str::to_string);
     let items = new_items(config, checkouts, &branch)?;
     let root = workspace.map_or_else(|| cwd.join(name), Path::to_path_buf);
-    execute(config, &root, &items, fetcher, swl).map(drop)
+    execute(config, &root, &items, fetcher, swl)
 }
 
-/// `swl start --from <consumer>#<MR>`; returns the workspace directory.
+/// `swl start --from <consumer>#<MR>`.
 pub fn run_from(
     config: &Config,
     cwd: &Path,
@@ -401,7 +410,7 @@ pub fn run_from(
     fetcher: &Fetcher,
     reader: &dyn PrReader,
     swl: &Path,
-) -> Result<PathBuf> {
+) -> Result<Started> {
     let (consumer, n) = parse_from(from)?;
     let mr = read_consumer_mr(config, &consumer, n, fetcher)?;
     println!(

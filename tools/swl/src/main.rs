@@ -8,6 +8,7 @@ mod finalize;
 mod forge;
 mod git;
 mod github;
+mod hook;
 mod land;
 mod lock;
 mod lock_change;
@@ -211,6 +212,8 @@ enum Commands {
         #[command(subcommand)]
         command: CiCommands,
     },
+    /// Print the shell function `swl`, which changes to the new workspace after `swl start`: eval "$(swl hook zsh)"
+    Hook { shell: hook::Shell },
     /// Run the real tool with the workspace's overrides and guards (used by the wrappers)
     Shim {
         tool: Tool,
@@ -319,7 +322,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             let cwd = std::env::current_dir().context("current directory")?;
             let fetcher = ws_add::Fetcher::new(!no_fetch);
             let swl = swl_exe()?;
-            match from {
+            let started = match from {
                 Some(from) => start::run_from(
                     &config,
                     &cwd,
@@ -328,8 +331,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     &fetcher,
                     &forge::ForgeReader::from_env(),
                     &swl,
-                )
-                .map(drop)?,
+                )?,
                 None => start::run_new(
                     &config,
                     &cwd,
@@ -340,6 +342,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     &fetcher,
                     &swl,
                 )?,
+            };
+            if let Some(dir) = &started.cd {
+                hook::write_cd_file("swl start", dir);
             }
         }
         Commands::Env { workspace, force } => {
@@ -506,6 +511,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 .collect();
             return shim::run_ci(&flake, pairs, args);
         }
+        Commands::Hook { shell } => print!("{}", hook::script(shell)),
         Commands::Shim {
             tool,
             workspace,

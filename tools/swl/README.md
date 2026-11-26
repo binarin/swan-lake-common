@@ -48,6 +48,7 @@ swl finalize [--wait]                     # landed entries -> one lock commit
 swl land [--dry-run] [--keep] [--from swan-lake#12]   # merge, promote, finalize, merge, clean up
 swl refresh [--dry-run]                   # the change's MR branches rebased onto their bases, pushed with a lease
 swl bump [--dry-run] [--check]            # common's inputs forward, promoted, a bump MR per consumer
+swl hook zsh|bash                         # the shell function swl, which cds after start: eval "$(swl hook zsh)"
 ```
 
 `ws add`, `env` and `status` use the current directory as the workspace unless
@@ -70,11 +71,12 @@ terminal.
   `sl-0060-foo`), added as `ws add --branch B` does, fetching each source
   once. Then `env` once, and `direnv allow` for each consumer with an
   `.envrc` when `direnv` is on PATH (else a note to run it). It ends with the
-  checkouts and a `cd` hint. Rerunnable: an existing checkout directory is
-  kept, and reported when it is on another branch (never changed); missing
-  ones are added. An interrupted `start` is finished by rerunning it. An
-  existing directory that is not a worktree of the repo's configured source
-  is refused.
+  checkouts and a `cd` hint, and writes the directory the hint names to
+  `$SWL_CD_FILE` when that is set (see `hook` below). Rerunnable: an
+  existing checkout directory is kept, and reported when it is on another
+  branch (never changed); missing ones are added. An interrupted `start` is
+  finished by rerunning it. An existing directory that is not a worktree of
+  the repo's configured source is refused.
 - `start --from CONSUMER#MR [--workspace DIR] [--no-fetch]` joins a
   published change, for example on another machine. With git (consumer repos
   are private), it reads `refs/pull/MR/head` from the consumer source's
@@ -87,8 +89,8 @@ terminal.
   `<repo>@<last segment of path>` (`common/zwanenzang` gives
   `zwanenzang@zwanenzang`): on an open MR's head branch, or detached at a
   merged MR's merge commit. A closed or unknown MR is an error, before
-  anything is added. Then `env` and `direnv allow` as above; rerunnable
-  likewise.
+  anything is added. Then `env`, `direnv allow`, the `cd` hint and
+  `$SWL_CD_FILE` as above; rerunnable likewise.
 
 - `ws add NAME [--branch B] [--no-fetch] [--no-env]` runs `git worktree add`
   in the repo's configured source, which can be a bare repository or a main
@@ -118,6 +120,26 @@ terminal.
   checkouts, or after a checkout's `flake.lock` changes.
 - `status [--no-fetch]` shows where the workspace's change stands; see
   [Status](#status).
+- `hook zsh|bash` prints, on stdout, the shell function `swl` for an
+  interactive shell, to be loaded with `eval "$(swl hook zsh)"` (or `bash`)
+  in its rc file. Any other shell is a usage error. The function runs `command
+  swl` from `PATH` with its arguments, with `SWL_CD_FILE` set to a new
+  temporary file (`mktemp` in `$TMPDIR`, else `/tmp`). When swl succeeds and
+  has written a directory to that file, the function changes to it; it
+  removes the file either way and returns swl's exit status (or, when the
+  `cd` fails, that of `cd`). `set -e`, zsh's `ERR_RETURN` or an ERR trap
+  in the shell do not stop it before it removes the file. When `mktemp`
+  fails, it runs swl with `SWL_CD_FILE` empty and does not change
+  directory. A call interrupted with Ctrl-C can leave the file behind.
+
+  The `SWL_CD_FILE` protocol: a command that leaves the shell somewhere
+  else writes that directory's absolute path to the file named by
+  `$SWL_CD_FILE`, as the file's only content (no newline), when the variable
+  is set and not empty, and only on success. Only `start` (also with `--from`) does: it
+  writes the first consumer's checkout, the one its `cd` hint names; `land
+  --from`, which can remove the workspace it starts, does not. Without the
+  variable (or with it empty) nothing is written; a failure to write is a
+  warning.
 
 `publish`, `check`, `ci env`, `finalize`, `land` and `refresh` are
 described under [Manifest and landing](#manifest-and-landing), `bump` under

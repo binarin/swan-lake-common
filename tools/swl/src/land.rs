@@ -1444,7 +1444,7 @@ pub fn run_from(
         );
         return Ok(ExitCode::SUCCESS);
     }
-    let root = start::run_from(config, cwd, from, workspace, &fetcher, reader, swl)?;
+    let root = start::run_from(config, cwd, from, workspace, &fetcher, reader, swl)?.root;
     run(&root, config, reader, writer, opts)
 }
 

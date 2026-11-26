@@ -28,16 +28,25 @@ fn start_creates_a_workspace_and_is_rerunnable() {
     // checkouts are added.
     let zw_source = f.source("zwanenzang");
     let zw_url = f.forge_repo("zwanenzang").display().to_string();
+    // Nothing is written to $SWL_CD_FILE.
+    let cd_file = f.root.join("cd-file");
+    fs::write(&cd_file, "").unwrap();
+    let cd_env = [("SWL_CD_FILE", cd_file.to_str().unwrap())];
     f.git(&zw_source, &["remote", "set-url", "origin", "/nonexistent"]);
-    failed(&f.swl(&work, &start), 2, "pass --no-fetch");
+    failed(&f.swl_env(&work, &start, &cd_env), 2, "pass --no-fetch");
     assert!(consumer.join("flake.nix").is_file() && common.join("flake.nix").is_file());
     assert!(!zw.exists());
     assert!(!consumer.join(".envrc.local").exists());
+    assert_eq!(fs::read_to_string(&cd_file).unwrap(), "");
 
     // Rerun after the fix: the two are kept, the third added, then env and
-    // direnv allow.
+    // direnv allow. The consumer that the cd hint names is in $SWL_CD_FILE.
     f.git(&zw_source, &["remote", "set-url", "origin", &zw_url]);
-    let out = stdout(&f.swl(&work, &start));
+    let out = stdout(&f.swl_env(&work, &start, &cd_env));
+    assert_eq!(
+        fs::read_to_string(&cd_file).unwrap(),
+        consumer.display().to_string()
+    );
     for dir in [&consumer, &common] {
         assert!(
             out.contains(&format!("{}: kept, on sl-0001-foo", dir.display())),
@@ -207,9 +216,19 @@ fn start_from_joins_an_open_and_a_merged_mr() {
         "{seen:?}"
     );
 
-    // Rerun: all kept.
-    let out = stdout(&f.swl_env(&work, &from, &login));
+    // Rerun: all kept, and the consumer is in $SWL_CD_FILE.
+    let cd_file = f.root.join("cd-file");
+    let out = stdout(&f.swl_env(
+        &work,
+        &from,
+        &[login[0], ("SWL_CD_FILE", cd_file.to_str().unwrap())],
+    ));
     assert_eq!(out.matches(": kept,").count(), 3, "{out}");
+    assert!(out.contains(&format!("cd {}", consumer.display())), "{out}");
+    assert_eq!(
+        fs::read_to_string(&cd_file).unwrap(),
+        consumer.display().to_string()
+    );
 
     // An MR whose head is no branch's head any more: refused.
     let master = f.git(&f.forge_repo("swan-lake"), &["rev-parse", "master"]);

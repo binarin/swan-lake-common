@@ -56,10 +56,13 @@ in
         # The tests drive real git and nix on throwaway local flakes, with a
         # store in the build directory, and serve a fake forge API on
         # 127.0.0.1. In the sandbox swl is not in /nix/store (no GC root is
-        # made) and direnv is absent; the tests that need it fake it.
+        # made) and direnv is absent; the tests that need it fake it. The
+        # tests of `swl hook` run its function in zsh and bash.
         nativeCheckInputs = [
           pkgs.git
           pkgs.nix
+          pkgs.zsh
+          pkgs.bash
         ];
         preCheck = ''
           export SWL_TEST_NIX_STORE=$TMPDIR/swl-test-store
