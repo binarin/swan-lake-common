@@ -122,7 +122,8 @@ terminal.
   [Status](#status).
 - `hook zsh|bash` prints, on stdout, the shell function `swl` for an
   interactive shell, to be loaded with `eval "$(swl hook zsh)"` (or `bash`)
-  in its rc file. Any other shell is a usage error. The function runs `command
+  in its rc file; `homeModules.swl` adds that line to home-manager's zsh and
+  bash init. Any other shell is a usage error. The function runs `command
   swl` from `PATH` with its arguments, with `SWL_CD_FILE` set to a new
   temporary file (`mktemp` in `$TMPDIR`, else `/tmp`). When swl succeeds and
   has written a directory to that file, the function changes to it; it

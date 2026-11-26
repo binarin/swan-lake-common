@@ -152,11 +152,19 @@ in
     };
   };
 
-  # swl on PATH, for the machines where Swan Lake changes are made.
+  # swl on PATH, for the machines where Swan Lake changes are made, and its
+  # shell function in zsh and bash, which changes to the new workspace after
+  # `swl start`.
   flake.homeModules.swl =
     { pkgs, ... }:
     {
       key = "swan-lake-common.modules.home.swl";
       home.packages = [ commonSelf.packages.${pkgs.stdenv.hostPlatform.system}.swl ];
+      programs.zsh.initContent = ''
+        eval "$(swl hook zsh)"
+      '';
+      programs.bash.initExtra = ''
+        eval "$(swl hook bash)"
+      '';
     };
 }
