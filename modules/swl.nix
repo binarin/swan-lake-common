@@ -13,6 +13,11 @@ in
     let
       inherit (pkgs) lib;
       src = ../tools/swl;
+      # The paths below tools/swl that swl is built from. A change to any of
+      # them must bump the version in Cargo.toml: the CI job
+      # .forgejo/workflows/swl-version.yaml checks it with
+      # scripts/check-swl-version-bump.py, which reads this same list.
+      srcPaths = lib.importJSON (src + "/src-fileset.json");
       # lastModifiedDate is YYYYMMDDHHMMSS, in UTC.
       commitDate =
         d: "${builtins.substring 0 4 d}-${builtins.substring 4 2 d}-${builtins.substring 6 2 d}";
@@ -23,12 +28,7 @@ in
         version = (builtins.fromTOML (builtins.readFile (src + "/Cargo.toml"))).package.version;
         src = lib.fileset.toSource {
           root = src;
-          fileset = lib.fileset.unions [
-            (src + "/Cargo.toml")
-            (src + "/Cargo.lock")
-            (src + "/src")
-            (src + "/tests")
-          ];
+          fileset = lib.fileset.unions (map (p: src + "/${p}") srcPaths);
         };
         cargoLock.lockFile = src + "/Cargo.lock";
         # `swl --version` names the commit of common it is built from, so swl
@@ -66,6 +66,28 @@ in
         };
       };
       apps.swl = mkApp self'.packages.swl;
+      # The CI check that an MR changing swl bumps its version, on scratch git
+      # repos.
+      checks.swl-version-bump =
+        pkgs.runCommand "swl-version-bump-test"
+          {
+            nativeBuildInputs = [
+              pkgs.python3
+              pkgs.git
+            ];
+            src = lib.fileset.toSource {
+              root = ../scripts;
+              fileset = lib.fileset.unions [
+                ../scripts/check-swl-version-bump.py
+                ../scripts/test_check_swl_version_bump.py
+              ];
+            };
+          }
+          ''
+            cd $src
+            PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -v test_check_swl_version_bump
+            touch $out
+          '';
       checks.swl = self'.packages.swl.overrideAttrs (old: {
         nativeCheckInputs = old.nativeCheckInputs ++ [
           pkgs.rustfmt

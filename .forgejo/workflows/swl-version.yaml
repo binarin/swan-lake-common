@@ -1,0 +1,18 @@
+name: swl version
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+jobs:
+  swl-version-bump:
+    name: swl version bump
+    runs-on: native
+    steps:
+      # The whole history, with the target branch as origin/<base_ref>, for
+      # the merge base.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+      - env:
+          BASE_REF: ${{ github.base_ref }}
+        run: nix shell --inputs-from . nixpkgs#python3 nixpkgs#git -c python3 scripts/check-swl-version-bump.py "origin/$BASE_REF"
