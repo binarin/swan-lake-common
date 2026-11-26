@@ -442,6 +442,87 @@ fn report_plan(plans: &[InputPlan]) {
     }
 }
 
+/// The repos of the config other than common whose base branch locks
+/// common, each fetched.
+fn consumers(config: &Config, fetcher: &Fetcher) -> Result<Vec<Consumer>> {
+    let mut out = Vec::new();
+    for (name, rc) in config.repos() {
+        if name == COMMON_REPO {
+            continue;
+        }
+        let base = rc.base();
+        let Some(remote) = base_remote(&rc.source, base)? else {
+            tracing::debug!(%name, %base, "not a consumer: its base names no remote");
+            continue;
+        };
+        fetcher.fetch(&rc.source, &remote)?;
+        let branch = base_branch(base).to_string();
+        let Some(head) = rev_parse(&rc.source, &format!("refs/remotes/{remote}/{branch}")) else {
+            bail!("{name}: {base} is not known in {}", rc.source.display());
+        };
+        let Some(lock) = check::lock_at(&rc.source, &head)? else {
+            tracing::debug!(%name, "not a consumer: no flake.lock");
+            continue;
+        };
+        let inputs =
+            common_inputs(config, &lock).with_context(|| format!("{name}'s flake.lock"))?;
+        if inputs.is_empty() {
+            tracing::debug!(%name, "not a consumer: no common input");
+            continue;
+        }
+        out.push(Consumer {
+            name: name.to_string(),
+            source: rc.source.clone(),
+            remote,
+            branch,
+            head,
+            lock,
+            inputs,
+        });
+    }
+    Ok(out)
+}
+
+/// Where common is promoted: the one branch its consumers declare for it
+/// (`swan-lake-current`), and the union of their declared sources (the
+/// GitHub mirror), which must have it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PromotionTarget {
+    pub(crate) branch: String,
+    pub(crate) mirrors: BTreeSet<String>,
+}
+
+/// The promotion target that `consumers` declare; `cmd` names who refuses
+/// none or several branches.
+fn target_of(config: &Config, consumers: &[Consumer], cmd: &str) -> Result<PromotionTarget> {
+    if consumers.is_empty() {
+        bail!(
+            "no repo of the swl config locks {COMMON_REPO}: {cmd} needs its consumers, whose \
+             flake.nix declares the branch to promote"
+        );
+    }
+    let master = base_branch(config.base_for(COMMON_REPO));
+    let mut branches = BTreeSet::new();
+    let mut mirrors = BTreeSet::new();
+    for c in consumers {
+        for i in &c.inputs {
+            branches.insert(i.branch.clone().unwrap_or_else(|| master.to_string()));
+            mirrors.extend(i.declared_source.clone());
+        }
+    }
+    let branch = match branches.into_iter().collect::<Vec<_>>().as_slice() {
+        [one] => one.clone(),
+        many => bail!(
+            "the consumers declare {COMMON_REPO} at different branches ({}); {cmd} promotes one",
+            many.join(", ")
+        ),
+    };
+    if !valid_branch(&branch) {
+        bail!("the declared branch {branch:?} is not a branch name");
+    }
+    Ok(PromotionTarget { branch, mirrors })
+}
+
 /// Where common stands for the consumers.
 enum Common {
     /// Promoted and in the declared sources: the rev to bump them to.
@@ -471,48 +552,6 @@ impl Bumper<'_> {
 
     fn dry_run(&self) -> bool {
         self.opts.land.dry_run
-    }
-
-    /// The repos of the config other than common whose base branch locks
-    /// common, each fetched.
-    fn consumers(&self) -> Result<Vec<Consumer>> {
-        let mut out = Vec::new();
-        for (name, rc) in self.config.repos() {
-            if name == COMMON_REPO {
-                continue;
-            }
-            let base = rc.base();
-            let Some(remote) = base_remote(&rc.source, base)? else {
-                tracing::debug!(%name, %base, "not a consumer: its base names no remote");
-                continue;
-            };
-            self.fetcher.fetch(&rc.source, &remote)?;
-            let branch = base_branch(base).to_string();
-            let Some(head) = rev_parse(&rc.source, &format!("refs/remotes/{remote}/{branch}"))
-            else {
-                bail!("{name}: {base} is not known in {}", rc.source.display());
-            };
-            let Some(lock) = check::lock_at(&rc.source, &head)? else {
-                tracing::debug!(%name, "not a consumer: no flake.lock");
-                continue;
-            };
-            let inputs = common_inputs(self.config, &lock)
-                .with_context(|| format!("{name}'s flake.lock"))?;
-            if inputs.is_empty() {
-                tracing::debug!(%name, "not a consumer: no common input");
-                continue;
-            }
-            out.push(Consumer {
-                name: name.to_string(),
-                source: rc.source.clone(),
-                remote,
-                branch,
-                head,
-                lock,
-                inputs,
-            });
-        }
-        Ok(out)
     }
 
     /// Steps 1 and 2: common bumped, promoted to `promoted` and in the
@@ -1065,33 +1104,11 @@ impl Bumper<'_> {
 
     fn run(&self) -> Result<ExitCode> {
         let common_rc = self.config.repo(COMMON_REPO)?;
-        let consumers = self.consumers()?;
-        if consumers.is_empty() {
-            bail!(
-                "no repo of the swl config locks {COMMON_REPO}: swl bump needs its consumers, \
-                 whose flake.nix declares the branch to promote"
-            );
-        }
-        let master = base_branch(common_rc.base());
-        let mut branches = BTreeSet::new();
-        let mut mirrors = BTreeSet::new();
-        for c in &consumers {
-            for i in &c.inputs {
-                branches.insert(i.branch.clone().unwrap_or_else(|| master.to_string()));
-                mirrors.extend(i.declared_source.clone());
-            }
-        }
-        let promoted = match branches.into_iter().collect::<Vec<_>>().as_slice() {
-            [one] => one.clone(),
-            many => bail!(
-                "the consumers declare {COMMON_REPO} at different branches ({}); swl bump \
-                 promotes one",
-                many.join(", ")
-            ),
-        };
-        if !valid_branch(&promoted) {
-            bail!("the declared branch {promoted:?} is not a branch name");
-        }
+        let consumers = consumers(self.config, &self.fetcher)?;
+        let PromotionTarget {
+            branch: promoted,
+            mirrors,
+        } = target_of(self.config, &consumers, CMD)?;
         let names: Vec<&str> = consumers.iter().map(|c| c.name.as_str()).collect();
         tracing::debug!(%promoted, ?mirrors, consumers = ?names, "what bump works on");
         let target = match self.common(&promoted, &mirrors)? {
