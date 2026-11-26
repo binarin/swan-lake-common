@@ -449,7 +449,13 @@ fn run(cli: Cli) -> Result<ExitCode> {
         } => {
             let config = Config::load(config_flag)?;
             let ws = Workspace::scan(&workspace_dir(workspace)?)?;
-            publish::run(&ws, &config, &consumer, &Fj)?;
+            publish::run(
+                &ws,
+                &config,
+                &consumer,
+                &Fj,
+                &forge::ForgeReader::from_env(),
+            )?;
         }
         Commands::Finalize {
             dir,

@@ -9,8 +9,8 @@ use anyhow::{Result, anyhow, bail};
 
 use crate::{
     config::Config,
-    forge::PrPublisher,
-    git::{git, git_ok},
+    forge::{PrPublisher, PrReader, PrState},
+    git::{git, git_ok, short},
     lock::Lock,
     manifest::{Entry, MANIFEST_FILE, Manifest},
     workspace::{Checkout, Workspace},
@@ -26,6 +26,8 @@ struct Branch {
     base_ref: String,
     /// The branch on origin is already at `head`.
     pushed: bool,
+    /// The branch is on origin.
+    on_origin: bool,
 }
 
 /// The base branch name for MRs from a base revision such as `origin/master`.
@@ -92,7 +94,55 @@ fn publishable(c: &Checkout, base: &str) -> Result<Branch> {
         base_branch: base_branch(base).to_string(),
         base_ref: base.to_string(),
         pushed,
+        on_origin: remote.is_some(),
     })
+}
+
+/// Refuses a branch that is not on origin whose MR merged without HEAD's
+/// commits (as they were before a rebase): publishing it would open a new MR
+/// for landed work. A forge that cannot be asked is a warning.
+fn refuse_merged(c: &Checkout, repo: &str, b: &Branch, reader: &dyn PrReader) -> Result<()> {
+    if b.on_origin {
+        return Ok(());
+    }
+    let info = match reader.pr_of_branch(repo, &b.base_branch, &b.name) {
+        Ok(Some(info)) => info,
+        Ok(None) => return Ok(()),
+        Err(e) => {
+            crate::style::tell(
+                "swl publish",
+                crate::style::Tone::Warn,
+                format!(
+                    "warning: {}: cannot look up the MR of {}: {e:#}",
+                    c.name, b.name
+                ),
+            );
+            return Ok(());
+        }
+    };
+    let PrState::Merged { merge_commit } = &info.state else {
+        return Ok(());
+    };
+    if git_ok(
+        &c.dir,
+        &["merge-base", "--is-ancestor", merge_commit, "HEAD"],
+    )
+    .is_some()
+    {
+        return Ok(());
+    }
+    bail!(
+        "{}: {repo}#{}, the MR of {}, is merged (as {}), and {} is not on origin any more; HEAD \
+         has commits outside {} that the merge does not have (as they were before a rebase), so \
+         publishing would open a new MR for landed work: remove the workspace, or put new work \
+         on a new branch",
+        c.name,
+        info.number,
+        b.name,
+        short(merge_commit),
+        b.name,
+        b.base_ref
+    )
 }
 
 fn push(c: &Checkout, b: &Branch) -> Result<()> {
@@ -154,7 +204,13 @@ fn find_or_open(
     Ok(n)
 }
 
-pub fn run(ws: &Workspace, config: &Config, consumer: &str, forge: &dyn PrPublisher) -> Result<()> {
+pub fn run(
+    ws: &Workspace,
+    config: &Config,
+    consumer: &str,
+    forge: &dyn PrPublisher,
+    reader: &dyn PrReader,
+) -> Result<()> {
     let target = ws
         .checkouts
         .iter()
@@ -203,10 +259,12 @@ pub fn run(ws: &Workspace, config: &Config, consumer: &str, forge: &dyn PrPublis
             continue;
         }
         let branch = publishable(checkout, base)?;
+        refuse_merged(checkout, repo, &branch, reader)?;
         shared.push((checkout, repo.as_str(), paths, branch));
     }
     fetch_base(target, config.base_for(consumer))?;
-    publishable(target, config.base_for(consumer))?;
+    let consumer_branch = publishable(target, config.base_for(consumer))?;
+    refuse_merged(target, consumer, &consumer_branch, reader)?;
     if let Some(e) = crate::check::lock_change(&target.dir, config.base_for(consumer))? {
         bail!("{consumer}: {e}");
     }

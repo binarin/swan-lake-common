@@ -483,7 +483,13 @@ From a workspace, for the consumer checkout `<consumer>`:
 4. Push the consumer branch and find or open its MR (not a draft; the body
    lists the dependencies).
 
-Everything is checked before anything is pushed. Refused: a detached HEAD,
+Everything is checked before anything is pushed. Refused: a branch that is
+not on `origin` whose MR, looked up as `status` does (`GET
+/repos/{owner}/{repo}/pulls/{base branch}/{branch}`, with fj's login for a
+private repo), merged without HEAD's commits outside the base (they predate
+a rebase): publishing would open a new MR for landed work, so remove the
+workspace, or put new work on a new branch (a lookup that fails is a
+warning). Also refused: a detached HEAD,
 the base branch itself (publish from a topic branch), a consumer branch that
 changes `flake.lock`, uncommitted changes to tracked files, and a branch on
 `origin` that HEAD does not contain (publish never force-pushes; fetch and rebase or merge). So a
@@ -958,7 +964,8 @@ and CI fetches
 public. Should one become private, give CI a dedicated read-only token as a
 secret, through nix `access-tokens` or a netrc for the fetch, and the same for
 the API; Forgejo's automatic Actions token is scoped to the job's own repo
-and is not enough. `publish` uses `fj` and its login.
+and is not enough. `publish` uses `fj` and its login, and reads the MR of a
+branch that is not on `origin` as `status` does.
 
 `SWL_FORGE_API` (default `https://forgejo.lynx-lizard.ts.net/api/v1`) and
 `SWL_FORGE_GIT` (default `https://forgejo.lynx-lizard.ts.net`, the base of

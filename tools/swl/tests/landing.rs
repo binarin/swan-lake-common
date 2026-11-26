@@ -435,9 +435,11 @@ impl World {
 
 impl Drop for World {
     fn drop(&mut self) {
-        // check, ci env and finalize read anonymously, also with an fj login.
+        // check, ci env and finalize read anonymously, also with an fj login;
+        // publish looks up a branch's MR (`pulls/<base>/<branch>`) with it.
         if !thread::panicking() {
-            let authed = self.api.authed.lock().unwrap().clone();
+            let mut authed = self.api.authed.lock().unwrap().clone();
+            authed.retain(|p| !p.contains("/pulls/master/"));
             assert!(authed.is_empty(), "requests with a token: {authed:?}");
         }
         let _ = fs::remove_dir_all(&self.root);
@@ -1312,4 +1314,94 @@ fn finalize_lands_a_nested_entry_through_its_parent() {
         .output()
         .unwrap();
     assert_eq!(stdout(&out), "z2");
+}
+
+#[test]
+fn publish_refuses_a_branch_whose_mr_merged_without_its_commits() {
+    let w = World::new("publish-merged");
+    let ws = w.ws.display().to_string();
+    let publish = ["publish", "--workspace", &ws, "swan-lake"];
+    // `repo`'s MR `n` from `branch`, merged as `merge_commit`; its branch is
+    // gone.
+    let merged = |repo: &str, n: u64, branch: &str, merge_commit: &str| {
+        let body = serde_json::json!({
+            "number": n,
+            "state": "closed",
+            "merged": true,
+            "title": "t",
+            "head": { "sha": merge_commit, "ref": format!("refs/pull/{n}/head"), "label": branch },
+            "base": { "ref": "master" },
+            "merge_commit_sha": merge_commit,
+        });
+        w.api.responses.lock().unwrap().insert(
+            format!("/api/v1/repos/binarin/{repo}/pulls/master/{branch}"),
+            body.to_string(),
+        );
+    };
+    // Common's feature was merged as rebased elsewhere: master has its
+    // change, not its commit.
+    let elsewhere = w.root.join("elsewhere");
+    let forge_common = w.forge_repo("swan-lake-common");
+    w.git(
+        &w.root,
+        &[
+            "clone",
+            "-q",
+            &forge_common.display().to_string(),
+            &elsewhere.display().to_string(),
+        ],
+    );
+    fs::write(elsewhere.join("other.txt"), "other").unwrap();
+    w.git(&elsewhere, &["add", "other.txt"]);
+    w.git(&elsewhere, &["commit", "-qm", "other"]);
+    fs::write(elsewhere.join("value.txt"), "c2").unwrap();
+    w.git(&elsewhere, &["commit", "-qam", "common: c2"]);
+    w.git(&elsewhere, &["push", "-q", "origin", "HEAD:master"]);
+    let rebased = w.git(&elsewhere, &["rev-parse", "HEAD"]);
+    merged("swan-lake-common", 4, "feature", &rebased);
+    let out = w.swl(&w.root, &publish, &[]);
+    failed(
+        &out,
+        2,
+        &format!(
+            "swan-lake-common@lib: swan-lake-common#4, the MR of feature, is merged (as {}), and \
+             feature is not on origin any more; HEAD has commits outside origin/master that the \
+             merge does not have (as they were before a rebase), so publishing would open a new \
+             MR for landed work: remove the workspace, or put new work on a new branch",
+            &rebased[..12]
+        ),
+    );
+    w.api.responses.lock().unwrap().clear();
+
+    // Likewise the consumer's branch.
+    let consumer_master = w.git(&w.forge_repo("swan-lake"), &["rev-parse", "master"]);
+    merged("swan-lake", 5, "feat", &rebased);
+    failed(
+        &w.swl(&w.root, &publish, &[]),
+        2,
+        "swan-lake: swan-lake#5, the MR of feat, is merged (as ",
+    );
+    // Nothing was pushed and no MR opened.
+    for (repo, branch) in [("swan-lake-common", "feature"), ("swan-lake", "feat")] {
+        let branches = w.git(
+            &w.forge_repo(repo),
+            &["branch", "--format=%(refname:short)"],
+        );
+        assert!(!branches.lines().any(|b| b == branch), "{repo}: {branches}");
+    }
+    assert!(!w.fj_log().contains("pr create"), "{}", w.fj_log());
+
+    // A merged MR whose merge HEAD has: the branch is new work after it.
+    merged("swan-lake", 5, "feat", &consumer_master);
+    w.api
+        .responses
+        .lock()
+        .unwrap()
+        .remove("/api/v1/repos/binarin/swan-lake-common/pulls/master/feature");
+    w.git(&w.common, &["rebase", "-q", "origin/master"]);
+    stdout(&w.swl(&w.root, &publish, &[]));
+    assert_eq!(
+        w.git(&w.forge_repo("swan-lake"), &["rev-parse", "feat"]),
+        w.git(&w.consumer, &["rev-parse", "HEAD"])
+    );
 }
