@@ -5,7 +5,7 @@
 
 mod support;
 
-use std::{fs, path::Path};
+use std::{fs, os::unix::fs::PermissionsExt, path::Path};
 
 use support::{Forge, stdout};
 
@@ -589,4 +589,109 @@ fn a_plain_lock_bump_is_not_a_landing() {
     let r = row(&out, "swan-lake");
     assert!(!r.contains("landing pushed"), "{out}");
     assert!(r.starts_with("swan-lake  CI pending"), "{out}");
+}
+
+#[test]
+fn status_shows_the_wrappers_swl_version_and_warns_when_it_differs() {
+    let f = Forge::new("status-version");
+    let work = f.root.join("work");
+    fs::create_dir_all(&work).unwrap();
+    stdout(&f.swl(&work, &["start", "SL-0013-v", "swan-lake"]));
+    let ws = work.join("SL-0013-v");
+    let ws_s = ws.display().to_string();
+    let status = || {
+        let out = f.swl(&f.root, &["status", "--workspace", &ws_s, "--no-fetch"]);
+        let err = String::from_utf8_lossy(&out.stderr).to_string();
+        (stdout(&out), err)
+    };
+    let version = stdout(
+        &std::process::Command::new(env!("CARGO_BIN_EXE_swl"))
+            .arg("--version")
+            .output()
+            .unwrap(),
+    );
+    let running = format!("running swl: {version} at ");
+
+    // `start` ran `swl env`: the wrappers exec this swl.
+    let (out, err) = status();
+    assert!(support::line(&out, &running).ends_with("/swl"), "{out}");
+    assert!(
+        support::line(&out, "wrappers' swl: ")
+            .starts_with(&format!("wrappers' swl: {version} at ")),
+        "{out}"
+    );
+    assert!(!err.contains("warning"), "{err}");
+
+    // The wrappers exec another swl, at a path that needs quoting.
+    let old_dir = f.root.join("old swl's");
+    fs::create_dir_all(&old_dir).unwrap();
+    let old = old_dir.join("swl");
+    fs::write(&old, "#!/bin/sh\necho 'swl 0.1.0'\n").unwrap();
+    fs::set_permissions(&old, fs::Permissions::from_mode(0o755)).unwrap();
+    let quoted = format!("'{}'", old.display().to_string().replace('\'', r"'\''"));
+    let nix = ws.join(".swl/bin/nix");
+    let wrapper = fs::read_to_string(&nix).unwrap();
+    let exec = support::line(&wrapper, "exec ");
+    let (_, rest) = exec["exec ".len()..].split_once(' ').unwrap();
+    fs::write(
+        &nix,
+        wrapper.replace(exec, &format!("exec {quoted} {rest}")),
+    )
+    .unwrap();
+    let (out, err) = status();
+    assert_eq!(
+        support::line(&out, "wrappers' swl: "),
+        format!("wrappers' swl: swl 0.1.0 at {}", old.display()),
+        "{out}"
+    );
+    assert!(
+        err.contains(&format!(
+            "swl status: warning: the wrappers exec swl 0.1.0, not the running {version}; rerun swl env"
+        )),
+        "{err}"
+    );
+
+    // Not executable, then gone.
+    fs::set_permissions(&old, fs::Permissions::from_mode(0o644)).unwrap();
+    let (out, err) = status();
+    assert!(
+        support::line(&out, "wrappers' swl: ").starts_with("wrappers' swl: unknown (running "),
+        "{out}"
+    );
+    assert!(
+        err.contains("warning: the wrappers' swl does not run (running ")
+            && err.contains("ermission denied")
+            && err.contains("; rerun swl env"),
+        "{err}"
+    );
+    fs::remove_file(&old).unwrap();
+    let (_, err) = status();
+    assert!(
+        err.contains("warning: the wrappers' swl does not run (running ")
+            && err.contains("No such file"),
+        "{err}"
+    );
+
+    // No wrappers yet: said, without a warning.
+    fs::remove_dir_all(ws.join(".swl/bin")).unwrap();
+    let (out, err) = status();
+    assert_eq!(
+        support::line(&out, "wrappers' swl: "),
+        format!(
+            "wrappers' swl: none yet ({} is missing; swl env writes it)",
+            nix.display()
+        ),
+        "{out}"
+    );
+    assert!(!err.contains("warning"), "{err}");
+
+    // `swl env` makes them exec this swl again.
+    stdout(&f.swl(&f.root, &["env", "--workspace", &ws_s]));
+    let (out, err) = status();
+    assert!(
+        support::line(&out, "wrappers' swl: ")
+            .starts_with(&format!("wrappers' swl: {version} at ")),
+        "{out}"
+    );
+    assert!(!err.contains("warning"), "{err}");
 }

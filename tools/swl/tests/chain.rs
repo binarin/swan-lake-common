@@ -465,6 +465,10 @@ fn three_level_chain_through_the_wrappers() {
     let common_rev = t.git(&common_src, &["rev-parse", "--short", "HEAD"]);
     let zw_rev = t.git(&t.src.join("zwanenzang"), &["rev-parse", "--short", "HEAD"]);
     let publish = "next: commit the changes, then swl publish swan-lake";
+    // After the rows, the running swl and the one the wrappers exec: this one.
+    let version = stdout(&t.swl(&["--version"]));
+    let swl = Path::new(env!("CARGO_BIN_EXE_swl")).canonicalize().unwrap();
+    let swl = swl.display();
     assert_eq!(
         status,
         format!(
@@ -478,7 +482,10 @@ swan-lake                                     no change (HEAD is in master)  wai
    └─ common/zwanenzang: zwanenzang@zwanenzang  local                       waits: anyone  {publish}
          input zwanenzang  HEAD {zw_rev}  detached  dirty
          swan-lake: common/zwanenzang locked {zw_rev}, ahead 0, behind 0
-         swan-lake-common@common: zwanenzang locked {zw_rev}, ahead 0, behind 0"
+         swan-lake-common@common: zwanenzang locked {zw_rev}, ahead 0, behind 0
+
+running swl: {version} at {swl}
+wrappers' swl: {version} at {swl}"
         )
     );
 

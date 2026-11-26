@@ -12,6 +12,7 @@ use std::{
     cell::OnceCell,
     collections::BTreeMap,
     fmt, fs,
+    io::Write,
     path::{Path, PathBuf},
 };
 
@@ -27,6 +28,7 @@ use crate::{
     manifest::{Entry, MANIFEST_FILE, Manifest},
     nix::Nix,
     start::{parse_from, parse_ls_remote, source_remote},
+    style::{self, Tone},
     tempdir::TempDir,
     workspace::{Checkout, Workspace},
     ws_add::{Fetcher, base_remote},
@@ -1326,7 +1328,27 @@ pub fn run(
     fetcher: &Fetcher,
 ) -> Result<()> {
     crate::status_tree::print(&collect(ws, config, reader, fetcher)?);
+    print_versions(ws);
     Ok(())
+}
+
+/// After the rows: the running swl's version and that of the swl the
+/// wrappers exec, with a warning when they differ.
+fn print_versions(ws: &Workspace) {
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("swl"));
+    let (lines, warning) = crate::version::status_lines(
+        &crate::version::line(),
+        &exe,
+        &crate::version::wrapped(&ws.root),
+    );
+    let mut stdout = anstream::stdout();
+    let _ = writeln!(stdout);
+    for l in lines {
+        let _ = writeln!(stdout, "{}", style::paint(style::DIM, l));
+    }
+    if let Some(w) = warning {
+        style::tell("swl status", Tone::Warn, w);
+    }
 }
 
 /// The rows of a workspace: shared checkouts, entries without one, then
