@@ -429,6 +429,9 @@ pub struct ConsumerFacts {
     /// The merged MR of the topic branch, which is gone on the remote, while
     /// HEAD has commits outside the base.
     pub merged_branch_mr: Option<MergedBranchMr>,
+    /// A lookup of an MR by branch (the workspace's, or the topic branch's)
+    /// that failed: why. The row stays as it is; land stops.
+    pub branch_mr_error: Option<String>,
 }
 
 /// A merged MR of a consumer's topic branch, which is gone on the remote,
@@ -891,23 +894,23 @@ impl Ctx<'_> {
     }
 
     /// The MR of `branch` into `base` in `repo`, in any state. A forge that
-    /// cannot be asked is a detail line and a warning, not the row's state.
+    /// cannot be asked is a detail line, a warning and `failed`, not the
+    /// row's state.
     fn branch_mr(
         &self,
         repo: &str,
         base: &str,
         branch: &str,
         details: &mut Vec<String>,
+        failed: &mut Option<String>,
     ) -> Option<PrInfo> {
         match self.reader.pr_of_branch(repo, base, branch) {
             Ok(info) => info,
             Err(e) => {
                 details.push(format!("MR of {branch}: unknown ({e:#})"));
-                style::tell(
-                    "swl",
-                    Tone::Warn,
-                    format!("warning: {repo}: cannot look up the MR of {branch}: {e:#}"),
-                );
+                let why = format!("cannot look up the MR of {branch}: {e:#}");
+                style::tell("swl", Tone::Warn, format!("warning: {repo}: {why}"));
+                failed.get_or_insert(why);
                 None
             }
         }
@@ -1315,6 +1318,7 @@ fn consumer_row(ctx: &Ctx, hops: &[Hop], ws: &Workspace, rows: &[Row], c: &Check
         let dirty = is_dirty(&c.dir)?;
         let mut workspace_mr = None;
         let mut merged_branch_mr = None;
+        let mut branch_mr_error = None;
         if remote.is_some() && state == RemoteBranch::Missing && ctx.fetcher.enabled() {
             let ws_branch = ws
                 .root
@@ -1326,7 +1330,8 @@ fn consumer_row(ctx: &Ctx, hops: &[Hop], ws: &Workspace, rows: &[Row], c: &Check
             // when its MR merged at HEAD, or HEAD has the merge commit.
             if clean_at_base
                 && let Some(t) = &topic
-                && let Some(info) = ctx.branch_mr(&c.name, base_branch, t, &mut details)
+                && let Some(info) =
+                    ctx.branch_mr(&c.name, base_branch, t, &mut details, &mut branch_mr_error)
                 && let PrState::Merged { merge_commit } = &info.state
                 && (info.head_sha == head || ancestor(&c.dir, merge_commit, &head) == Ok(true))
             {
@@ -1354,7 +1359,13 @@ fn consumer_row(ctx: &Ctx, hops: &[Hop], ws: &Workspace, rows: &[Row], c: &Check
             match (&topic, ws_branch) {
                 // At the base, not on the workspace's branch: is its MR open?
                 (t, Some(b)) if clean_at_base && !landed && t.as_ref() != Some(&b) => {
-                    match ctx.branch_mr(&c.name, base_branch, &b, &mut details) {
+                    match ctx.branch_mr(
+                        &c.name,
+                        base_branch,
+                        &b,
+                        &mut details,
+                        &mut branch_mr_error,
+                    ) {
                         Some(info) if info.state == PrState::Open => {
                             let which = format!("{}#{}", c.name, info.number);
                             details.push(land_from_note(&which, &b));
@@ -1366,7 +1377,8 @@ fn consumer_row(ctx: &Ctx, hops: &[Hop], ws: &Workspace, rows: &[Row], c: &Check
                 // Commits on a branch gone on the remote: did its MR merge
                 // without them (as rebased)?
                 (Some(t), _) if !head_in_base => {
-                    if let Some(info) = ctx.branch_mr(&c.name, base_branch, t, &mut details)
+                    if let Some(info) =
+                        ctx.branch_mr(&c.name, base_branch, t, &mut details, &mut branch_mr_error)
                         && let PrState::Merged { merge_commit } = &info.state
                     {
                         let which = format!("{}#{}", c.name, info.number);
@@ -1412,6 +1424,7 @@ fn consumer_row(ctx: &Ctx, hops: &[Hop], ws: &Workspace, rows: &[Row], c: &Check
             mr,
             workspace_mr,
             merged_branch_mr,
+            branch_mr_error,
         })
     })();
     match result {
@@ -1760,6 +1773,7 @@ pub fn collect_from(
             mr: MrFacts::Read { number: n, read },
             workspace_mr: None,
             merged_branch_mr: None,
+            branch_mr_error: None,
         })
     })();
     let row = row.map(|f| (consumer_verdict(&f), f));
@@ -2040,6 +2054,7 @@ mod tests {
             mr: MrFacts::None,
             workspace_mr: None,
             merged_branch_mr: None,
+            branch_mr_error: None,
         }
     }
 

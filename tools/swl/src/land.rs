@@ -776,6 +776,12 @@ impl Lander<'_> {
         if let (Stage::NoChange(_) | Stage::NotAChange(_), RowFacts::Consumer(f)) =
             (&row.verdict.stage, &row.facts)
         {
+            // Whether the workspace's MR is open, or this branch's merged,
+            // is unknown: landing the rest could remove the workspace
+            // without it.
+            if let Some(why) = &f.branch_mr_error {
+                return stop(Waits::Nobody, format!("{}: {why}; rerun {cmd}", c.name));
+            }
             // The workspace's open MR is not checked out: landing the rest
             // would remove the workspace without it.
             let Some((n, branch)) = &f.workspace_mr else {

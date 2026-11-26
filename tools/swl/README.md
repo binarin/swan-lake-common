@@ -821,7 +821,9 @@ A consumer at its base (`no change`, `not a change`) is skipped, unless the
 workspace's branch has an open MR in its repo (see [Status](#status)): then
 `land` stops there, for anyone, with `git -C <checkout> switch <branch>,
 then swl land` and the `swl land --from` alternative, before anything is
-merged or removed. When every consumer is at its base, the workspace does
+merged or removed. When that lookup (or the one of the consumer's own
+branch) fails, `land` stops there too, to rerun, rather than land the rest
+and remove the workspace. When every consumer is at its base, the workspace does
 not hold a change: `land` refuses, for anyone, saying where each consumer
 is, instead of saying it has nothing to land. The hint is not `swl land
 --from` alone because `start --from` keeps an existing checkout as it is:

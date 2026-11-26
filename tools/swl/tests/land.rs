@@ -553,6 +553,25 @@ fn land_refuses_a_workspace_whose_consumer_is_detached_at_the_base() {
     );
     assert!(!text(&out).contains("nothing to land"), "{}", text(&out));
 
+    // A forge that cannot be asked whether the workspace's MR is open:
+    // land stops, to rerun, and removes nothing.
+    let out = f.swl_env(
+        &f.root,
+        &["land", "--workspace", &ws_s, "--timeout", "0"],
+        &[
+            ("SWL_FJ_KEYS", &keys),
+            ("SWL_FORGE_API", "http://127.0.0.1:9/api/v1"),
+        ],
+    );
+    failed(&out, 5, ": cannot look up the MR of sl-0022-held: ");
+    assert!(text(&out).contains("; rerun swl land"), "{}", text(&out));
+    assert!(
+        !text(&out).contains("no consumer checkout holds a change"),
+        "{}",
+        text(&out)
+    );
+    assert!(ws.join("nixos-config").exists());
+
     // nixos-config#9 is open on the workspace's branch, which the checkout
     // is not on: switch it there, or land --from it elsewhere.
     let head = f.commit_on_forge("nixos-config", "sl-0022-held", "nixos-config-2");
