@@ -13,11 +13,14 @@ in
     let
       inherit (pkgs) lib;
       src = ../tools/swl;
+      # lastModifiedDate is YYYYMMDDHHMMSS, in UTC.
+      commitDate =
+        d: "${builtins.substring 0 4 d}-${builtins.substring 4 2 d}-${builtins.substring 6 2 d}";
     in
     {
       packages.swl = pkgs.rustPlatform.buildRustPackage {
         pname = "swl";
-        version = "0.1.0";
+        version = (builtins.fromTOML (builtins.readFile (src + "/Cargo.toml"))).package.version;
         src = lib.fileset.toSource {
           root = src;
           fileset = lib.fileset.unions [
@@ -28,6 +31,13 @@ in
           ];
         };
         cargoLock.lockFile = src + "/Cargo.lock";
+        # `swl --version` names the commit of common it is built from, so swl
+        # is rebuilt on every commit of common. A dirty tree gives the
+        # `-dirty` rev; a tree without a rev, `(unknown)`.
+        env.SWL_COMMIT = commonSelf.shortRev or commonSelf.dirtyShortRev or "";
+        env.SWL_COMMIT_DATE = lib.optionalString (
+          commonSelf ? lastModifiedDate
+        ) (commitDate commonSelf.lastModifiedDate);
         # swl runs git for worktrees and status, and curl for the forge API.
         # It is not wrapped with a PATH: the shim must find the caller's
         # nix, nh and deploy, and the generated wrappers exec this binary by

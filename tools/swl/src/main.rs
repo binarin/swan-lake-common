@@ -25,6 +25,7 @@ mod status;
 mod status_tree;
 mod style;
 mod tempdir;
+mod version;
 mod workspace;
 mod ws_add;
 
@@ -44,7 +45,7 @@ use crate::{
 #[derive(Parser)]
 #[command(
     name = "swl",
-    version,
+    version = version::VERSION.as_str(),
     about = "Swan Lake cross-repo workspaces: checkouts, input overrides, the nix/nh/deploy shims, manifests and CI"
 )]
 struct Cli {
