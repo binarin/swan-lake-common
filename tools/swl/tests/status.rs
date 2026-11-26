@@ -844,8 +844,9 @@ fn status_says_a_detached_consumer_is_not_a_change() {
 #[test]
 fn status_says_a_branch_whose_mr_merged_without_its_commits_is_merged() {
     let f = Forge::new("status-merged-branch");
-    // As with fetch.prune: the deleted branch goes from the source too.
-    f.git(&f.source("swan-lake"), &["config", "fetch.prune", "true"]);
+    // Without fetch.prune in the git config: status's fetch prunes the
+    // deleted branch's tracking branch itself.
+    f.git(&f.source("swan-lake"), &["config", "fetch.prune", "false"]);
     let work = f.root.join("work");
     fs::create_dir_all(&work).unwrap();
     stdout(&f.swl(&work, &["start", "SL-0031-rebased", "swan-lake"]));
@@ -877,7 +878,10 @@ fn status_says_a_branch_whose_mr_merged_without_its_commits_is_merged() {
         &merged,
         Some(&merged),
     );
+    let tracking = ["for-each-ref", "refs/remotes/origin/sl-0031-rebased"];
+    assert_ne!(f.git(&consumer, &tracking), "");
     let out = stdout(&f.swl(&f.root, &["status", "--workspace", &ws_s]));
+    assert_eq!(f.git(&consumer, &tracking), "", "{out}");
     assert_row(
         &out,
         "swan-lake",

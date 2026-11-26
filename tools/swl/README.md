@@ -94,7 +94,8 @@ terminal.
   in the repo's configured source, which can be a bare repository or a main
   checkout.
   - First it fetches the source's remote that the `base` names (`origin` for
-    `origin/master`), so that the new worktree starts at the current base. A
+    `origin/master`) with `git fetch --prune`, so that the new worktree
+    starts at the current base and no branch deleted there is joined. A
     base without a remote prefix is not fetched. `--no-fetch` skips the fetch
     for offline work; a failed fetch is an error, not a stale base.
   - Without `--branch`, the worktree is detached at `base`. With `--branch B`:
@@ -222,7 +223,9 @@ The next steps are `swl publish <consumer>` (anyone), `mark <repo>#N ready`
 (`fix CI`, anyone, while it fails).
 
 By default `status` fetches each checkout's remote (as `ws add` does, once
-per source) so that the stages are current, and finds a consumer's MR with
+per source, with `--prune`) so that the stages are current, also "gone on
+the remote" whatever the git config's `fetch.prune`, and finds a consumer's
+MR with
 `git ls-remote <remote> 'refs/pull/*/head'`; the mirror check fetches commit
 history only. `--no-fetch` uses the refs already known and looks up no
 consumer MR, by pull ref or by branch. A forge, network or git error makes

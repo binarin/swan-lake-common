@@ -39,8 +39,10 @@ impl Fetcher {
         self.enabled
     }
 
-    /// `git fetch <remote>` in the repository at `dir`, unless fetching is
-    /// off or that repository and remote were fetched already.
+    /// `git fetch --prune <remote>` in the repository at `dir`, unless
+    /// fetching is off or that repository and remote were fetched already.
+    /// Pruned, so that a branch gone on the remote is gone here too, as
+    /// status reads it, whatever the git config's `fetch.prune`.
     pub fn fetch(&self, dir: &Path, remote: &str) -> Result<()> {
         if !self.enabled {
             return Ok(());
@@ -51,7 +53,7 @@ impl Fetcher {
         if !self.done.borrow_mut().insert((common, remote.to_string())) {
             return Ok(());
         }
-        git(dir, &["fetch", "--quiet", remote]).with_context(|| {
+        git(dir, &["fetch", "--quiet", "--prune", remote]).with_context(|| {
             format!(
                 "fetching {remote} in {} (pass --no-fetch to work on the refs already known)",
                 dir.display()
