@@ -897,6 +897,39 @@ fn status_says_a_branch_whose_mr_merged_without_its_commits_is_merged() {
         "{out}"
     );
 
+    // A merge commit not known here: whether HEAD has it is unknown, so the
+    // workspace is not to be removed.
+    let unknown = "1".repeat(40);
+    let set = |merge_commit: &str| {
+        f.api.set_pr(
+            "swan-lake",
+            3,
+            "merged",
+            "refs/pull/3/head",
+            &merged,
+            Some(merge_commit),
+        )
+    };
+    set(&unknown);
+    let out = stdout(&f.swl(&f.root, &["status", "--workspace", &ws_s]));
+    assert_row(
+        &out,
+        "swan-lake",
+        "unknown (swan-lake#3: merged as 111111111111, 111111111111 is not known here)",
+        "check swan-lake#3 on the forge",
+        "anyone",
+    );
+    assert!(!out.contains("remove the workspace"), "{out}");
+    assert!(
+        detail(
+            &out,
+            "swan-lake#3: merged as 111111111111; whether HEAD has it is unknown"
+        )
+        .contains("111111111111 is not known here"),
+        "{out}"
+    );
+    set(&merged);
+
     // New work on the branch, after the merge: to publish.
     f.git(&consumer, &["reset", "-q", "--hard", "origin/master"]);
     fs::write(consumer.join("value.txt"), "consumer-3").unwrap();

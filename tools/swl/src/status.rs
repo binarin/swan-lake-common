@@ -427,8 +427,19 @@ pub struct ConsumerFacts {
     /// branch)`.
     pub workspace_mr: Option<(u64, String)>,
     /// The merged MR of the topic branch, which is gone on the remote, while
-    /// HEAD has commits outside the base that the merge commit is not in.
-    pub merged_branch_mr: Option<u64>,
+    /// HEAD has commits outside the base.
+    pub merged_branch_mr: Option<MergedBranchMr>,
+}
+
+/// A merged MR of a consumer's topic branch, which is gone on the remote,
+/// while HEAD has commits outside the base.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergedBranchMr {
+    /// Its merge commit is not in HEAD's history: the commits are from
+    /// before a rebase.
+    WithoutHead(u64),
+    /// Whether its merge commit is in HEAD's history is unknown: why.
+    Unknown(u64, String),
 }
 
 /// The step for a consumer checkout at its base that is not on the branch
@@ -489,10 +500,15 @@ pub fn consumer_verdict(f: &ConsumerFacts) -> Verdict {
             return at_base(Stage::NoChange(format!("HEAD is in {}", f.base)));
         }
         RemoteBranch::Missing => {
-            return match f.merged_branch_mr {
-                Some(n) => verdict(
+            return match &f.merged_branch_mr {
+                Some(MergedBranchMr::WithoutHead(n)) => verdict(
                     Stage::Merged,
                     format!("remove the workspace ({c}#{n} of {branch} is merged)"),
+                    Waits::Anyone,
+                ),
+                Some(MergedBranchMr::Unknown(n, why)) => verdict(
+                    Stage::Unknown(why.clone()),
+                    format!("check {c}#{n} on the forge"),
                     Waits::Anyone,
                 ),
                 None => publish.with_stage(Stage::Local),
@@ -1352,17 +1368,29 @@ fn consumer_row(ctx: &Ctx, hops: &[Hop], ws: &Workspace, rows: &[Row], c: &Check
                 (Some(t), _) if !head_in_base => {
                     if let Some(info) = ctx.branch_mr(&c.name, base_branch, t, &mut details)
                         && let PrState::Merged { merge_commit } = &info.state
-                        && ancestor(&c.dir, merge_commit, &head) != Ok(true)
                     {
-                        details.push(format!(
-                            "{}#{}: merged as {}; {t} is gone on the remote, and the merge \
-                             does not have HEAD's commits outside {base}: from before a rebase, \
-                             or new work for a new branch",
-                            c.name,
-                            info.number,
-                            short(merge_commit)
-                        ));
-                        merged_branch_mr = Some(info.number);
+                        let which = format!("{}#{}", c.name, info.number);
+                        let merged = format!("{which}: merged as {}", short(merge_commit));
+                        match ancestor(&c.dir, merge_commit, &head) {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                details.push(format!(
+                                    "{merged}; {t} is gone on the remote, and the merge does not \
+                                     have HEAD's commits outside {base}: from before a rebase, or \
+                                     new work for a new branch"
+                                ));
+                                merged_branch_mr = Some(MergedBranchMr::WithoutHead(info.number));
+                            }
+                            Err(e) => {
+                                details.push(format!(
+                                    "{merged}; whether HEAD has it is unknown ({e})"
+                                ));
+                                merged_branch_mr = Some(MergedBranchMr::Unknown(
+                                    info.number,
+                                    format!("{merged}, {e}"),
+                                ));
+                            }
+                        }
                     }
                 }
                 _ => {}
@@ -2276,12 +2304,28 @@ mod tests {
         assert_eq!(
             cv(ConsumerFacts {
                 remote: RemoteBranch::Missing,
-                merged_branch_mr: Some(3),
+                merged_branch_mr: Some(MergedBranchMr::WithoutHead(3)),
                 ..consumer()
             }),
             (
                 "merged".into(),
                 "remove the workspace (swan-lake#3 of sl-1-x is merged)".into(),
+                Waits::Anyone
+            )
+        );
+        // Whether HEAD has the merge commit is unknown: not to remove.
+        assert_eq!(
+            cv(ConsumerFacts {
+                remote: RemoteBranch::Missing,
+                merged_branch_mr: Some(MergedBranchMr::Unknown(
+                    3,
+                    "swan-lake#3: merged as 1c0ffee, 1c0ffee is not known here".into()
+                )),
+                ..consumer()
+            }),
+            (
+                "unknown (swan-lake#3: merged as 1c0ffee, 1c0ffee is not known here)".into(),
+                "check swan-lake#3 on the forge".into(),
                 Waits::Anyone
             )
         );

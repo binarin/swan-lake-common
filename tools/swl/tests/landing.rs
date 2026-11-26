@@ -1373,13 +1373,35 @@ fn publish_refuses_a_branch_whose_mr_merged_without_its_commits() {
     );
     w.api.responses.lock().unwrap().clear();
 
-    // Likewise the consumer's branch.
+    // Likewise the consumer's branch, merged as a later commit of master.
     let consumer_master = w.git(&w.forge_repo("swan-lake"), &["rev-parse", "master"]);
-    merged("swan-lake", 5, "feat", &rebased);
+    let consumer_elsewhere = w.root.join("consumer-elsewhere");
+    w.git(
+        &w.root,
+        &[
+            "clone",
+            "-q",
+            &w.forge_repo("swan-lake").display().to_string(),
+            &consumer_elsewhere.display().to_string(),
+        ],
+    );
+    fs::write(consumer_elsewhere.join("other.txt"), "other").unwrap();
+    w.git(&consumer_elsewhere, &["add", "other.txt"]);
+    w.git(&consumer_elsewhere, &["commit", "-qm", "other"]);
+    w.git(
+        &consumer_elsewhere,
+        &["push", "-q", "origin", "HEAD:master"],
+    );
+    let later = w.git(&consumer_elsewhere, &["rev-parse", "HEAD"]);
+    merged("swan-lake", 5, "feat", &later);
     failed(
         &w.swl(&w.root, &publish, &[]),
         2,
-        "swan-lake: swan-lake#5, the MR of feat, is merged (as ",
+        &format!(
+            "swan-lake: swan-lake#5, the MR of feat, is merged (as {}), and feat is not on \
+             origin any more",
+            &later[..12]
+        ),
     );
     // Nothing was pushed and no MR opened.
     for (repo, branch) in [("swan-lake-common", "feature"), ("swan-lake", "feat")] {
@@ -1407,29 +1429,30 @@ fn publish_refuses_a_branch_whose_mr_merged_without_its_commits() {
 
     // A branch whose HEAD is in the base has no commits that the merge
     // lacks: not refused, though its MR merged as a later commit of master.
-    let consumer_elsewhere = w.root.join("consumer-elsewhere");
-    w.git(
-        &w.root,
-        &[
-            "clone",
-            "-q",
-            &w.forge_repo("swan-lake").display().to_string(),
-            &consumer_elsewhere.display().to_string(),
-        ],
-    );
-    fs::write(consumer_elsewhere.join("other.txt"), "other").unwrap();
-    w.git(&consumer_elsewhere, &["add", "other.txt"]);
-    w.git(&consumer_elsewhere, &["commit", "-qm", "other"]);
-    w.git(
-        &consumer_elsewhere,
-        &["push", "-q", "origin", "HEAD:master"],
-    );
-    let later = w.git(&consumer_elsewhere, &["rev-parse", "HEAD"]);
     merged("swan-lake", 6, "at-base", &later);
     w.git(&w.consumer, &["switch", "-qc", "at-base", &consumer_master]);
     let out = stdout(&w.swl(&w.root, &publish, &[]));
     assert!(
         out.contains("swan-lake: HEAD is already in origin/master; no consumer MR to open"),
         "{out}"
+    );
+
+    // A merge commit not known here: whether HEAD has it is unknown, a
+    // warning, and the branch is published.
+    w.git(&w.consumer, &["switch", "-qc", "unknown-merge", "feat"]);
+    merged("swan-lake", 7, "unknown-merge", &"1".repeat(40));
+    let out = w.swl(&w.root, &publish, &[]);
+    stdout(&out);
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains(
+            "warning: swan-lake: swan-lake#7, the MR of unknown-merge, is merged as \
+             111111111111, which is not known here: whether HEAD has it is unknown"
+        ),
+        "{}",
+        text(&out)
+    );
+    assert_eq!(
+        w.git(&w.forge_repo("swan-lake"), &["rev-parse", "unknown-merge"]),
+        w.git(&w.consumer, &["rev-parse", "HEAD"])
     );
 }

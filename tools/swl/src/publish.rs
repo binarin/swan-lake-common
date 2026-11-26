@@ -130,6 +130,26 @@ fn refuse_merged(c: &Checkout, repo: &str, b: &Branch, reader: &dyn PrReader) ->
     let PrState::Merged { merge_commit } = &info.state else {
         return Ok(());
     };
+    let which = format!("{repo}#{}", info.number);
+    if git_ok(
+        &c.dir,
+        &["cat-file", "-e", &format!("{merge_commit}^{{commit}}")],
+    )
+    .is_none()
+    {
+        crate::style::tell(
+            "swl publish",
+            crate::style::Tone::Warn,
+            format!(
+                "warning: {}: {which}, the MR of {}, is merged as {}, which is not known here: \
+                 whether HEAD has it is unknown",
+                c.name,
+                b.name,
+                short(merge_commit)
+            ),
+        );
+        return Ok(());
+    }
     if git_ok(
         &c.dir,
         &["merge-base", "--is-ancestor", merge_commit, "HEAD"],
@@ -139,12 +159,11 @@ fn refuse_merged(c: &Checkout, repo: &str, b: &Branch, reader: &dyn PrReader) ->
         return Ok(());
     }
     bail!(
-        "{}: {repo}#{}, the MR of {}, is merged (as {}), and {} is not on origin any more; HEAD \
+        "{}: {which}, the MR of {}, is merged (as {}), and {} is not on origin any more; HEAD \
          has commits outside {} that the merge does not have (as they were before a rebase), so \
          publishing would open a new MR for landed work: remove the workspace, or put new work \
          on a new branch",
         c.name,
-        info.number,
         b.name,
         short(merge_commit),
         b.name,

@@ -208,7 +208,8 @@ the MR's shared entries not checked out in this one. A consumer with commits
 outside its base on a branch that is not on the remote is looked up
 likewise: when that branch's MR merged and its merge commit is not in HEAD's
 history (the commits from before a rebase), it is `merged`, next `remove the
-workspace`; with the merge commit in HEAD's history it is new work, `local`.
+workspace`; with the merge commit in HEAD's history it is new work, `local`;
+with a merge commit not known here, `unknown`, next to check the MR.
 A lookup that fails is a detail line and a warning; the row stays as it is.
 When no consumer holds a change (each is `no change` or `not a change`), a
 line after the rows says so. A consumer MR with entries is not merged on its
@@ -493,8 +494,8 @@ not on `origin`, with commits outside the base, whose MR, looked up as
 `status` does (`GET /repos/{owner}/{repo}/pulls/{base branch}/{branch}`,
 with fj's login for a private repo), merged without them (they predate a
 rebase): publishing would open a new MR for landed work, so remove the
-workspace, or put new work on a new branch (a lookup that fails is a
-warning). Also refused: a detached HEAD,
+workspace, or put new work on a new branch (a lookup that fails, or a merge
+commit not known here, is a warning). Also refused: a detached HEAD,
 the base branch itself (publish from a topic branch), a consumer branch that
 changes `flake.lock`, uncommitted changes to tracked files, and a branch on
 `origin` that HEAD does not contain (publish never force-pushes; fetch and rebase or merge). So a
