@@ -220,6 +220,21 @@ landing as `pushed`. A login the forge rejects makes the row
 then shows a row per `swl.toml` entry at its head and the consumer row. A
 cross-repo list of all open changes is not part of swl.
 
+For a workspace, after the rows, `status` names the running swl and the one
+the wrappers exec (see [Version](#version)):
+
+```
+running swl: swl 0.2.0 (abc1234 2026-11-26) at /nix/store/…-swl-0.2.0/bin/swl
+wrappers' swl: swl 0.2.0 (abc1234 2026-11-26) at /nix/store/…-swl-0.2.0/bin/swl
+```
+
+The wrappers' swl is the one `<ws>/.swl/bin/nix` execs, and its version is
+what it prints for `--version`. When the two versions differ, or that swl
+does not run (`wrappers' swl: unknown (<reason>)`: it is gone or not
+executable), a warning on stderr says to rerun `swl env`. Without wrappers
+yet the line says `none yet`, without a warning. `--from` prints neither
+line.
+
 ## Diagnostics
 
 `SWL_LOG` sets what swl logs on stderr, as a `tracing` filter: `debug`,
@@ -234,6 +249,29 @@ on stdin, which is not logged, and arguments that look like credentials
 (an `Authorization` header, a password in a URL, the value of an
 `access-tokens` option) are scrubbed. The shims (`swl shim`, `swl ci
 shim`) log nothing unless `SWL_LOG` is set; `SWL_SHIM_LOG` is separate.
+
+## Version
+
+`swl --version` prints one line: `swl 0.2.0 (abc1234 2026-11-26)`. First
+the version in `tools/swl/Cargo.toml`, the only place it is written (the
+package reads it from there). Then the short rev and the commit date (UTC)
+of the swan-lake-common commit the package is built from: the flake's
+`shortRev` and `lastModifiedDate`, which `modules/swl.nix` passes to the
+build as `SWL_COMMIT` and `SWL_COMMIT_DATE`. So swl is rebuilt on every
+commit of common. A build from a dirty tree shows the rev with `-dirty`
+(`abc1234-dirty`); a build without a rev, such as a plain `cargo build`,
+shows `swl 0.2.0 (unknown)`.
+
+Every MR that changes swl bumps its version in `Cargo.toml` (and the swl
+entry of `Cargo.lock`). Before 1.0: the minor version for a breaking change
+or a new feature, the patch version for a fix. swl's sources are the paths
+below `tools/swl` that `tools/swl/src-fileset.json` lists, which is also the
+source fileset of the package, and that list itself. The `swl version`
+workflow (`.forgejo/workflows/swl-version.yaml`) enforces the rule on MRs
+with `scripts/check-swl-version-bump.py`: when the MR changes a source
+since its merge base with the target branch, the version at its head must
+be greater, by semver precedence, than at the merge base and at the target
+branch; otherwise the job fails.
 
 ## Config
 
@@ -1025,8 +1063,8 @@ Limits:
   `nix-direnv-reload`.
 - The wrappers name the `swl` store path that ran `swl env`, which `env`
   keeps alive with the workspace's GC root. Rerun `swl env` after updating
-  swl; until then the wrappers run the old one. A swl run from outside the
-  store (a cargo build) is not rooted.
+  swl; until then the wrappers run the old one, and `status` warns about it.
+  A swl run from outside the store (a cargo build) is not rooted.
 - The nix option table is finite. The value of an unknown option can be taken
   for an installable, so the shim may then add overrides to a store-path call
   (harmless) or miss the default `.`. Before the subcommand, only words that
