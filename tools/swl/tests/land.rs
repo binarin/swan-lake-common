@@ -756,6 +756,64 @@ fn land_merges_an_mr_with_green_checks_directly() {
     assert_eq!(t.f.api.writes().len(), writes, "nothing more to write");
 }
 
+#[test]
+fn land_removes_the_workspace_when_fetch_prunes_the_merged_branch() {
+    let t = Change::new("land-prune");
+    // As in the user's git config: a fetch drops the tracking branches of
+    // the branches that a merge deleted.
+    for repo in ["swan-lake", "swan-lake-common"] {
+        t.f.git(&t.f.source(repo), &["config", "fetch.prune", "true"]);
+    }
+    t.mirror_at_once();
+    let c2 = t.common_head();
+    t.f.api.set_status("swan-lake-common", &c2, "success");
+    failed(&t.land(&[]), 5, "swan-lake#2 waits for CI, then it merges");
+    let landing = t.f.git(&t.consumer, &["rev-parse", "HEAD"]);
+    t.f.api.set_status("swan-lake", &landing, "success");
+
+    // The merge deleted the branch, and the fetch prunes it: the consumer
+    // is landed by the MR of its branch.
+    let ws = t.ws.display().to_string();
+    let status = stdout(&t.f.swl_env(
+        &t.f.root,
+        &["status", "--workspace", &ws],
+        &[("SWL_FJ_KEYS", &t.keys)],
+    ));
+    assert_eq!(
+        t.f.git(
+            &t.consumer,
+            &["for-each-ref", "refs/remotes/origin/sl-0020-land"]
+        ),
+        "",
+        "{status}"
+    );
+    let row = status
+        .lines()
+        .find(|l| l.starts_with("swan-lake "))
+        .unwrap();
+    assert!(
+        row.split_whitespace().collect::<Vec<_>>()[1..4] == ["landed", "waits:", "nobody"],
+        "{status}"
+    );
+    assert!(
+        status.contains(&format!(
+            "swan-lake#2: merged as {}; sl-0020-land is gone on the remote",
+            &landing[..12]
+        )),
+        "{status}"
+    );
+
+    let out = t.land(&[]);
+    let log = out_text(&out);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(log.contains("every MR of the change is merged"), "{log}");
+    assert!(
+        !log.contains("no consumer checkout holds a change"),
+        "{log}"
+    );
+    assert!(!t.ws.exists(), "{log}");
+}
+
 /// Forgejo's 405 for a branch protection `reason`.
 fn protected(reason: &str) -> MergeReply {
     MergeReply::Status(405, format!("not allowed to merge [reason: {reason}]"))

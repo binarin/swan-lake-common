@@ -1277,7 +1277,7 @@ fn consumer_row(ctx: &Ctx, hops: &[Hop], ws: &Workspace, rows: &[Row], c: &Check
         // The MR at the remote branch head. Not for a head already in the
         // base: that is landed by git alone, and an older merged MR can have
         // the same head (a new branch at master).
-        let mr = match (&remote, &remote_head) {
+        let mut mr = match (&remote, &remote_head) {
             (Some(r), Some(rh)) if !remote_in_base => ctx.consumer_mr(&c.dir, r, &c.name, rh),
             _ => MrFacts::None,
         };
@@ -1301,14 +1301,40 @@ fn consumer_row(ctx: &Ctx, hops: &[Hop], ws: &Workspace, rows: &[Row], c: &Check
                 .root
                 .file_name()
                 .map(|n| n.to_string_lossy().to_lowercase());
+            let clean_at_base = head_in_base && !dirty && unpublished_inputs.is_empty();
+            // A topic branch at the base, gone on the remote (as a merge
+            // deletes it, and a pruning fetch its tracking branch): landed
+            // when its MR merged at HEAD, or HEAD has the merge commit.
+            if clean_at_base
+                && let Some(t) = &topic
+                && let Some(info) = ctx.branch_mr(&c.name, base_branch, t, &mut details)
+                && let PrState::Merged { merge_commit } = &info.state
+                && (info.head_sha == head || ancestor(&c.dir, merge_commit, &head) == Ok(true))
+            {
+                let read = MrRead::Merged {
+                    merge_commit: merge_commit.clone(),
+                    promotion: None,
+                };
+                let which = format!("{}#{}", c.name, info.number);
+                details.push(format!(
+                    "{}; {t} is gone on the remote",
+                    describe_mr(&which, &read)
+                ));
+                mr = MrFacts::Read {
+                    number: info.number,
+                    read,
+                };
+            }
+            let landed = matches!(
+                mr,
+                MrFacts::Read {
+                    read: MrRead::Merged { .. },
+                    ..
+                }
+            );
             match (&topic, ws_branch) {
                 // At the base, not on the workspace's branch: is its MR open?
-                (t, Some(b))
-                    if head_in_base
-                        && !dirty
-                        && unpublished_inputs.is_empty()
-                        && t.as_ref() != Some(&b) =>
-                {
+                (t, Some(b)) if clean_at_base && !landed && t.as_ref() != Some(&b) => {
                     match ctx.branch_mr(&c.name, base_branch, &b, &mut details) {
                         Some(info) if info.state == PrState::Open => {
                             let which = format!("{}#{}", c.name, info.number);

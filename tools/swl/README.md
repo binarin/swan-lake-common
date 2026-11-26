@@ -186,7 +186,7 @@ The stages, in order:
 | `merged` | the MR is merged (its merge commit) | its branch is gone on the remote, and the MR of that branch merged without HEAD's commits outside the base (they predate a rebase): remove the workspace |
 | `promoted` | the merge commit is in the declared branch on the forge (`swan-lake-current` for common; an input without a ref is promoted when merged) | |
 | `landing pushed`, `landing pushed, CI failing` | | the MR is open, and its branch has no pending `swl.toml` entries, had some (its commits since the merge base touch `swl.toml`), and changes `flake.lock` |
-| `landed` | merged, and every consumer that names it in `swl.toml` has landed | the MR is merged, or both the local and the remote branch heads are in the base |
+| `landed` | merged, and every consumer that names it in `swl.toml` has landed | the MR is merged, or both the local and the remote branch heads are in the base, or the branch is gone on the remote (a merge deletes it) and HEAD, in the base, is the head of the branch's merged MR or has its merge commit |
 
 A shared checkout without an MR whose HEAD is in the rev each consumer
 locks, or already in its base, is `no MR needed`; a consumer on a topic
@@ -809,8 +809,9 @@ whom. Rerun it to continue. The steps:
    the generated `.envrc.local`, `.direnv/`, `result*` links and `.swl`),
    or with commits in neither the base nor its remote branch. Then `.swl`
    and the directory go. A workspace where no consumer landed through a
-   merged MR (its MR merged, or its pushed branch, now in the base, the
-   head of a merged MR) has nothing to land and stays.
+   merged MR (its MR merged, also once the merge deleted its branch and a
+   fetch pruned it, or its pushed branch, now in the base, the head of a
+   merged MR) has nothing to land and stays.
 
 A consumer at its base (`no change`, `not a change`) is skipped, unless the
 workspace's branch has an open MR in its repo (see [Status](#status)): then
@@ -1139,8 +1140,10 @@ Limits:
   does not show that a branch is behind its base; `refresh --dry-run`
   does.
 - `land` tells a landed consumer from the forge's pull refs and its
-  remote-tracking branch: with `fetch.prune` the pruned branch of a merged
-  MR is not seen, so the workspace stays; remove it by hand.
+  remote-tracking branch, or, once the merge deleted the branch, from the
+  MR of the branch (`GET /repos/{owner}/{repo}/pulls/{base}/{branch}`): a
+  topic branch at the base whose name an older, merged MR had, with its
+  merge commit in HEAD, reads as landed too.
 - `swl check` guards against mistakes, not against a hostile MR author: on
   `pull_request` the MR's own workflow runs it, with the swl of the MR's own
   lock (`nix run .#swl`), so the MR can change both. A hardened setup would
