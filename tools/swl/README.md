@@ -272,7 +272,12 @@ workflow (`.forgejo/workflows/swl-version.yaml`) enforces the rule on MRs
 with `scripts/check-swl-version-bump.py`: when the MR changes a source
 since its merge base with the target branch, the version at its head must
 be greater, by semver precedence, than at the merge base and at the target
-branch; otherwise the job fails.
+branch; otherwise the job fails. It runs when the MR is opened, pushed to,
+reopened or edited, so retargeting it checks it again. Every push to
+`master` runs the same check of the pushed master against master before the
+push: two MRs that made the same bump each pass against the old master, and
+the second to merge fails `master`, to be fixed with a further bump. The push
+that creates `master` is not checked.
 
 ## Config
 

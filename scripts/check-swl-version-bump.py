@@ -3,13 +3,14 @@
 
 Usage: check-swl-version-bump.py TARGET
 
-TARGET is the MR's target branch, e.g. origin/master; HEAD is the MR. The
-sources are the paths below tools/swl that tools/swl/src-fileset.json lists
-(the fileset of packages.swl in modules/swl.nix), and that list itself. When
-the MR changes any of them since its merge base with TARGET, the version in
-tools/swl/Cargo.toml at HEAD must be greater, as semver, than at the merge
-base and at TARGET. Exit status: 0 when it passes, 1 when it fails, 2 on
-errors.
+TARGET is the MR's target branch, e.g. origin/master, and HEAD is the MR;
+or, after a push to master, TARGET is the commit master was before it and
+HEAD is master. TARGET is any git revision. The sources are the paths below
+tools/swl that tools/swl/src-fileset.json lists (the fileset of packages.swl
+in modules/swl.nix), and that list itself. When HEAD changes any of them
+since its merge base with TARGET, the version in tools/swl/Cargo.toml at
+HEAD must be greater, as semver, than at the merge base and at TARGET. Exit
+status: 0 when it passes, 1 when it fails, 2 on errors.
 """
 import json
 import os

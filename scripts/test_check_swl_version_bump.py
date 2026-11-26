@@ -1,5 +1,6 @@
 """check-swl-version-bump.py against scratch git repos: an MR branch off
-master, checked with master as the target."""
+master, checked with master as the target, and a merge into master, checked
+with master before it as the target."""
 import os
 from pathlib import Path
 import subprocess
@@ -119,6 +120,34 @@ class CheckSwlVersionBump(unittest.TestCase):
         self.commit({"tools/swl/src-fileset.json":
                      '["Cargo.toml", "Cargo.lock", "build.rs", "src", "tests"]\n'})
         self.assert_fails("tools/swl/build.rs")
+
+    def merge_mr_into_master(self):
+        """Merges mr into master and checks out the merge detached, as the
+        push job of the workflow does; returns master before the merge."""
+        before = self.git("rev-parse", "master").strip()
+        self.git("checkout", "-q", "master")
+        self.git("merge", "-q", "--no-ff", "--no-edit", "mr")
+        self.git("checkout", "-q", "--detach", "master")
+        return before
+
+    def test_on_master_a_merge_with_a_bump_passes(self):
+        self.commit({"tools/swl/src/main.rs": "fn main() { }\n",
+                     "tools/swl/Cargo.toml": cargo_toml("0.3.0")})
+        code, out = self.check(target=self.merge_mr_into_master())
+        self.assertEqual(code, 0, out)
+
+    def test_on_master_a_second_merge_of_the_same_bump_fails(self):
+        # Two MRs off the same master both bump to 0.3.0, and each passed
+        # against it; the second to merge is no bump over the first.
+        self.commit({"tools/swl/src/main.rs": "fn main() { }\n",
+                     "tools/swl/Cargo.toml": cargo_toml("0.3.0")}, branch="master")
+        self.commit({"tools/swl/tests/t.rs": "\n",
+                     "tools/swl/Cargo.toml": cargo_toml("0.3.0")})
+        before = self.merge_mr_into_master()
+        code, out = self.check(target=before)
+        self.assertEqual(code, 1, out)
+        self.assertIn("swl changed (tools/swl/tests/t.rs), but its version 0.3.0 "
+                      "is not greater than 0.3.0 at the merge base", out)
 
     def test_bad_arguments_and_target_are_errors(self):
         code, _ = self.check(target="no-such-branch")

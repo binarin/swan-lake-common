@@ -1,10 +1,14 @@
 name: swl version
 on:
   pull_request:
-    types: [opened, synchronize, reopened]
+    # `edited`: retargeting the MR checks it against its new target.
+    types: [opened, synchronize, reopened, edited]
+  push:
+    branches: [master]
 jobs:
   swl-version-bump:
     name: swl version bump
+    if: github.event_name == 'pull_request'
     runs-on: native
     steps:
       # The whole history, with the target branch as origin/<base_ref>, for
@@ -16,3 +20,25 @@ jobs:
       - env:
           BASE_REF: ${{ github.base_ref }}
         run: nix shell --inputs-from . nixpkgs#python3 nixpkgs#git -c python3 scripts/check-swl-version-bump.py "origin/$BASE_REF"
+  # The same check of what a push to master added, against master before it:
+  # two MRs that made the same bump each pass against the old master, and the
+  # second to merge fails here.
+  swl-version-bump-master:
+    name: swl version bump on master
+    if: github.event_name == 'push'
+    runs-on: native
+    steps:
+      # The whole history, for the merge base with the pushed-over commit.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          # All zeros: the push created master, there is nothing before it.
+          case "$BEFORE" in
+            *[!0]*) ;;
+            *) echo "master is new: nothing to check against"; exit 0 ;;
+          esac
+          nix shell --inputs-from . nixpkgs#python3 nixpkgs#git -c python3 scripts/check-swl-version-bump.py "$BEFORE"
