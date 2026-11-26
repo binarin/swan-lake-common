@@ -183,7 +183,7 @@ The stages, in order:
 | `pushed` | pushed, but the MR cannot be read | pushed, and no MR yet, or it cannot be read (also with the landing commit pushed) |
 | `MR open`, `MR open (draft)` | the `swl.toml` entry's MR is open; a draft has a `WIP:` title or `draft` set | the MR whose `refs/pull/N/head` is the remote branch head (not looked up once that head is in the base) |
 | `CI pending`, `CI failing`, `CI green` | the combined commit status of the MR head | likewise |
-| `merged` | the MR is merged (its merge commit) | |
+| `merged` | the MR is merged (its merge commit) | its branch is gone on the remote, and the MR of that branch merged without HEAD's commits outside the base (they predate a rebase): remove the workspace |
 | `promoted` | the merge commit is in the declared branch on the forge (`swan-lake-current` for common; an input without a ref is promoted when merged) | |
 | `landing pushed`, `landing pushed, CI failing` | | the MR is open, and its branch has no pending `swl.toml` entries, had some (its commits since the merge base touch `swl.toml`), and changes `flake.lock` |
 | `landed` | merged, and every consumer that names it in `swl.toml` has landed | the MR is merged, or both the local and the remote branch heads are in the base |
@@ -201,13 +201,17 @@ when it is open, the next step is `git -C <consumer> switch <branch>, then
 swl land` (anyone), and a detail line names the other way, `swl land --from
 <consumer>#<MR>`: as `start --from`, it keeps an existing checkout as it is,
 so it makes a workspace of its own (`./<branch>`) and needs the branches of
-the MR's shared entries not checked out in this one. A lookup that fails is
-a detail line and a warning; the row stays as it is. When no consumer holds
-a change (each is `no change` or `not a change`), a line after the rows says
-so. A consumer MR with entries is not merged on its own: while its own step
-waits for the owner (merge) or nobody (CI), its next step waits for the
-entries' rows, then is `swl land` (see [Landing](#landing)). A draft or
-failing CI is its own step first.
+the MR's shared entries not checked out in this one. A consumer with commits
+outside its base on a branch that is not on the remote is looked up
+likewise: when that branch's MR merged and its merge commit is not in HEAD's
+history (the commits from before a rebase), it is `merged`, next `remove the
+workspace`; with the merge commit in HEAD's history it is new work, `local`.
+A lookup that fails is a detail line and a warning; the row stays as it is.
+When no consumer holds a change (each is `no change` or `not a change`), a
+line after the rows says so. A consumer MR with entries is not merged on its
+own: while its own step waits for the owner (merge) or nobody (CI), its next
+step waits for the entries' rows, then is `swl land` (see
+[Landing](#landing)). A draft or failing CI is its own step first.
 
 The next steps are `swl publish <consumer>` (anyone), `mark <repo>#N ready`
 (anyone), wait for CI (nobody), `merge <repo>#N` (owner),

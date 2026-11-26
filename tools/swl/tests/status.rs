@@ -840,3 +840,69 @@ fn status_says_a_detached_consumer_is_not_a_change() {
         "anyone",
     );
 }
+
+#[test]
+fn status_says_a_branch_whose_mr_merged_without_its_commits_is_merged() {
+    let f = Forge::new("status-merged-branch");
+    // As with fetch.prune: the deleted branch goes from the source too.
+    f.git(&f.source("swan-lake"), &["config", "fetch.prune", "true"]);
+    let work = f.root.join("work");
+    fs::create_dir_all(&work).unwrap();
+    stdout(&f.swl(&work, &["start", "SL-0031-rebased", "swan-lake"]));
+    let ws = work.join("SL-0031-rebased");
+    let ws_s = ws.display().to_string();
+    let consumer = ws.join("swan-lake");
+    fs::write(consumer.join("value.txt"), "consumer-2").unwrap();
+    f.git(&consumer, &["commit", "-qam", "consumer-2"]);
+    f.git(&consumer, &["push", "-q", "origin", "sl-0031-rebased"]);
+    let old = f.git(&consumer, &["rev-parse", "HEAD"]);
+    f.git(
+        &f.forge_repo("swan-lake"),
+        &["update-ref", "refs/pull/3/head", &old],
+    );
+    f.api
+        .set_pr("swan-lake", 3, "open", "sl-0031-rebased", &old, None);
+    // Elsewhere: rebased onto a newer master, pushed and merged; the branch
+    // is deleted. The local branch keeps the commit from before the rebase.
+    f.commit_file_on_forge("swan-lake", "master", "other.txt", "other");
+    let merged = f.commit_on_forge("swan-lake", "master", "consumer-2 rebased");
+    let forge = f.forge_repo("swan-lake");
+    f.git(&forge, &["update-ref", "refs/pull/3/head", &merged]);
+    f.git(&forge, &["update-ref", "-d", "refs/heads/sl-0031-rebased"]);
+    f.api.set_pr(
+        "swan-lake",
+        3,
+        "merged",
+        "refs/pull/3/head",
+        &merged,
+        Some(&merged),
+    );
+    let out = stdout(&f.swl(&f.root, &["status", "--workspace", &ws_s]));
+    assert_row(
+        &out,
+        "swan-lake",
+        "merged",
+        "remove the workspace (swan-lake#3 of sl-0031-rebased is merged)",
+        "anyone",
+    );
+    assert!(
+        detail(&out, "swan-lake#3: merged as ").contains(
+            "; sl-0031-rebased is gone on the remote, and the merge does not have HEAD's commits \
+             outside origin/master: from before a rebase, or new work for a new branch"
+        ),
+        "{out}"
+    );
+
+    // New work on the branch, after the merge: to publish.
+    f.git(&consumer, &["reset", "-q", "--hard", "origin/master"]);
+    fs::write(consumer.join("value.txt"), "consumer-3").unwrap();
+    f.git(&consumer, &["commit", "-qam", "consumer-3"]);
+    let out = stdout(&f.swl(&f.root, &["status", "--workspace", &ws_s]));
+    assert_row(
+        &out,
+        "swan-lake",
+        "local",
+        "swl publish swan-lake",
+        "anyone",
+    );
+}

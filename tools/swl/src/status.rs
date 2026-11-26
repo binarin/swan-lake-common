@@ -425,6 +425,9 @@ pub struct ConsumerFacts {
     /// the checkout is at its base on another branch or none: `(number,
     /// branch)`.
     pub workspace_mr: Option<(u64, String)>,
+    /// The merged MR of the topic branch, which is gone on the remote, while
+    /// HEAD has commits outside the base that the merge commit is not in.
+    pub merged_branch_mr: Option<u64>,
 }
 
 /// The step for a consumer checkout at its base that is not on the branch
@@ -482,7 +485,16 @@ pub fn consumer_verdict(f: &ConsumerFacts) -> Verdict {
         RemoteBranch::Missing if f.head_in_base && !f.dirty => {
             return at_base(Stage::NoChange(format!("HEAD is in {}", f.base)));
         }
-        RemoteBranch::Missing => return publish.with_stage(Stage::Local),
+        RemoteBranch::Missing => {
+            return match f.merged_branch_mr {
+                Some(n) => verdict(
+                    Stage::Merged,
+                    format!("remove the workspace ({c}#{n} of {branch} is merged)"),
+                    Waits::Anyone,
+                ),
+                None => publish.with_stage(Stage::Local),
+            };
+        }
         RemoteBranch::Behind if f.local_lock_change => {
             return verdict(
                 Stage::NeedsPublish,
@@ -1281,6 +1293,7 @@ fn consumer_row(ctx: &Ctx, hops: &[Hop], ws: &Workspace, rows: &[Row], c: &Check
         }
         let dirty = is_dirty(&c.dir)?;
         let mut workspace_mr = None;
+        let mut merged_branch_mr = None;
         if remote.is_some() && state == RemoteBranch::Missing && ctx.fetcher.enabled() {
             let ws_branch = ws
                 .root
@@ -1296,6 +1309,24 @@ fn consumer_row(ctx: &Ctx, hops: &[Hop], ws: &Workspace, rows: &[Row], c: &Check
                             workspace_mr = Some((info.number, b));
                         }
                         _ => {}
+                    }
+                }
+                // Commits on a branch gone on the remote: did its MR merge
+                // without them (as rebased)?
+                (Some(t), _) if !head_in_base => {
+                    if let Some(info) = ctx.branch_mr(&c.name, base_branch, t, &mut details)
+                        && let PrState::Merged { merge_commit } = &info.state
+                        && ancestor(&c.dir, merge_commit, &head) != Ok(true)
+                    {
+                        details.push(format!(
+                            "{}#{}: merged as {}; {t} is gone on the remote, and the merge \
+                             does not have HEAD's commits outside {base}: from before a rebase, \
+                             or new work for a new branch",
+                            c.name,
+                            info.number,
+                            short(merge_commit)
+                        ));
+                        merged_branch_mr = Some(info.number);
                     }
                 }
                 _ => {}
@@ -1316,6 +1347,7 @@ fn consumer_row(ctx: &Ctx, hops: &[Hop], ws: &Workspace, rows: &[Row], c: &Check
             entries: entry_verdicts(&manifest, rows),
             mr,
             workspace_mr,
+            merged_branch_mr,
         })
     })();
     match result {
@@ -1663,6 +1695,7 @@ pub fn collect_from(
             entries: entry_verdicts(&manifest, &rows),
             mr: MrFacts::Read { number: n, read },
             workspace_mr: None,
+            merged_branch_mr: None,
         })
     })();
     let row = row.map(|f| (consumer_verdict(&f), f));
@@ -1942,6 +1975,7 @@ mod tests {
             entries: Vec::new(),
             mr: MrFacts::None,
             workspace_mr: None,
+            merged_branch_mr: None,
         }
     }
 
@@ -2177,6 +2211,19 @@ mod tests {
             })
             .0,
             "local"
+        );
+        // Commits on a branch whose MR merged without them.
+        assert_eq!(
+            cv(ConsumerFacts {
+                remote: RemoteBranch::Missing,
+                merged_branch_mr: Some(3),
+                ..consumer()
+            }),
+            (
+                "merged".into(),
+                "remove the workspace (swan-lake#3 of sl-1-x is merged)".into(),
+                Waits::Anyone
+            )
         );
     }
 
