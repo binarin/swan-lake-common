@@ -459,7 +459,8 @@ fn three_level_chain_through_the_wrappers() {
     );
 
     // status: the consumer's tree, the nested input under its parent; per
-    // shared checkout, the rev each flake in the workspace locks.
+    // shared checkout, the rev each flake in the workspace locks. The
+    // consumer uses the uncommitted changes of both checkouts: local.
     let status = stdout(&t.swl(&["status"]));
     let consumer_rev = t.git(&consumer, &["rev-parse", "--short", "HEAD"]);
     let common_rev = t.git(&common_src, &["rev-parse", "--short", "HEAD"]);
@@ -473,18 +474,17 @@ fn three_level_chain_through_the_wrappers() {
         status,
         format!(
             "\
-swan-lake                                     not a change (detached at master)  waits: nobody  next: -
+swan-lake                                     local  waits: anyone  next: check out a topic branch, then swl publish swan-lake
 │  HEAD {consumer_rev}  detached  clean
 │  no pending swl.toml entries
-└─ common: swan-lake-common@common            local                       waits: anyone  {publish}
+│  changed without a swl.toml entry: common, common/zwanenzang
+└─ common: swan-lake-common@common            local  waits: anyone  {publish}
    │  input common  HEAD {common_rev}  feature  dirty
    │  swan-lake: common locked {common_rev}, ahead 0, behind 0
-   └─ common/zwanenzang: zwanenzang@zwanenzang  local                       waits: anyone  {publish}
+   └─ common/zwanenzang: zwanenzang@zwanenzang  local  waits: anyone  {publish}
          input zwanenzang  HEAD {zw_rev}  detached  dirty
          swan-lake: common/zwanenzang locked {zw_rev}, ahead 0, behind 0
          swan-lake-common@common: zwanenzang locked {zw_rev}, ahead 0, behind 0
-
-no consumer checkout holds a change: none has commits of its own or a pushed branch (swan-lake: not a change (detached at master))
 
 running swl: {version} at {swl}
 wrappers' swl: {version} at {swl}"

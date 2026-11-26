@@ -195,8 +195,8 @@ branch that is not on the remote, with its HEAD in its base, is `no change`.
 A consumer that is detached or on its base branch, at a commit of its base
 (as `swl ws add` leaves it), is `not a change (detached at origin/master)`:
 it does not hold the change. A consumer that uses an overridden checkout
-changed without a `swl.toml` entry is neither: it is `local`, as with
-commits of its own. For a consumer at its base that is not on the
+changed without a `swl.toml` entry (commits, or uncommitted changes to
+tracked files) is neither: it is `local`, as with commits of its own. For a consumer at its base that is not on the
 workspace's branch (the workspace's directory name lower-cased, the branch
 `swl start` makes), `status` asks the forge for that branch's MR in the
 consumer's repo (`GET /repos/{owner}/{repo}/pulls/{base branch}/{branch}`);

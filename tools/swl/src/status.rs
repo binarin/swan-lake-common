@@ -415,7 +415,8 @@ pub struct ConsumerFacts {
     /// The remote branch has no pending swl.toml entries, removed some, and
     /// changes flake.lock: the landing commit is pushed.
     pub landing_pushed: bool,
-    /// Overridden inputs whose checkout HEAD is changed and has no entry.
+    /// Overridden inputs whose checkout is changed (its HEAD, or
+    /// uncommitted changes to tracked files) and has no entry.
     pub unpublished_inputs: Vec<String>,
     /// The swl.toml entries' rows: `repo#n` and their verdicts.
     pub entries: Vec<(String, Verdict)>,
@@ -1251,9 +1252,11 @@ fn consumer_row(ctx: &Ctx, hops: &[Hop], ws: &Workspace, rows: &[Row], c: &Check
                 continue;
             };
             let ch = git(&checkout.dir, &["rev-parse", "HEAD"])?;
-            if h.locked.as_deref() == Some(ch.as_str())
-                || manifest.inputs.contains_key(&h.input_path)
-                || ancestor(&checkout.dir, &ch, ctx.config.base_for(repo)) == Ok(true)
+            // Uncommitted changes are a change too: Nix builds them.
+            if manifest.inputs.contains_key(&h.input_path)
+                || (!is_dirty(&checkout.dir)?
+                    && (h.locked.as_deref() == Some(ch.as_str())
+                        || ancestor(&checkout.dir, &ch, ctx.config.base_for(repo)) == Ok(true)))
             {
                 continue;
             }
