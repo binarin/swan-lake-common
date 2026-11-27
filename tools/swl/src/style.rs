@@ -80,6 +80,16 @@ pub fn paint(style: Style, text: impl Display) -> String {
     format!("{}{text}{}", style.render(), style.render_reset())
 }
 
+/// The width of `s` in a column: its characters.
+pub fn width(s: &str) -> usize {
+    s.chars().count()
+}
+
+/// The spaces that pad a cell `used` wide to `w`.
+pub fn pad(w: usize, used: usize) -> String {
+    " ".repeat(w.saturating_sub(used))
+}
+
 fn line(prefix: &str, tone: Tone, msg: impl Display) -> String {
     format!("{}: {}", paint(PREFIX, prefix), paint(tone.style(), msg))
 }

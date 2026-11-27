@@ -1,6 +1,6 @@
 //! The forge's open MRs across the configured repos, grouped by change:
-//! by the ticket ID in their branch (`SL-NNNN`), else by branch. `swl ls`
-//! lists those that no workspace holds.
+//! by the ticket ID in their branch (`SL-NNNN`), else by branch, and their
+//! listing's lines. `swl ls` lists those that no workspace holds.
 
 use std::{cmp::Ordering, collections::BTreeMap};
 
@@ -8,6 +8,7 @@ use crate::{
     bump::{BUMP_BRANCH, COMMON_REPO},
     config::Config,
     forge::{PrInfo, PrReader},
+    style::{BOLD, DIM, pad, paint, width},
     workspace_location::{ticket_in, ticket_spelling},
 };
 
@@ -177,6 +178,78 @@ impl Held {
             .is_some_and(|bs| bs.contains(&mr.info.head_ref))
             || self.entries.contains(&mr.which())
     }
+}
+
+/// The `swl start --from` line of a group.
+pub fn start_line(group: &Group, consumers: &Result<Vec<String>, String>) -> String {
+    let consumers = match consumers {
+        Ok(c) => c,
+        Err(e) => return format!("unknown which repos are consumers ({e})"),
+    };
+    match group.start_from(consumers) {
+        Some((from, _)) if from.repo == COMMON_REPO && !consumers.contains(&from.repo) => {
+            format!(
+                "swl start --from {} (only shared-repo MRs: common alone, as the consumer)",
+                from.which()
+            )
+        }
+        Some((from, others)) if others.is_empty() => {
+            format!("swl start --from {}", from.which())
+        }
+        Some((from, others)) => format!(
+            "swl start --from {} (also {})",
+            from.which(),
+            others
+                .iter()
+                .map(|m| m.which())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        None => "only shared-repo MRs: no consumer MR to swl start --from".to_string(),
+    }
+}
+
+/// The groups' lines: the group, then per MR `<repo>#<n>[ (bump)]  open
+/// [(draft)]  <branch>  <title>`, then the `swl start --from` line.
+pub fn lines(groups: &[Group], consumers: &Result<Vec<String>, String>) -> Vec<String> {
+    let mrs: Vec<&OpenMr> = groups.iter().flat_map(|g| &g.mrs).collect();
+    let which = |m: &OpenMr| {
+        if m.is_bump() {
+            format!("{} (bump)", m.which())
+        } else {
+            m.which()
+        }
+    };
+    let state = |m: &OpenMr| if m.info.draft { "open (draft)" } else { "open" };
+    let which_w = mrs.iter().map(|m| width(&which(m))).max().unwrap_or(0);
+    let state_w = mrs.iter().map(|m| width(state(m))).max().unwrap_or(0);
+    let branch_w = mrs
+        .iter()
+        .map(|m| width(&m.info.head_ref))
+        .max()
+        .unwrap_or(0);
+    let mut out = Vec::new();
+    for g in groups {
+        out.push(format!("  {}", paint(BOLD, g.label())));
+        for m in &g.mrs {
+            let w = which(m);
+            let s = state(m);
+            let b = &m.info.head_ref;
+            out.push(
+                format!(
+                    "    {w}{}  {s}{}  {b}{}  {}",
+                    pad(which_w, width(&w)),
+                    pad(state_w, width(s)),
+                    pad(branch_w, width(b)),
+                    m.info.title
+                )
+                .trim_end()
+                .to_string(),
+            );
+        }
+        out.push(paint(DIM, format!("    {}", start_line(g, consumers))));
+    }
+    out
 }
 
 #[cfg(test)]

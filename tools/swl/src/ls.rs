@@ -9,15 +9,15 @@ use std::{io::Write, path::Path};
 use anyhow::{Result, bail};
 
 use crate::{
-    bump::{COMMON_REPO, consumer_names},
+    bump::consumer_names,
     config::Config,
     forge::{CiState, ForgeReader, PrInfo, PrReader},
     git::git_ok,
     manifest::Manifest,
-    open_mrs::{self, Group, Held, OpenMr},
+    open_mrs::{self, Held},
     status::{self, Row, Stage, Verdict, Waits},
     status_tree::verdict_style,
-    style::{BOLD, DIM, OWNER, paint},
+    style::{BOLD, DIM, OWNER, pad, paint, width},
     workspace::Workspace,
     workspace_location::directories,
     ws_add::Fetcher,
@@ -116,21 +116,40 @@ fn summary(ws: &Workspace, rows: &[Row]) -> Verdict {
 }
 
 /// What the workspace holds of the forge's MRs: its checkouts' branches,
-/// and its consumers' `swl.toml` entries.
+/// the workspace's branch (its name lower-cased, as `swl start` names
+/// branches) in its consumers' repos, also with the checkout detached or on
+/// another branch, and its consumers' `swl.toml` entries.
 fn hold(ws: &Workspace, held: &mut Held) {
+    let ws_branch = ws
+        .root
+        .file_name()
+        .map(|n| n.to_string_lossy().to_lowercase());
     for c in &ws.checkouts {
         let repo = c
             .shared
             .as_ref()
             .map_or(c.name.as_str(), |(r, _)| r.as_str());
+        let branches = held.branches.entry(repo.to_string()).or_default();
         if let Some(b) = git_ok(&c.dir, &["symbolic-ref", "--quiet", "--short", "HEAD"]) {
-            held.branches.entry(repo.to_string()).or_default().push(b);
+            branches.push(b);
         }
-        if c.is_consumer()
-            && let Ok(Some(m)) = Manifest::read(&c.dir)
-        {
-            held.entries
-                .extend(m.inputs.values().map(|e| format!("{}#{}", e.repo, e.mr)));
+        if !c.is_consumer() {
+            continue;
+        }
+        branches.extend(ws_branch.clone());
+        match Manifest::read(&c.dir) {
+            Ok(Some(m)) => held
+                .entries
+                .extend(m.inputs.values().map(|e| format!("{}#{}", e.repo, e.mr))),
+            Ok(None) => {}
+            Err(e) => {
+                tracing::debug!(
+                    target: "swl::ls",
+                    checkout = %c.name,
+                    error = %format!("{e:#}"),
+                    "its entries hold nothing"
+                );
+            }
         }
     }
 }
@@ -180,14 +199,6 @@ fn workspace_line(
     }
 }
 
-fn width(s: &str) -> usize {
-    s.chars().count()
-}
-
-fn pad(w: usize, used: usize) -> String {
-    " ".repeat(w.saturating_sub(used))
-}
-
 /// `<name>  [removable]  <stage>  waits: <who>  next: <step>`, the columns
 /// aligned and coloured as `status` colours a row.
 fn local_lines(lines: &[WorkspaceLine]) -> Vec<String> {
@@ -228,78 +239,6 @@ fn local_lines(lines: &[WorkspaceLine]) -> Vec<String> {
                 v.next.clone()
             },
         ));
-    }
-    out
-}
-
-/// The `swl start --from` line of a group.
-fn start_line(group: &Group, consumers: &Result<Vec<String>, String>) -> String {
-    let consumers = match consumers {
-        Ok(c) => c,
-        Err(e) => return format!("unknown which repos are consumers ({e})"),
-    };
-    match group.start_from(consumers) {
-        Some((from, _)) if from.repo == COMMON_REPO && !consumers.contains(&from.repo) => {
-            format!(
-                "swl start --from {} (only shared-repo MRs: common alone, as the consumer)",
-                from.which()
-            )
-        }
-        Some((from, others)) if others.is_empty() => {
-            format!("swl start --from {}", from.which())
-        }
-        Some((from, others)) => format!(
-            "swl start --from {} (also {})",
-            from.which(),
-            others
-                .iter()
-                .map(|m| m.which())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-        None => "only shared-repo MRs: no consumer MR to swl start --from".to_string(),
-    }
-}
-
-/// The groups' lines: the group, then per MR `<repo>#<n>[ (bump)]  open
-/// [(draft)]  <branch>  <title>`, then the `swl start --from` line.
-fn forge_lines(groups: &[Group], consumers: &Result<Vec<String>, String>) -> Vec<String> {
-    let mrs: Vec<&OpenMr> = groups.iter().flat_map(|g| &g.mrs).collect();
-    let which = |m: &OpenMr| {
-        if m.is_bump() {
-            format!("{} (bump)", m.which())
-        } else {
-            m.which()
-        }
-    };
-    let state = |m: &OpenMr| if m.info.draft { "open (draft)" } else { "open" };
-    let which_w = mrs.iter().map(|m| width(&which(m))).max().unwrap_or(0);
-    let state_w = mrs.iter().map(|m| width(state(m))).max().unwrap_or(0);
-    let branch_w = mrs
-        .iter()
-        .map(|m| width(&m.info.head_ref))
-        .max()
-        .unwrap_or(0);
-    let mut out = Vec::new();
-    for g in groups {
-        out.push(format!("  {}", paint(BOLD, g.label())));
-        for m in &g.mrs {
-            let w = which(m);
-            let s = state(m);
-            let b = &m.info.head_ref;
-            out.push(
-                format!(
-                    "    {w}{}  {s}{}  {b}{}  {}",
-                    pad(which_w, width(&w)),
-                    pad(state_w, width(s)),
-                    pad(branch_w, width(b)),
-                    m.info.title
-                )
-                .trim_end()
-                .to_string(),
-            );
-        }
-        out.push(paint(DIM, format!("    {}", start_line(g, consumers))));
     }
     out
 }
@@ -351,7 +290,7 @@ pub fn run(config: &Config, no_fetch: bool) -> Result<()> {
     } else {
         consumer_names(config, &fetcher).map_err(|e| format!("{e:#}"))
     };
-    for l in forge_lines(&groups, &consumers) {
+    for l in open_mrs::lines(&groups, &consumers) {
         let _ = writeln!(stdout, "{l}");
     }
     for (repo, why) in &listing.unread {

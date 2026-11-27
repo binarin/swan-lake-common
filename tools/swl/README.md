@@ -390,8 +390,11 @@ as the fetch left them, from git alone.
 Then the open MRs (drafts too, by anyone) of every repo of the config,
 from `GET /repos/{owner}/{repo}/pulls?state=open` (read as `status` reads
 the forge, see [Forge access](#forge-access)), but those that a workspace
-holds: an MR is held when a checkout of its repo is on its branch, or a
-consumer's `swl.toml` in a workspace names it. They are grouped by the
+holds: an MR is held when a checkout of its repo is on its branch, when it
+is of a consumer repo of a workspace on the workspace's branch (its name
+lower-cased, the branch `swl start` makes; also with that checkout detached
+or on another branch), or when a consumer's `swl.toml` in a workspace names
+it (a `swl.toml` that cannot be read names none, logged at debug). They are grouped by the
 ticket ID in their branch (`SL-NNNN`, anywhere in it after a character
 that is not a letter or digit, compared case-insensitively and without
 leading zeros, as workspace names are; shown as the first MR's branch spells
@@ -1372,9 +1375,10 @@ are not.
   it takes as long as their `status` runs together (less the repeated
   fetches); `--no-fetch` is the quick view. It lists up to 20 pages of 50
   open MRs per repo. Which MRs a workspace holds it tells by its checkouts'
-  branches and its `swl.toml` entries only: an MR of the workspace's
-  ticket on a repo it has no checkout of, and that no entry names, is
-  listed.
+  branches, the workspace's branch in its consumer repos and its
+  `swl.toml` entries only: an MR of the workspace's ticket on a repo it
+  has no consumer checkout of, on another branch than its checkout's, and
+  that no entry names, is listed.
 - `land` follows one change in one workspace, step by step: an MR that waits
   for CI stops the run, also when later MRs could proceed. It knows a
   merge's outcome from Forgejo's answer (200 merged, 201 scheduled, 409

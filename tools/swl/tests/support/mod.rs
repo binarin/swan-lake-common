@@ -110,6 +110,8 @@ pub struct FakeApi {
     /// with `follow_pull_refs`, the heads of open MRs.
     pub forge: Arc<Mutex<Option<PathBuf>>>,
     pub follow_pull_refs: Arc<Mutex<bool>>,
+    /// Repos whose reads answer this HTTP status, with [`FakeApi::fail_reads`].
+    pub failing: Arc<Mutex<BTreeMap<String, u16>>>,
 }
 
 fn git_in(dir: &Path, args: &[&str]) -> Option<String> {
@@ -200,6 +202,9 @@ impl FakeApi {
                 return status(401, "Unauthorized");
             }
             return self.write(method, path, &repo, body);
+        }
+        if let Some(code) = self.failing.lock().unwrap().get(&repo) {
+            return (format!("{code} Failing"), r#"{"message":"failing"}"#.into());
         }
         let allowed = !self.private.lock().unwrap().contains(&repo) || good;
         // Like Forgejo, a commit without statuses has an empty
@@ -557,6 +562,11 @@ impl FakeApi {
 
     pub fn base(&self) -> String {
         format!("http://127.0.0.1:{}/api/v1", self.port)
+    }
+
+    /// Every read (GET) of `repo` answers `code`, as a broken forge does.
+    pub fn fail_reads(&self, repo: &str, code: u16) {
+        self.failing.lock().unwrap().insert(repo.to_string(), code);
     }
 
     pub fn make_private(&self, repo: &str) {

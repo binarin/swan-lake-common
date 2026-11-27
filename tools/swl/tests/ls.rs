@@ -225,6 +225,23 @@ fn ls_groups_the_open_mrs_no_workspace_holds_by_ticket_or_branch() {
     );
     assert!(!lines.iter().any(|l| l.starts_with("swan-lake#")), "{anon}");
 
+    // A repo that answers another error than a 404: not read, with why; the
+    // other repos list.
+    f.api.fail_reads("zwanenzang", 500);
+    let out = stdout(&f.swl_env(&f.root, &["ls"], &[("SWL_FJ_KEYS", &keys)]));
+    let lines = forge_lines(&out);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with("zwanenzang: not read (") && l.contains("500")),
+        "{out}"
+    );
+    assert!(!lines.iter().any(|l| l.starts_with("zwanenzang#")), "{out}");
+    assert!(
+        lines.contains(&"swan-lake#6  open  feature-x  t".to_string()),
+        "{out}"
+    );
+
     // --no-fetch: the workspaces only, and no request to the forge.
     f.api.requests.lock().unwrap().clear();
     let out = stdout(&f.swl_env(&f.root, &["ls", "--no-fetch"], &[("SWL_FJ_KEYS", &keys)]));
@@ -247,4 +264,153 @@ fn ls_groups_the_open_mrs_no_workspace_holds_by_ticket_or_branch() {
         .map(|r| r.path.clone())
         .collect();
     assert!(seen.is_empty(), "forge requests with --no-fetch: {seen:?}");
+}
+
+#[test]
+fn ls_lines_of_published_workspaces_online_and_offline() {
+    let f = Forge::new("ls-published");
+    f.add_consumer("nixos-config");
+    let work = f.root.join("work");
+    fs::create_dir_all(&work).unwrap();
+    stdout(&f.swl(&work, &["start", "SL-0020-pushed", "swan-lake"]));
+    stdout(&f.swl(&work, &["start", "SL-0021-ci", "swan-lake"]));
+    stdout(&f.swl(
+        &work,
+        &["start", "SL-0022-two", "swan-lake", "nixos-config"],
+    ));
+    stdout(&f.swl(&work, &["start", "SL-0023-held", "swan-lake"]));
+    let commit = |dir: &std::path::Path, value: &str| {
+        fs::write(dir.join("value.txt"), value).unwrap();
+        f.git(dir, &["commit", "-qam", value]);
+        f.git(dir, &["rev-parse", "HEAD"])
+    };
+    let open_mr = |repo: &str, n: u64, branch: &str, head: &str| {
+        f.git(
+            &f.forge_repo(repo),
+            &["update-ref", &format!("refs/pull/{n}/head"), head],
+        );
+        f.api.set_pr(repo, n, "open", branch, head, None);
+    };
+
+    // Pushed, no MR.
+    let pushed = work.join("SL-0020-pushed/swan-lake");
+    commit(&pushed, "p2");
+    f.git(&pushed, &["push", "-q", "origin", "sl-0020-pushed"]);
+
+    // An MR with CI green.
+    let ci = work.join("SL-0021-ci/swan-lake");
+    let head = commit(&ci, "ci2");
+    f.git(&ci, &["push", "-q", "origin", "sl-0021-ci"]);
+    open_mr("swan-lake", 2, "sl-0021-ci", &head);
+    f.api.set_status("swan-lake", &head, "success");
+
+    // Two consumers: swan-lake's MR with CI green; nixos-config's MR merged
+    // as rebased elsewhere and its branch deleted, while the local branch
+    // was rebased onto a newer master.
+    let two = work.join("SL-0022-two");
+    let head = commit(&two.join("swan-lake"), "two2");
+    f.git(
+        &two.join("swan-lake"),
+        &["push", "-q", "origin", "sl-0022-two"],
+    );
+    open_mr("swan-lake", 3, "sl-0022-two", &head);
+    f.api.set_status("swan-lake", &head, "success");
+    let nixos = two.join("nixos-config");
+    let head = commit(&nixos, "n2");
+    f.git(&nixos, &["push", "-q", "origin", "sl-0022-two"]);
+    open_mr("nixos-config", 1, "sl-0022-two", &head);
+    f.commit_file_on_forge("nixos-config", "master", "other.txt", "other");
+    f.git(&nixos, &["fetch", "-q", "origin"]);
+    f.git(&nixos, &["rebase", "-q", "origin/master"]);
+    let merged = f.commit_on_forge("nixos-config", "master", "n2 rebased");
+    let forge = f.forge_repo("nixos-config");
+    f.git(&forge, &["update-ref", "refs/pull/1/head", &merged]);
+    f.git(&forge, &["update-ref", "-d", "refs/heads/sl-0022-two"]);
+    f.api.set_pr(
+        "nixos-config",
+        1,
+        "merged",
+        "refs/pull/1/head",
+        &merged,
+        Some(&merged),
+    );
+
+    // The consumer detached at its base, the workspace's branch MR open
+    // elsewhere: the workspace holds it.
+    let held = work.join("SL-0023-held/swan-lake");
+    f.git(&held, &["switch", "-q", "--detach", "origin/master"]);
+    f.api
+        .set_pr("swan-lake", 4, "open", "sl-0023-held", SHA, None);
+
+    let out = stdout(&f.swl(&f.root, &["ls"]));
+    assert_eq!(
+        ws_line(&out, "SL-0020-pushed"),
+        "SL-0020-pushed  pushed  waits: anyone  next: swl publish swan-lake",
+        "{out}"
+    );
+    assert_eq!(
+        ws_line(&out, "SL-0021-ci"),
+        "SL-0021-ci  CI green  waits: owner  next: merge swan-lake#2",
+        "{out}"
+    );
+    assert_eq!(
+        ws_line(&out, "SL-0022-two"),
+        "SL-0022-two  CI green  waits: owner  next: merge swan-lake#3 (+ nixos-config: merged)",
+        "{out}"
+    );
+    assert_eq!(
+        ws_line(&out, "SL-0023-held"),
+        "SL-0023-held  removable  not a change (detached at origin/master)  waits: anyone  next: \
+         git -C swan-lake switch sl-0023-held, then swl land",
+        "{out}"
+    );
+    assert!(
+        out.ends_with("no open MR on the forge that no workspace holds"),
+        "{out}"
+    );
+    let status = stdout(&f.swl(
+        &f.root,
+        &["status", "--workspace", &two.display().to_string()],
+    ));
+    assert!(
+        status.contains("remove the workspace (nixos-config#1 of sl-0022-two is merged)"),
+        "{status}"
+    );
+
+    // Offline: what needs the forge is not claimed.
+    let out = stdout(&f.swl(&f.root, &["ls", "--no-fetch"]));
+    let rerun =
+        "pushed  waits: anyone  next: rerun without --no-fetch (it does not look up the MR)";
+    assert_eq!(
+        ws_line(&out, "SL-0020-pushed"),
+        format!("SL-0020-pushed  {rerun}"),
+        "{out}"
+    );
+    assert_eq!(
+        ws_line(&out, "SL-0021-ci"),
+        format!("SL-0021-ci  {rerun}"),
+        "{out}"
+    );
+    assert_eq!(
+        ws_line(&out, "SL-0022-two"),
+        "SL-0022-two  local  waits: anyone  next: swl publish nixos-config (unless sl-0022-two's \
+         MR merged: --no-fetch does not look it up) (+ swan-lake: pushed)",
+        "{out}"
+    );
+    let status = stdout(&f.swl(
+        &f.root,
+        &[
+            "status",
+            "--workspace",
+            &two.display().to_string(),
+            "--no-fetch",
+        ],
+    ));
+    assert!(
+        status.contains(
+            "next: swl publish nixos-config (unless sl-0022-two's MR merged: --no-fetch does not \
+             look it up)"
+        ),
+        "{status}"
+    );
 }
