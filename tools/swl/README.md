@@ -307,7 +307,12 @@ history only. For the promotion of common's merged MR as a consumer, it
 (and so `land`) also fetches the remote of each other repo of the swl
 config, to read the branch and the declared sources of common's consumers
 at their base, as `swl bump` does. `--no-fetch` uses the refs already known
-and looks up no consumer MR, by pull ref or by branch. A forge, network or git error makes
+and looks up no consumer MR, by pull ref or by branch: a pushed consumer is
+`pushed`, next `rerun without --no-fetch (it does not look up the MR)`
+(anyone); a consumer with commits outside its base on a branch not on the
+remote is `local`, next `swl publish <consumer> (unless <branch>'s MR
+merged: --no-fetch does not look it up)`, since that MR may have merged
+them as rebased (see above). A forge, network or git error makes
 that row `unknown (<reason>)`; it is never an error of the command.
 
 MR state and CI come from the forge API: anonymously, and for what that
@@ -399,9 +404,17 @@ and no consumer MR to start from. A repo whose MRs cannot be read is a
 line `<repo>: not read (<reason>)` (a private repo without fj's login, say).
 
 `--no-fetch` gives a quick offline view of the workspaces only: no fetch
-and no forge request at all, so a row that needs the forge (an MR's state
-or CI) is `unknown (--no-fetch: the forge is not read)` there, and the
-open MRs are not listed. The exit status is 0, also with unknown lines.
+and no forge request at all, and the open MRs are not listed. A line
+claims nothing that needs the forge: a pushed consumer is `pushed`, next
+`rerun without --no-fetch (it does not look up the MR)` (anyone), its MR,
+CI and entries unknown (with its landing commit pushed, `check the MR of
+<consumer> on the forge …`); a consumer with commits on a branch gone
+from the remote refs is `local`, next `swl publish <consumer> (unless
+<branch>'s MR merged: --no-fetch does not look it up)`, as `status
+--no-fetch` says (see [Status](#status)). The rows below the consumers
+that need the forge are `unknown (--no-fetch: the forge is not read)`; the
+line waits for them through the consumer's verdict only. The exit status is
+0, also with unknown lines.
 
 ## Diagnostics
 

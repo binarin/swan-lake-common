@@ -77,7 +77,14 @@ fn ls_lists_each_workspace_with_its_stage_and_whether_it_is_removable() {
     f.git(&pushed, &["push", "-q", "origin", "sl-0006-pushed"]);
     f.git(&pushed, &["reset", "-q", "--hard", "origin/master"]);
 
-    for args in [&["ls"][..], &["ls", "--no-fetch"][..]] {
+    for (args, unpushed_next) in [
+        (&["ls"][..], "swl publish swan-lake"),
+        (
+            &["ls", "--no-fetch"][..],
+            "swl publish swan-lake (unless sl-0004-unpushed's MR merged: --no-fetch does not \
+             look it up)",
+        ),
+    ] {
         let out = stdout(&f.swl(&f.root, args));
         assert!(
             out.starts_with(&format!("workspaces in {}:", work.display())),
@@ -90,7 +97,7 @@ fn ls_lists_each_workspace_with_its_stage_and_whether_it_is_removable() {
         );
         assert_eq!(
             ws_line(&out, "SL-0004-unpushed"),
-            "SL-0004-unpushed  local  waits: anyone  next: swl publish swan-lake",
+            format!("SL-0004-unpushed  local  waits: anyone  next: {unpushed_next}"),
             "{out}"
         );
         for kept in [

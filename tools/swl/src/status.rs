@@ -472,7 +472,13 @@ pub enum MergedBranchMr {
     WithoutHead(u64),
     /// Whether its merge commit is in HEAD's history is unknown: why.
     Unknown(u64, String),
+    /// Not looked up (`--no-fetch`): why.
+    NotLookedUp(String),
 }
+
+/// Why `--no-fetch` leaves a consumer's MR, by pull ref or by branch,
+/// unknown.
+pub const NO_FETCH_MR: &str = "--no-fetch: the MR is not looked up";
 
 /// The step for a consumer checkout at its base that is not on the branch
 /// of the workspace's open MR.
@@ -543,6 +549,11 @@ pub fn consumer_verdict(f: &ConsumerFacts) -> Verdict {
                 Some(MergedBranchMr::Unknown(n, why)) => verdict(
                     Stage::Unknown(why.clone()),
                     format!("check {c}#{n} on the forge"),
+                    Waits::Anyone,
+                ),
+                Some(MergedBranchMr::NotLookedUp(why)) => verdict(
+                    Stage::Local,
+                    format!("swl publish {c} (unless {branch}'s MR merged: {why})"),
                     Waits::Anyone,
                 ),
                 None => publish.with_stage(Stage::Local),
@@ -632,6 +643,13 @@ pub fn consumer_verdict(f: &ConsumerFacts) -> Verdict {
     }
     let own = match &f.mr {
         MrFacts::None => return publish.with_stage(Stage::Pushed),
+        MrFacts::NotLookedUp(why) if why == NO_FETCH_MR => {
+            return verdict(
+                Stage::Pushed,
+                "rerun without --no-fetch (it does not look up the MR)",
+                Waits::Anyone,
+            );
+        }
         MrFacts::Read { number, read } => match read {
             MrRead::Open { info, ci } => open_verdict(&which(number), info, ci, c),
             MrRead::Closed => {
@@ -1034,7 +1052,7 @@ impl Ctx<'_> {
     /// at that head, read with `ls-remote` (works for private repos).
     fn consumer_mr(&self, dir: &Path, remote: &str, repo: &str, head: &str) -> MrFacts {
         if !self.fetcher.enabled() {
-            return MrFacts::NotLookedUp("--no-fetch: the MR is not looked up".into());
+            return MrFacts::NotLookedUp(NO_FETCH_MR.into());
         }
         let refs = match git(dir, &["ls-remote", remote, "refs/pull/*/head"]) {
             Ok(r) => r,
@@ -1528,6 +1546,18 @@ fn consumer_row(ctx: &Ctx, hops: &[Hop], ws: &Workspace, rows: &[Row], c: &Check
                 }
                 _ => {}
             }
+        } else if remote.is_some()
+            && state == RemoteBranch::Missing
+            && !ctx.fetcher.enabled()
+            && !head_in_base
+            && let Some(t) = &topic
+        {
+            // Not fetching: whether the branch's MR merged (the commits
+            // from before a rebase) is not known.
+            details.push(format!("MR of {t}: {NO_FETCH_MR}"));
+            merged_branch_mr = Some(MergedBranchMr::NotLookedUp(
+                "--no-fetch does not look it up".into(),
+            ));
         }
         // Common at the base, its branch kept on the remote after its MR
         // merged: that MR (by branch, at the branch head), to promote.
@@ -2498,6 +2528,47 @@ mod tests {
             (
                 "unknown (swan-lake#3: merged as 1c0ffee, 1c0ffee is not known here)".into(),
                 "check swan-lake#3 on the forge".into(),
+                Waits::Anyone
+            )
+        );
+        // --no-fetch: whether it merged is not known, so publishing is not
+        // the plain next step.
+        assert_eq!(
+            cv(ConsumerFacts {
+                remote: RemoteBranch::Missing,
+                merged_branch_mr: Some(MergedBranchMr::NotLookedUp(
+                    "--no-fetch does not look it up".into()
+                )),
+                ..consumer()
+            }),
+            (
+                "local".into(),
+                "swl publish swan-lake (unless sl-1-x's MR merged: --no-fetch does not look it up)"
+                    .into(),
+                Waits::Anyone
+            )
+        );
+    }
+
+    #[test]
+    fn a_consumer_mr_not_looked_up_with_no_fetch_is_to_rerun_without_it() {
+        let pushed = ConsumerFacts {
+            mr: MrFacts::NotLookedUp(NO_FETCH_MR.into()),
+            entries: vec![(
+                "swan-lake-common#32".into(),
+                verdict(
+                    Stage::Unknown("x".into()),
+                    "rerun swl status",
+                    Waits::Nobody,
+                ),
+            )],
+            ..consumer()
+        };
+        assert_eq!(
+            cv(pushed),
+            (
+                "pushed".into(),
+                "rerun without --no-fetch (it does not look up the MR)".into(),
                 Waits::Anyone
             )
         );
