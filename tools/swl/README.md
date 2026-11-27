@@ -91,7 +91,8 @@ The global `--config FILE` selects the repos config.
 
 The global `--color auto|always|never` colours the output: the `swl <cmd>:`
 prefix bold, errors red, warnings yellow, what waits for the owner magenta,
-what is done green, and `status` (see [Status](#status)). `auto`, the
+what is done green, the progress output's tree (see [Progress
+output](#progress-output)), and `status` (see [Status](#status)). `auto`, the
 default, colours a terminal only, never with `NO_COLOR` set, and always with
 `CLICOLOR_FORCE` set (and no `NO_COLOR`). Without colour the text is the same
 as with it, escape codes aside. `--color` does not reach the output of the
@@ -185,6 +186,86 @@ terminal.
 described under [Manifest and landing](#manifest-and-landing), `bump` under
 [Bump](#bump), `promote` under [Promote](#promote).
 
+## Progress output
+
+The multi-step commands (`land`, `bump`, `promote`, `refresh`, `publish`,
+`finalize`) print their progress as a tree, as the run goes on: a section
+per repo, MR or phase, headed `swl <cmd>: <name>`, its steps nested below.
+A `swl bump` that bumps common and opens the consumers' bump MRs:
+
+```
+swl bump: common
+├─ up to date: disko, emacs-niri-awareness, emacs-overlay, emacs-tramp-rpc, flake-parts,
+│  home-manager, import-tree, llm-agents, nixpkgs, nixpkgs-unstable, omnidiff, sops-nix
+├─ zwanenzang 11a574392516 -> e40d4498c7c3 (the default branch)
+├─ relock zwanenzang on master at 4f5d3c028d43 commit "swl: bump zwanenzang" and push it to origin's master (fast-forward)
+├─ pushed 8ab4ff130b05 to master: swl: bump zwanenzang
+├─ swan-lake-current at 4f5d3c028d43 gets 1 commit(s):
+│  8ab4ff1 swl: bump zwanenzang
+├─ promote swan-lake-common master
+│  git -C /home/binarin/personal-workspace/bare-repos/swan-lake-common.git push origin 8ab4ff13…:refs/heads/swan-lake-current
+├─ promoted swan-lake-current to 8ab4ff130b05
+│  https://github.com/binarin/swan-lake-common.git swan-lake-current does not have 8ab4ff130b05 yet; checking again in 10s
+╵
+swl bump: nixos-config
+├─ push nixos-config's bump of common to 8ab4ff130b05 as origin's swl-bump-common
+├─ open the bump MR "swl: bump common to 8ab4ff130b05" of nixos-config
+├─ request the merge of nixos-config#372 at 23f6f85ddb3a (fast-forward only, when its checks succeed, deleting its branch)
+└─ waits for nobody: nixos-config#372 waits for CI, then it merges (merge when checks succeed); rerun swl bump
+swl bump: swan-lake
+├─ push swan-lake's bump of common to 8ab4ff130b05 as origin's swl-bump-common
+├─ open the bump MR "swl: bump common to 8ab4ff130b05" of swan-lake
+├─ request the merge of swan-lake#58 at bae3292f4218 (fast-forward only, when its checks succeed, deleting its branch)
+└─ waits for nobody: swan-lake#58 waits for CI, then it merges (merge when checks succeed); rerun swl bump
+```
+
+- A section's heading comes with its first line: one with nothing to say
+  (an MR landed already) prints nothing. `land` has a section per shared
+  MR and per consumer MR (`swan-lake#31`), and `workspace <dir>` for the
+  removal; `bump` one for common and one per consumer; `promote` one for
+  what it promotes (`swan-lake-common origin/master`); `refresh` one per MR;
+  `publish` one per checkout; `finalize` one for `swl.toml`.
+- `├─ ` a step: what swl does (with `--dry-run`, `would …`) or found;
+  outcomes (pushed, promoted, merged, committed, an MR opened) bold, in
+  green.
+- `│  ` dimmed, a detail of the step above: the command swl runs (a
+  promotion's `git push`), a step's further lines (the commits a promotion
+  brings), a wait (`checking again in 10s`).
+- `└─ ` the section's final outcome, which closes it: what it waits for
+  (`waits for the owner|anyone|nobody: …`, coloured as in `status`), what
+  a dry run would do next (`dry run, nothing was written; then: …`), or
+  its result.
+- `╵` closes a section that the run leaves without a final outcome: it
+  goes on to the next section (common, bumped and promoted, before the
+  consumers; a shared MR merged before its consumer), or an error ends the
+  run (on stderr, after it).
+- A line drops a leading `<name>: ` that repeats its section's heading
+  (`swan-lake#31: pushed …` under `swan-lake#31` reads `pushed …`); the
+  wording is otherwise the same as without the tree. A long list (`up to
+  date: …`) wraps at the commas before 100 columns.
+- Lines about the whole run stand outside any section, prefixed `swl
+  <cmd>:` as headings are: `swl bump: nothing to bump`, `swl bump: done:
+  …`, `swl land: every MR of the change is merged`; also a stop that is
+  not one item's (`land` with no consumer that holds a change, too many
+  steps in one run).
+
+Why not the `├─`/`└─` of a finished tree throughout: the output streams
+(waits, retries, pushes that take a while), so when a line is printed it is
+not known whether more lines of its section follow. A step is therefore
+always `├─ `, and `└─ ` is kept for the line that the command knows to be
+the section's last, its final outcome; `╵` is the end of a section that
+had none. Nothing is held back to be redrawn, so each line appears as the
+step happens, also in a pipe or a file.
+
+The glyphs are Unicode box drawing, the same as `status`'s tree, also
+without colour: `--color never`, `NO_COLOR` or a pipe give the same text
+without escape codes. Errors and `warning:` lines stay on stderr, prefixed
+and greppable: `swl bump: error: <consumer>: …`, `swl publish: warning: …`.
+A step that needs attention (an input not bumped, a checkout kept) is a
+step of its section on stdout, in the warning colour.
+`swl start` ends with the workspace's checkouts as a tree too, each on its
+branch, then the `cd` hint.
+
 ## Status
 
 `swl status [WORKSPACE] [--workspace NAME|TICKET|PATH] [--no-fetch]` for a workspace, and
@@ -214,7 +295,8 @@ others its line says `details under <consumer>: <path>`. Rows under no
 consumer follow as roots of their own; a blank line separates the roots.
 The columns are aligned: the stage, `waits: <who>`, `next: <step>` (a very
 long name or stage pushes its own line's columns). The glyphs are Unicode
-box drawing, also in a pipe or a file; this plain form is stable. On a
+box drawing, as in the [progress output](#progress-output), also in a pipe
+or a file; this plain form is stable. On a
 terminal (see `--color` under [Commands](#commands)) each row's stage and
 waits are coloured by whom it waits for: the owner magenta (the next step
 too), anyone yellow, nobody cyan, done (`next: -`) green, unknown red; names
