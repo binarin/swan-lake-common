@@ -872,8 +872,17 @@ pub enum MergeWhen {
     ChecksSucceed,
 }
 
+/// What the forge said to closing an MR (`PATCH .../pulls/{n}` with
+/// `state: closed`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CloseOutcome {
+    Closed,
+    /// The user may not close it (HTTP 403): for the owner.
+    Refused(String),
+}
+
 /// The forge writes of `swl land`, `swl bump` and `swl publish`: marking an
-/// MR ready, opening one, and requesting its merge.
+/// MR ready, opening one, requesting its merge, and closing one.
 pub trait ForgeWriter {
     /// Sets the MR's title (a draft is marked ready by dropping `WIP:`).
     fn set_title(&self, repo: &str, number: u64, title: &str) -> Result<()>;
@@ -898,6 +907,17 @@ pub trait ForgeWriter {
         title: &str,
         body: &str,
     ) -> Result<PrInfo>;
+    /// Closes the MR without merging it.
+    fn close_pr(&self, repo: &str, number: u64) -> Result<CloseOutcome>;
+}
+
+/// The MR's page on the forge, where it can be closed by hand.
+pub fn pr_url(repo: &str, number: u64) -> String {
+    format!(
+        "{}/{}/pulls/{number}",
+        git_base().trim_end_matches('/'),
+        slug(repo)
+    )
 }
 
 /// The title without a draft prefix (Forgejo's `WIP:` and `[WIP]`).
@@ -1013,6 +1033,23 @@ impl ForgeWriter for FjWriter {
                 Err(PrExists(format!("POST {path}: HTTP {code}: {}", text.trim())).into())
             }
             (code, text) => bail!("POST {path}: HTTP {code}: {}", text.trim()),
+        }
+    }
+
+    fn close_pr(&self, repo: &str, number: u64) -> Result<CloseOutcome> {
+        let path = format!("repos/{}/pulls/{number}", slug(repo));
+        let fields = serde_json::json!({ "state": "closed" });
+        match self.send("PATCH", &path, Some(&fields))? {
+            (200 | 201, _) => Ok(CloseOutcome::Closed),
+            (401, _) => bail!(LOGIN_REJECTED),
+            (403, text) => Ok(CloseOutcome::Refused(format!(
+                "HTTP 403: {}",
+                serde_json::from_str::<Value>(&text)
+                    .ok()
+                    .and_then(|v| v.get("message")?.as_str().map(str::to_string))
+                    .unwrap_or_else(|| text.trim().to_string())
+            ))),
+            (code, text) => bail!("PATCH {path}: HTTP {code}: {}", text.trim()),
         }
     }
 }

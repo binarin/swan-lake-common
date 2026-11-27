@@ -437,6 +437,7 @@ The stages, in order:
 | `merged` | the MR is merged (its merge commit) | its branch is gone on the remote, and the MR of that branch merged without HEAD's commits outside the base (they predate a rebase): remove the workspace; common, landed as below but not promoted yet: `promote <branch>`, for the owner |
 | `promoted` | the merge commit is in the declared branch on the forge (`swan-lake-current` for common; an input without a ref is promoted when merged) | common, landed as below and promoted, but not in a declared source yet: wait for it, nobody |
 | `landing pushed`, `landing pushed, CI failing` | | the MR is open, and its branch has no pending `swl.toml` entries, had some (its commits since the merge base touch `swl.toml`), and changes `flake.lock` |
+| `obsolete: its change is in <base>` | | the MR is open, and its change is in its base already (below): close it, for anyone |
 | `landed` | merged, and every consumer that names it in `swl.toml` has landed | the MR is merged, or both the local and the remote branch heads are in the base, or the branch is gone on the remote (a merge deletes it) and HEAD, in the base, is the head of the branch's merged MR or has its merge commit; common as a consumer, its MR merged, also promoted and in the declared sources |
 
 A shared checkout without an MR whose HEAD is in the rev each consumer
@@ -474,6 +475,20 @@ workspace is not done. A change of common in its base without a merged MR
 (such as a branch pushed at master) is `landed` by git alone, and promotes
 nothing. When that branch or those sources cannot be read, it is
 `unknown`, next `rerun swl status` (waits: nobody).
+An open consumer MR whose change its base has already (a duplicate of a
+bump that landed by another MR on the same parent, as nixos-config#377 was
+of #376; a rebased copy that landed) is `obsolete: its change is in
+origin/master`, next `close <consumer>#<MR>`, waiting for anyone, with a
+detail line `<consumer>#<MR>: its change is in origin/master already
+(merging it changes nothing)`; unpushed commits of the checkout come first
+(`swl publish`). The test is git's: merging the MR head into the base's tip
+with `git merge-tree --write-tree` (in the object store, no checkout) is
+clean and gives the tip's own tree. A head that its base contains is
+`landed` instead; a change that the base has only in part, or that
+conflicts with how the base changed the same lines since (a bump to an
+older rev), is not obsolete. A rebase onto the tip would tell the same but
+needs a worktree; a diff against the merge base, or `git cherry`, misses a
+change that landed as other commits.
 When no consumer holds a change (each is `no change` or `not a change`), a
 line after the rows says so. A consumer MR with entries is not merged on its
 own: while its own step waits for the owner (merge) or nobody (CI), its next
@@ -484,7 +499,8 @@ The next steps are `swl publish <consumer>` (anyone), `mark <repo>#N ready`
 (anyone), wait for CI (nobody), `merge <repo>#N` (owner),
 `promote <branch>` (owner), `swl land` (anyone), `open the MR` (anyone) and
 `request merge when checks succeed` (owner) once the landing is pushed
-(`fix CI`, anyone, while it fails).
+(`fix CI`, anyone, while it fails), and `close <consumer>#N` (anyone) for an
+obsolete consumer MR.
 
 By default `status` fetches each checkout's remote (as `ws add` does, once
 per source, with `--prune`) so that the stages are current, also "gone on
@@ -1184,7 +1200,12 @@ whom. Rerun it to continue. The steps:
    The consumer MR (found by the pull ref at the branch head) must be open,
    for that branch, and at the remote branch head; else it stops for anyone
    to check it on the forge. A draft is marked ready. A consumer without
-   entries just has its merge requested.
+   entries just has its merge requested. An obsolete consumer MR (its change
+   is in its base already, see [Status](#status)) is not rebased, finalized
+   or merged: `land` stops there, for anyone, `<consumer>#<MR>: obsolete:
+   its change is in origin/master; close it`. It only reports it: whoever
+   opened the MR, or the owner, closes it (`swl bump` closes its own, see
+   [Bump](#bump)).
 
    Common as a consumer (a common-only change), once its MR merged, is
    promoted as in step 2, in its own consumer step: like any consumer step,
@@ -1436,7 +1457,8 @@ same branch.
 
 Anyone may run `bump`; it does every step it can and stops at the first
 one the forge refuses. The owner's steps are the push to common's master,
-the promotion and the consumers' merges: like `land`, `bump` tries them,
+the promotion and the consumers' merges (and closing a bump MR that an
+agent may not close): like `land`, `bump` tries them,
 and a push that branch protection refuses, or a merge refused as `land`
 tells (`User not allowed to merge PR`, approvals), waits for the owner,
 with the command. For a refused push to master that is `git -C <source>
@@ -1467,6 +1489,33 @@ mirror, and goes on from there.
 - Common bumped and promoted, or nothing to bump: on to the consumers. A
   consumer at the promoted rev is done; one with an open bump MR at the
   right head goes to its merge.
+- A consumer with nothing to bump whose `swl-bump-common` is still there
+  (its change landed by another MR, as nixos-config#377 duplicated #376, or
+  it is in the base): when the branch is swl's own (the rules below, as for
+  rebuilding it), its open bump MR is closed (`PATCH
+  /repos/{owner}/{repo}/pulls/{n}` with `{"state": "closed"}`, fj's
+  login), then the branch is deleted, `git push
+  --force-with-lease=refs/heads/swl-bump-common:<head read> <remote>
+  --delete refs/heads/swl-bump-common` from the consumer's source; without
+  an open MR it is only deleted. A branch with anything else on it is left
+  and reported (`… is not needed any more, but it has commits other than
+  swl bump's own; left as it is`). A close that the forge refuses (403:
+  the agent may not edit the MR) waits for the owner, to close it on the
+  forge (its URL is given), then rerun, which deletes the branch; a refused
+  deletion (a protected branch) waits for the owner with `git -C <source>
+  push --delete <remote> swl-bump-common`; a branch that moved since it
+  was read waits for nobody: rerun. When common moved first, the branch is
+  needed again: it is rebuilt and its open MR reused, retitled, as below.
+- The consumer's base is read again with `git ls-remote` just before the
+  bump branch is pushed (after the relock, which takes a while) and just
+  before its MR is opened. When it moved since it was read (another bump of
+  the same change landed meanwhile, as nixos-config#376 did while a second
+  run built #377), nothing is pushed or opened on the old base: the base
+  branch is fetched and that consumer's step starts over on it (done when
+  the new base has the change, rebuilt on it otherwise), up to three times
+  in one run; then it waits for nobody: rerun. The base can still move
+  between that read and the push, or after the MR is opened: then the MR is
+  rebuilt (or found obsolete and closed) by the next run.
 - Nothing new anywhere: `nothing to bump`, and nothing is written.
 
 `--dry-run` reads as a run does, prints the plan and the first write it
@@ -1487,7 +1536,8 @@ rev is stale, it is rebuilt on the current base and pushed with
 MR branches; nothing else is force-pushed), and
 its open MR follows, retitled and its description updated (`PATCH
 /repos/{owner}/{repo}/pulls/{n}`). Anything else on it stops that consumer for
-anyone: delete the branch on the forge, then rerun. When the newest bump MR
+anyone: delete the branch on the forge, then rerun (an unneeded one is
+only reported, above). When the newest bump MR
 at the branch's (current) head was closed without merging, no other is
 opened for that head: it waits for the owner, to reopen it or delete the
 branch.
@@ -1618,7 +1668,10 @@ are not.
   commits since the merge base must touch `swl.toml`. A bump on a branch
   that once had entries for other reasons looks like a landing.
 - `status` knows a shared MR only through a consumer's `swl.toml` entry: an
-  MR opened by hand without one shows as `needs publish`. A consumer's MR is
+  MR opened by hand without one shows as `needs publish`. It tells an
+  obsolete MR (its change in its base already) for consumer MRs only; an
+  obsolete shared MR shows as open, and `land` (or `refresh`) stops at it
+  when its rebase leaves nothing: close it. A consumer's MR is
   the pull ref at its branch head, so a push that Forgejo has not recorded
   yet hides it for a moment.
 - `status --from` reads the declared branch of a nested entry

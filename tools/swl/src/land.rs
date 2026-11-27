@@ -13,9 +13,11 @@
 //!    source (common's GitHub mirror) must have it.
 //! 3. Each consumer: rebased as a shared MR is when behind its base, `swl
 //!    finalize` when every entry is satisfied, the landing commit pushed to
-//!    its MR branch, and its merge requested. Common as a consumer, its MR
-//!    merged, is promoted then as in step 2, to the branch and declared
-//!    sources that `bump` promotes ([`crate::bump::promotion_target`]).
+//!    its MR branch, and its merge requested; an obsolete consumer MR (its
+//!    change in its base already) stops it, only reported. Common as a
+//!    consumer, its MR merged, is promoted then as in step 2, to the branch
+//!    and declared sources that `bump` promotes
+//!    ([`crate::bump::promotion_target`]).
 //! 4. When every consumer MR is merged, the workspace is removed (unless
 //!    `--keep`).
 //!
@@ -42,7 +44,8 @@ use crate::{
     env::GENERATED_MARKER,
     finalize::{self, Landing},
     forge::{
-        CiState, ForgeWriter, MergeOutcome, MergeWhen, PrInfo, PrReader, PrState, ready_title,
+        CiState, CloseOutcome, ForgeWriter, MergeOutcome, MergeWhen, PrInfo, PrReader, PrState,
+        ready_title,
     },
     git::{STATUS_PORCELAIN, git, git_ok, short, valid_branch},
     manifest::{Entry, MANIFEST_FILE, Manifest},
@@ -881,6 +884,16 @@ impl Lander<'_> {
         let RowFacts::Consumer(f) = &row.facts else {
             return stop_at(row);
         };
+        // Only reported: closing it is for whoever opened it, or the owner.
+        if let (Stage::Obsolete(base), MrFacts::Read { number, .. }) = (&row.verdict.stage, &f.mr) {
+            return stop(
+                Waits::Anyone,
+                format!(
+                    "{}#{number}: obsolete: its change is in {base}; close it",
+                    c.name
+                ),
+            );
+        }
         if let Some(p) = &f.promotion {
             let which = match &f.mr {
                 MrFacts::Read { number, .. } => format!("{}#{number}", c.name),
@@ -1365,6 +1378,10 @@ impl ForgeWriter for DryRunWriter {
     }
 
     fn create_pr(&self, _: &str, _: &str, _: &str, _: &str, _: &str) -> Result<PrInfo> {
+        bail!("a dry run writes nothing")
+    }
+
+    fn close_pr(&self, _: &str, _: u64) -> Result<CloseOutcome> {
         bail!("a dry run writes nothing")
     }
 }

@@ -63,7 +63,7 @@ fn rank(stage: &Stage) -> u8 {
         Stage::Local => 1,
         Stage::NeedsPublish => 2,
         Stage::Pushed => 3,
-        Stage::MrOpen { .. } => 4,
+        Stage::MrOpen { .. } | Stage::Obsolete(_) => 4,
         Stage::Ci(_) => 5,
         Stage::Merged => 6,
         Stage::Promoted => 7,

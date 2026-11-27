@@ -14,7 +14,9 @@
 //!    promoted to master by fast-forward, and the declared source (the
 //!    GitHub mirror) waited for, as `land` does.
 //! 3. Each consumer: a bump MR from the swl-owned branch [`BUMP_BRANCH`]
-//!    that moves only `common` to the promoted rev, merged as `land` merges.
+//!    that moves only `common` to the promoted rev, merged as `land` merges;
+//!    started over when the consumer's base moves before the push. A bump
+//!    branch that is not needed any more is deleted, its open MR closed.
 //!
 //! Everything runs in scratch worktrees of the repos' configured sources,
 //! removed at the end. `--dry-run` writes nothing.
@@ -32,8 +34,8 @@ use serde_json::Value;
 use crate::{
     ancestry::{self, History, Source},
     check,
-    config::Config,
-    forge::{ForgeWriter, PrInfo, PrReader, PrState},
+    config::{Config, RepoConfig},
+    forge::{CloseOutcome, ForgeWriter, PrInfo, PrReader, PrState, pr_url},
     git::{git, git_ok, is_rev, short, valid_branch},
     land::{self, Lander, Rejection, Repeated, Step, push_rejection, stop},
     lock_change, lock_rules,
@@ -449,32 +451,70 @@ fn consumers(config: &Config, fetcher: &Fetcher) -> Result<Vec<Consumer>> {
             continue;
         };
         fetcher.fetch(&rc.source, &remote)?;
-        let branch = base_branch(base).to_string();
-        let Some(head) = rev_parse(&rc.source, &format!("refs/remotes/{remote}/{branch}")) else {
-            bail!("{name}: {base} is not known in {}", rc.source.display());
-        };
-        let Some(lock) = check::lock_at(&rc.source, &head)? else {
-            tracing::debug!(%name, "not a consumer: no flake.lock");
-            continue;
-        };
-        let inputs =
-            common_inputs(config, &lock).with_context(|| format!("{name}'s flake.lock"))?;
-        if inputs.is_empty() {
-            tracing::debug!(%name, "not a consumer: no common input");
-            continue;
-        }
-        out.push(Consumer {
-            name: name.to_string(),
-            source: rc.source.clone(),
-            remote,
-            branch,
-            head,
-            lock,
-            inputs,
-        });
+        out.extend(consumer_of(config, name, rc, remote)?);
     }
     Ok(out)
 }
+
+/// The repo `name` as a consumer at its base's remote-tracking branch of
+/// `remote`, as fetched; `None` when that does not lock common.
+fn consumer_of(
+    config: &Config,
+    name: &str,
+    rc: &RepoConfig,
+    remote: String,
+) -> Result<Option<Consumer>> {
+    let base = rc.base();
+    let branch = base_branch(base).to_string();
+    let Some(head) = rev_parse(&rc.source, &format!("refs/remotes/{remote}/{branch}")) else {
+        bail!("{name}: {base} is not known in {}", rc.source.display());
+    };
+    let Some(lock) = check::lock_at(&rc.source, &head)? else {
+        tracing::debug!(%name, "not a consumer: no flake.lock");
+        return Ok(None);
+    };
+    let inputs = common_inputs(config, &lock).with_context(|| format!("{name}'s flake.lock"))?;
+    if inputs.is_empty() {
+        tracing::debug!(%name, "not a consumer: no common input");
+        return Ok(None);
+    }
+    Ok(Some(Consumer {
+        name: name.to_string(),
+        source: rc.source.clone(),
+        remote,
+        branch,
+        head,
+        lock,
+        inputs,
+    }))
+}
+
+/// A consumer's base branch on the forge is no longer at the head that its
+/// step read: the step starts over rather than push a bump of the old one.
+#[derive(Debug)]
+struct BaseMoved {
+    /// The branch's head on the forge now; empty when it is gone.
+    now: String,
+    /// The write it was found before.
+    before: &'static str,
+}
+
+impl std::fmt::Display for BaseMoved {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let now = if self.now.is_empty() {
+            "nothing"
+        } else {
+            short(&self.now)
+        };
+        write!(f, "moved to {now} (found before {})", self.before)
+    }
+}
+
+impl std::error::Error for BaseMoved {}
+
+/// How often one run starts a consumer's step over when its base moved
+/// ([`BaseMoved`]) before it stops, for a rerun.
+const BASE_RESTARTS: usize = 3;
 
 /// The names of the [`consumers`]: the repos of the config other than
 /// common whose base branch locks common, each fetched.
@@ -799,8 +839,75 @@ impl Bumper<'_> {
     }
 
     /// Step 3 for one consumer: its bump MR to `target`, pushed, opened and
-    /// merged.
-    fn consumer(&self, c: &Consumer, target: &str, common_src: &Path) -> Result<Step> {
+    /// merged. When its base moved between the read and the push of the bump
+    /// branch, or the opening of its MR ([`BaseMoved`]), nothing is pushed
+    /// over it: the base is fetched and the step starts over, up to
+    /// [`BASE_RESTARTS`] times, then waits for nobody.
+    fn consumer(&self, first: &Consumer, target: &str, common_src: &Path) -> Result<Step> {
+        let mut reread: Option<Consumer> = None;
+        for pass in 0..=BASE_RESTARTS {
+            let c = reread.as_ref().unwrap_or(first);
+            let moved = match self.consumer_pass(c, target, common_src) {
+                Err(e) => e.downcast::<BaseMoved>()?,
+                done => return done,
+            };
+            let (name, base) = (&c.name, format!("{}/{}", c.remote, c.branch));
+            let moved = format!("{name}: {base} at {} {moved}", short(&c.head));
+            if pass == BASE_RESTARTS {
+                return stop(
+                    Waits::Nobody,
+                    format!("{moved}, {} times in this run; rerun {CMD}", pass + 1),
+                );
+            }
+            self.report()
+                .step(format!("{moved}: starting {name} over on it"));
+            match self.reread(c)? {
+                Some(next) => reread = Some(next),
+                None => {
+                    self.report().end(
+                        Tone::Plain,
+                        format!("{name}: {base} does not lock common now"),
+                    );
+                    return Ok(Step::Done);
+                }
+            }
+        }
+        unreachable!("the last pass returns")
+    }
+
+    /// The consumer `c` read again: its base branch fetched.
+    fn reread(&self, c: &Consumer) -> Result<Option<Consumer>> {
+        let (remote, branch) = (&c.remote, &c.branch);
+        let refspec = format!("+refs/heads/{branch}:refs/remotes/{remote}/{branch}");
+        git(&c.source, &["fetch", "--quiet", remote, &refspec])?;
+        consumer_of(
+            self.config,
+            &c.name,
+            self.config.repo(&c.name)?,
+            remote.clone(),
+        )
+    }
+
+    /// A [`BaseMoved`] error when the consumer's base branch on the forge,
+    /// asked by `ls-remote`, is not at the head read; `before` names the
+    /// write that then is not done.
+    fn base_unmoved(&self, c: &Consumer, before: &'static str) -> Result<()> {
+        let refname = format!("refs/heads/{}", c.branch);
+        let at = git(&c.source, &["ls-remote", &c.remote, &refname])?;
+        let now = at.split_whitespace().next().unwrap_or("");
+        tracing::debug!(consumer = %c.name, read = %c.head, %now, "the base before a write");
+        if now == c.head {
+            return Ok(());
+        }
+        Err(BaseMoved {
+            now: now.to_string(),
+            before,
+        }
+        .into())
+    }
+
+    /// One pass of [`Bumper::consumer`] on the base as read in `c`.
+    fn consumer_pass(&self, c: &Consumer, target: &str, common_src: &Path) -> Result<Step> {
         let _span = tracing::debug_span!("consumer", name = %c.name).entered();
         let name = &c.name;
         let mut moves = Vec::new();
@@ -850,22 +957,18 @@ impl Bumper<'_> {
                 .iter()
                 .all(|i| i.rev == target)
                 .then(|| format!("{name}: common is at {} already", short(target)));
-            let unneeded = tip.as_ref().map(|tip| {
-                format!(
-                    "{name}: {BUMP_BRANCH} (at {}) is not needed any more",
-                    short(tip)
-                )
-            });
-            match (at, unneeded) {
-                (Some(at), Some(unneeded)) => {
+            return match (at, &tip) {
+                (Some(at), Some(tip)) => {
                     self.report().outcome(Tone::Good, at);
-                    self.report().end(Tone::Plain, unneeded);
+                    self.drop_unneeded(c, tip)
                 }
-                (Some(at), None) => self.report().end(Tone::Good, at),
-                (None, Some(unneeded)) => self.report().end(Tone::Plain, unneeded),
-                (None, None) => {}
-            }
-            return Ok(Step::Done);
+                (None, Some(tip)) => self.drop_unneeded(c, tip),
+                (Some(at), None) => {
+                    self.report().end(Tone::Good, at);
+                    Ok(Step::Done)
+                }
+                (None, None) => Ok(Step::Done),
+            };
         }
         let title = format!("{CONSUMER_SUBJECT}{}", short(target));
         let body = format!(
@@ -882,10 +985,7 @@ impl Bumper<'_> {
         let mut mr = None;
         let mut up_to_date = false;
         if let Some(tip) = &tip {
-            if rev_parse(&c.source, tip).is_none() {
-                let refspec = format!("refs/heads/{BUMP_BRANCH}");
-                git(&c.source, &["fetch", "--quiet", &c.remote, &refspec])?;
-            }
+            self.fetch_tip(c, tip)?;
             if let Some(why) = self.foreign_branch(c, tip)? {
                 return stop(
                     Waits::Anyone,
@@ -941,7 +1041,12 @@ impl Bumper<'_> {
                     None => String::new(),
                 }
             );
-            if !self.lander.act(&format!("push {name}"), &what)? {
+            // Keyed by the base too: a pass started over on a moved base
+            // pushes anew.
+            if !self
+                .lander
+                .act(&format!("push {name} on {}", c.head), &what)?
+            {
                 return Ok(Step::Planned(format!(
                     "{} the bump MR of {name} and merge it",
                     if mr.is_some() { "update" } else { "open" }
@@ -949,6 +1054,8 @@ impl Bumper<'_> {
             }
             let scratch = Scratch::new(&c.source, name, &c.head)?;
             head = self.build(c, &scratch, &moves, &title)?;
+            // The relock takes a while, and another bump may land meanwhile.
+            self.base_unmoved(c, "pushing its bump")?;
             let lease = format!(
                 "--force-with-lease=refs/heads/{BUMP_BRANCH}:{}",
                 tip.as_deref().unwrap_or("")
@@ -995,8 +1102,12 @@ impl Bumper<'_> {
                 ),
             },
             None => {
+                self.base_unmoved(c, "opening its bump MR")?;
                 let what = format!("open the bump MR {title:?} of {name}");
-                if !self.lander.act(&format!("open {name}"), &what)? {
+                if !self
+                    .lander
+                    .act(&format!("open {name} on {}", c.head), &what)?
+                {
                     return Ok(Step::Planned(format!("merge the bump MR of {name}")));
                 }
                 self.writer
@@ -1035,6 +1146,109 @@ impl Bumper<'_> {
             }
             step => Ok(step),
         }
+    }
+
+    /// Fetches the bump branch when its head `tip` is not known in the
+    /// consumer's source.
+    fn fetch_tip(&self, c: &Consumer, tip: &str) -> Result<()> {
+        if rev_parse(&c.source, tip).is_none() {
+            let refspec = format!("refs/heads/{BUMP_BRANCH}");
+            git(&c.source, &["fetch", "--quiet", &c.remote, &refspec])?;
+        }
+        Ok(())
+    }
+
+    /// A consumer with nothing to bump whose bump branch is at `tip`: when
+    /// the branch is swl bump's own (as [`Bumper::foreign_branch`] judges it
+    /// for a rebuild), its open bump MR is closed, then the branch is
+    /// deleted with a lease on `tip`. Anything else is left and reported. A
+    /// refused close or delete waits for the owner.
+    fn drop_unneeded(&self, c: &Consumer, tip: &str) -> Result<Step> {
+        let name = &c.name;
+        let unneeded = format!(
+            "{name}: {BUMP_BRANCH} (at {}) is not needed any more",
+            short(tip)
+        );
+        self.fetch_tip(c, tip)?;
+        if let Some(why) = self.foreign_branch(c, tip)? {
+            self.report().end(
+                Tone::Warn,
+                format!("{unneeded}, but it {why}; left as it is"),
+            );
+            return Ok(Step::Done);
+        }
+        self.report().step(&unneeded);
+        let mut open = self
+            .mrs_at(c, tip)?
+            .into_iter()
+            .find(|i| i.state == PrState::Open);
+        if open.is_none() {
+            open = self.reader.open_pr_from(name, &c.branch, BUMP_BRANCH)?;
+        }
+        let delete = format!("delete {BUMP_BRANCH} on {}", c.remote);
+        if let Some(info) = &open {
+            let which = format!("{name}#{}", info.number);
+            if info.head_sha != tip {
+                return stop(
+                    Waits::Nobody,
+                    format!(
+                        "{which}: the forge has its head at {}, not {} yet; rerun {CMD}",
+                        short(&info.head_sha),
+                        short(tip)
+                    ),
+                );
+            }
+            let what = format!("close {which}, the bump MR of {BUMP_BRANCH}");
+            if !self.lander.act(&format!("close {which}"), &what)? {
+                return Ok(Step::Planned(delete));
+            }
+            match self.writer.close_pr(name, info.number)? {
+                CloseOutcome::Closed => {
+                    self.report().outcome(Tone::Good, format!("closed {which}"))
+                }
+                CloseOutcome::Refused(why) => {
+                    return stop(
+                        Waits::Owner,
+                        format!(
+                            "close {which} on the forge, {} (the forge refused: {why}); then \
+                             rerun {CMD}, which deletes {BUMP_BRANCH}",
+                            pr_url(name, info.number)
+                        ),
+                    );
+                }
+            }
+        }
+        let what = format!("{delete} (with a lease on {})", short(tip));
+        if !self
+            .lander
+            .act(&format!("delete {name}'s {BUMP_BRANCH}"), &what)?
+        {
+            return Ok(Step::Planned(format!("{name} is done")));
+        }
+        let lease = format!("--force-with-lease=refs/heads/{BUMP_BRANCH}:{tip}");
+        let refname = format!("refs/heads/{BUMP_BRANCH}");
+        let push = ["push", "--quiet", &lease, "--delete", &c.remote, &refname];
+        if let Err(e) = git(&c.source, &push) {
+            return match push_rejection(&format!("{e:#}")) {
+                None => Err(e.context(format!("deleting {name}'s {BUMP_BRANCH}"))),
+                Some(Rejection::Moved) => stop(
+                    Waits::Nobody,
+                    format!("{name}: {BUMP_BRANCH} moved since it was read; rerun {CMD}"),
+                ),
+                Some(Rejection::Refused(reason)) => stop(
+                    Waits::Owner,
+                    format!(
+                        "{name}: delete {BUMP_BRANCH}: git -C {} push --delete {} {BUMP_BRANCH} \
+                         (the push was refused: {reason})",
+                        c.source.display(),
+                        c.remote
+                    ),
+                ),
+            };
+        }
+        self.report()
+            .end(Tone::Good, format!("{name}: deleted {BUMP_BRANCH}"));
+        Ok(Step::Done)
     }
 
     /// Why the bump branch at `tip` is not swl bump's own, if it is not. It

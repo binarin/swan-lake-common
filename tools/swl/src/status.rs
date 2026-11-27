@@ -5,8 +5,9 @@
 //!
 //! The stages, in order: `local`, `needs publish`, `pushed`, `MR open`, `CI`
 //! (pending, failing, green), `merged`, `promoted`, `landing pushed`,
-//! `landed`. Facts that cannot be read make a row `unknown (<reason>)`, never
-//! an error.
+//! `landed`; aside, an open consumer MR whose change is in its base already
+//! is `obsolete`. Facts that cannot be read make a row `unknown (<reason>)`,
+//! never an error.
 
 use std::{
     cell::OnceCell,
@@ -79,6 +80,9 @@ pub enum Stage {
     /// A consumer checkout that is detached or on its base branch, at a
     /// commit of its base: it does not hold the change.
     NotAChange(String),
+    /// A consumer whose open MR's change is in its base (named) already:
+    /// [`change_in_base`].
+    Obsolete(String),
     Unknown(String),
 }
 
@@ -102,6 +106,7 @@ impl fmt::Display for Stage {
             Stage::NoMrNeeded(why) => write!(f, "no MR needed ({why})"),
             Stage::NoChange(why) => write!(f, "no change ({why})"),
             Stage::NotAChange(why) => write!(f, "not a change ({why})"),
+            Stage::Obsolete(base) => write!(f, "obsolete: its change is in {base}"),
             Stage::Unknown(why) => write!(f, "unknown ({why})"),
         }
     }
@@ -431,6 +436,8 @@ pub struct ConsumerFacts {
     /// The remote branch has no pending swl.toml entries, removed some, and
     /// changes flake.lock: the landing commit is pushed.
     pub landing_pushed: bool,
+    /// The open MR's change is in the base already ([`change_in_base`]).
+    pub obsolete: bool,
     /// Overridden inputs whose checkout is changed (its HEAD, or
     /// uncommitted changes to tracked files) and has no entry.
     pub unpublished_inputs: Vec<String>,
@@ -584,6 +591,18 @@ pub fn consumer_verdict(f: &ConsumerFacts) -> Verdict {
         return publish;
     }
     let which = |n: &u64| format!("{c}#{n}");
+    if f.obsolete
+        && let MrFacts::Read {
+            number,
+            read: MrRead::Open { .. },
+        } = &f.mr
+    {
+        return verdict(
+            Stage::Obsolete(f.base.clone()),
+            format!("close {}", which(number)),
+            Waits::Anyone,
+        );
+    }
     if f.landing_pushed {
         return match &f.mr {
             MrFacts::Read {
@@ -1359,6 +1378,38 @@ fn landing_at(dir: &Path, at: &str, base: &str) -> Result<bool> {
     Ok(had_entries && lock_changed(dir, at, base)?)
 }
 
+/// Whether the change of the commit `head` is in `base` already: merging
+/// `head` into `base`'s tip (`git merge-tree --write-tree`, in the object
+/// store only) is clean and gives the tip's own tree. So is a head whose
+/// commits made a change that the base got meanwhile by other commits (the
+/// same bump made twice on one parent, a rebased copy that landed); one
+/// whose change the base has in part only, or conflicts with, is not. A
+/// rebase of `head` onto the tip would tell the same, but needs a worktree;
+/// a diff against the merge base, or `git cherry`, misses a change that
+/// landed in other commits.
+fn change_in_base(dir: &Path, head: &str, base: &str) -> bool {
+    let tip_tree = git_ok(
+        dir,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{base}^{{tree}}"),
+        ],
+    );
+    let merged = git_ok(
+        dir,
+        &["merge-tree", "--write-tree", "--no-messages", base, head],
+    );
+    tracing::debug!(%head, %base, ?tip_tree, ?merged, "the MR's change against its base");
+    tip_tree.is_some() && merged == tip_tree
+}
+
+/// The detail line of an open MR [`change_in_base`].
+fn obsolete_detail(which: &str, base: &str) -> String {
+    format!("{which}: its change is in {base} already (merging it changes nothing)")
+}
+
 fn lock_changed(dir: &Path, at: &str, base: &str) -> Result<bool> {
     let mb = git(dir, &["merge-base", at, base])?;
     Ok(!git(dir, &["diff", "--name-only", &mb, at, "--", "flake.lock"])?.is_empty())
@@ -1442,6 +1493,16 @@ fn consumer_row(ctx: &Ctx, hops: &[Hop], ws: &Workspace, rows: &[Row], c: &Check
             (Some(r), Some(rh)) if !remote_in_base => ctx.consumer_mr(&c.dir, r, &c.name, rh),
             _ => MrFacts::None,
         };
+        let obsolete = match (&mr, &remote_head) {
+            (
+                MrFacts::Read {
+                    read: MrRead::Open { .. },
+                    ..
+                },
+                Some(rh),
+            ) => change_in_base(&c.dir, rh, &base),
+            _ => false,
+        };
         if let (Some(r), Some(b), Some(rh)) = (&remote, &topic, &remote_head)
             && *rh != head
         {
@@ -1449,7 +1510,11 @@ fn consumer_row(ctx: &Ctx, hops: &[Hop], ws: &Workspace, rows: &[Row], c: &Check
         }
         match &mr {
             MrFacts::Read { number, read } => {
-                details.push(describe_mr(&format!("{}#{number}", c.name), read))
+                let which = format!("{}#{number}", c.name);
+                details.push(describe_mr(&which, read));
+                if obsolete {
+                    details.push(obsolete_detail(&which, &base));
+                }
             }
             MrFacts::NotLookedUp(why) => details.push(format!("MR: {why}")),
             _ => {}
@@ -1593,6 +1658,7 @@ fn consumer_row(ctx: &Ctx, hops: &[Hop], ws: &Workspace, rows: &[Row], c: &Check
             remote_in_base,
             local_lock_change,
             landing_pushed,
+            obsolete,
             unpublished_inputs,
             entries: entry_verdicts(&manifest, rows),
             mr,
@@ -1928,6 +1994,12 @@ pub fn collect_from(
     let read = ctx.read_mr(&consumer, n, None);
     details.push(describe_mr(&which, &read));
     let head_in_base = ancestor(&source, &head, &base) == Ok(true);
+    let obsolete = matches!(read, MrRead::Open { .. })
+        && !head_in_base
+        && change_in_base(&source, &head, &base);
+    if obsolete {
+        details.push(obsolete_detail(&which, &base));
+    }
     let row = (|| -> Result<ConsumerFacts> {
         let landing_pushed = landing_at(&source, &head, &base)?;
         let mut facts = ConsumerFacts {
@@ -1945,6 +2017,7 @@ pub fn collect_from(
             remote_in_base: head_in_base,
             local_lock_change: false,
             landing_pushed,
+            obsolete,
             unpublished_inputs: Vec::new(),
             entries: entry_verdicts(&manifest, &rows),
             mr: MrFacts::Read { number: n, read },
@@ -2235,6 +2308,7 @@ mod tests {
             remote_in_base: false,
             local_lock_change: false,
             landing_pushed: false,
+            obsolete: false,
             unpublished_inputs: Vec::new(),
             entries: Vec::new(),
             mr: MrFacts::None,
@@ -2248,6 +2322,46 @@ mod tests {
     fn cv(f: ConsumerFacts) -> (String, String, Waits) {
         let v = consumer_verdict(&f);
         (v.stage.to_string(), v.next, v.waits)
+    }
+
+    #[test]
+    fn an_open_consumer_mr_whose_change_is_in_its_base_is_obsolete() {
+        let obsolete = (
+            "obsolete: its change is in origin/master".to_string(),
+            "close swan-lake#1".to_string(),
+            Waits::Anyone,
+        );
+        for ci in [Some(CiState::Pending), Some(CiState::Green), None] {
+            assert_eq!(
+                cv(ConsumerFacts {
+                    obsolete: true,
+                    mr: open(false, ci.clone()),
+                    ..consumer()
+                }),
+                obsolete,
+                "{ci:?}"
+            );
+        }
+        assert_eq!(
+            cv(ConsumerFacts {
+                obsolete: true,
+                landing_pushed: true,
+                mr: open(false, Some(CiState::Pending)),
+                ..consumer()
+            }),
+            obsolete
+        );
+        // Unpushed commits are the change's first.
+        assert_eq!(
+            cv(ConsumerFacts {
+                obsolete: true,
+                remote: RemoteBranch::Behind,
+                mr: open(false, Some(CiState::Pending)),
+                ..consumer()
+            })
+            .1,
+            "swl publish swan-lake"
+        );
     }
 
     #[test]

@@ -5,7 +5,10 @@
 //! commits; the bump branch rebuilt on a stale base; `--dry-run`, `--check`
 //! and the no-op rerun; refs with a slash and revs pinned in flake.nix; a
 //! branch that moves between bump's read and its push; consumers that
-//! disagree on the promotion branch; a lagging mirror.
+//! disagree on the promotion branch; a lagging mirror; a bump branch not
+//! needed any more, closed and deleted; an obsolete bump MR in `status` and
+//! `land`, rebuilt when common moves first; a consumer started over when its
+//! base moves before the push.
 //!
 //! Ported from scripts/test-relock-chain.py: its first run (each pin
 //! relocked, committed, pushed and promoted) is `bump_runs_to_the_end_over_reruns`,
@@ -976,4 +979,345 @@ fn bump_waits_for_the_mirror() {
         &["show", &format!("{BRANCH}:flake.lock")],
     );
     assert!(lock.contains(&mirror.display().to_string()), "{lock}");
+}
+
+impl Bump {
+    /// Lands a copy of `repo`'s bump commit on its master, as when another
+    /// run's bump MR of the same change merged (nixos-config#376): the same
+    /// parent, tree and subject, another commit. The bump branch and its MR
+    /// are left, their change in master already (as nixos-config#377 was).
+    /// The new master.
+    fn land_a_duplicate(&self, repo: &str) -> String {
+        let forge = self.f.forge_repo(repo);
+        let tip = self.rev(repo, BRANCH);
+        assert_eq!(
+            self.rev(repo, &format!("{BRANCH}^")),
+            self.rev(repo, "master")
+        );
+        let subject = self.f.git(&forge, &["log", "-1", "--format=%s", &tip]);
+        let copy = self.f.git(
+            &forge,
+            &[
+                "commit-tree",
+                "-p",
+                "master",
+                "-m",
+                &subject,
+                "-m",
+                "made by another run",
+                &format!("{tip}^{{tree}}"),
+            ],
+        );
+        self.f
+            .git(&forge, &["update-ref", "refs/heads/master", &copy]);
+        copy
+    }
+
+    /// Whether `repo` has the bump branch on the forge.
+    fn has_branch(&self, repo: &str) -> bool {
+        !self
+            .f
+            .git(&self.f.forge_repo(repo), &["branch", "--list", BRANCH])
+            .is_empty()
+    }
+
+    /// The forge's state of `repo#n`.
+    fn pr_state(&self, repo: &str, n: u64) -> String {
+        let path = format!("/api/v1/repos/binarin/{repo}/pulls/{n}");
+        let pr = self.f.api.responses.lock().unwrap()[&path].clone();
+        let pr: serde_json::Value = serde_json::from_str(&pr).unwrap();
+        pr["state"].as_str().unwrap().to_string()
+    }
+}
+
+#[test]
+fn bump_closes_and_deletes_its_branch_once_it_is_not_needed() {
+    let t = Bump::new("bump-unneeded");
+    t.f.commit_on_forge("zwanenzang", "master", "z2");
+    failed(&t.bump(&[]), 5, "swan-lake#1 waits for CI");
+    let bumped = t.rev(COMMON, "master");
+    let tips: Vec<String> = CONSUMERS.iter().map(|c| t.rev(c, BRANCH)).collect();
+    // Each consumer's bump lands by another MR: both bump MRs are left
+    // with nothing to do. Only the owner may close swan-lake#1.
+    for c in CONSUMERS {
+        t.land_a_duplicate(c);
+    }
+    t.f.api.refuse_close("swan-lake", 1, true);
+
+    // A dry run plans the close, and writes nothing.
+    let refs = t.forge_refs();
+    let writes = t.f.api.writes().len();
+    let log = stdout(&t.bump(&["--dry-run"]));
+    let want = format!(
+        "swl bump: nixos-config\n├─ common is at {} already\n├─ {BRANCH} (at {}) is not needed \
+         any more\n├─ would close nixos-config#1, the bump MR of {BRANCH}\n└─ dry run, nothing \
+         was written; then: delete {BRANCH} on origin\n",
+        short(&bumped),
+        short(&tips[0])
+    );
+    assert!(log.contains(&want), "{want:?} in\n{log}");
+    assert_eq!(t.forge_refs(), refs);
+    assert_eq!(t.f.api.writes().len(), writes);
+
+    // nixos-config#1 is closed and its branch deleted; closing swan-lake#1
+    // is refused: for the owner, on the forge.
+    let out = t.bump(&[]);
+    failed(
+        &out,
+        3,
+        &format!(
+            "waits for the owner: close swan-lake#1 on the forge, \
+             https://forgejo.lynx-lizard.ts.net/binarin/swan-lake/pulls/1 (the forge refused: \
+             HTTP 403: user should have permission to edit pull request); then rerun swl bump, \
+             which deletes {BRANCH}"
+        ),
+    );
+    let log = out_text(&out);
+    assert!(
+        log.contains(&format!(
+            "├─ closed nixos-config#1\n├─ delete {BRANCH} on origin (with a lease on {})\n└─ \
+             deleted {BRANCH}\n",
+            short(&tips[0])
+        )),
+        "{log}"
+    );
+    assert!(!t.has_branch("nixos-config"));
+    assert_eq!(t.pr_state("nixos-config", 1), "closed");
+    assert!(
+        t.f.api.writes().contains(
+            &"PATCH /api/v1/repos/binarin/nixos-config/pulls/1 {\"state\":\"closed\"}".to_string()
+        ),
+        "{:?}",
+        t.f.api.writes()
+    );
+    assert_eq!(t.rev("swan-lake", BRANCH), tips[1]);
+    assert_eq!(t.pr_state("swan-lake", 1), "open");
+
+    // The owner closed it; the branch's deletion is refused: for the owner,
+    // with the command.
+    t.f.api
+        .set_pr("swan-lake", 1, "closed", BRANCH, &tips[1], None);
+    t.protect("swan-lake", Some(BRANCH));
+    let writes = t.f.api.writes().len();
+    failed(
+        &t.bump(&[]),
+        3,
+        &format!(
+            "waits for the owner: swan-lake: delete {BRANCH}: git -C {} push --delete origin \
+             {BRANCH} (the push was refused: remote: {BRANCH} is protected",
+            t.f.source("swan-lake").display()
+        ),
+    );
+    assert_eq!(t.f.api.writes().len(), writes, "{:?}", t.f.api.writes());
+    assert_eq!(t.rev("swan-lake", BRANCH), tips[1]);
+
+    // Allowed: an unneeded branch without an open MR is deleted.
+    t.protect("swan-lake", None);
+    let log = stdout(&t.bump(&[]));
+    assert!(
+        log.contains(&format!(
+            "swl bump: swan-lake\n├─ common is at {} already\n├─ {BRANCH} (at {}) is not needed \
+             any more\n├─ delete {BRANCH} on origin (with a lease on {})\n└─ deleted {BRANCH}\n",
+            short(&bumped),
+            short(&tips[1]),
+            short(&tips[1])
+        )),
+        "{log}"
+    );
+    assert!(!t.has_branch("swan-lake"));
+    assert_eq!(t.f.api.writes().len(), writes);
+
+    // A bump branch with someone else's commit is left, and said so.
+    let theirs = t.f.commit_on_forge("swan-lake", BRANCH, "theirs");
+    let log = stdout(&t.bump(&[]));
+    assert!(
+        log.contains(&format!(
+            "└─ {BRANCH} (at {}) is not needed any more, but it has commits other than swl \
+             bump's own; left as it is\n",
+            short(&theirs)
+        )),
+        "{log}"
+    );
+    assert!(log.contains("swl bump: nothing to bump"), "{log}");
+    assert_eq!(t.rev("swan-lake", BRANCH), theirs);
+    t.no_worktrees_left();
+}
+
+#[test]
+fn an_obsolete_bump_mr_is_reported_and_rebuilt_once_common_moves_first() {
+    let t = Bump::new("bump-obsolete");
+    t.f.commit_on_forge("zwanenzang", "master", "z2");
+    failed(&t.bump(&[]), 5, "swan-lake#1 waits for CI");
+    let opened = |w: &[String]| w.iter().filter(|w| w.contains("/pulls {")).count();
+    let before = opened(&t.f.api.writes());
+    let master = t.land_a_duplicate("swan-lake");
+    let old_tip = t.rev("swan-lake", BRANCH);
+
+    // Its change is in master: status says to close it, for anyone, and land
+    // does not merge it.
+    let ws = t.f.root.join("work/obsolete");
+    let ws_s = ws.display().to_string();
+    let login = [("SWL_FJ_KEYS", t.keys.as_str())];
+    stdout(&t.f.swl_env(
+        &t.f.root,
+        &["start", "--from", "swan-lake#1", "--workspace", &ws_s],
+        &login,
+    ));
+    let row = "obsolete: its change is in origin/master  waits: anyone  next: close swan-lake#1";
+    let detail = "swan-lake#1: its change is in origin/master already (merging it changes nothing)";
+    for args in [
+        vec!["status", "--workspace", &ws_s],
+        vec!["status", "--from", "swan-lake#1"],
+    ] {
+        let log = stdout(&t.f.swl_env(&t.f.root, &args, &login));
+        let line = log
+            .lines()
+            .find(|l| l.starts_with("swan-lake "))
+            .unwrap_or_else(|| panic!("no swan-lake row in\n{log}"));
+        let line = line.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            line.ends_with(&row.split_whitespace().collect::<Vec<_>>().join(" ")),
+            "{args:?}: {line}\n{log}"
+        );
+        assert!(log.contains(detail), "{args:?}:\n{log}");
+    }
+    let writes = t.f.api.writes().len();
+    let out = t.f.swl_env(
+        &t.f.root,
+        &["land", "--workspace", &ws_s, "--timeout", "0"],
+        &login,
+    );
+    failed(
+        &out,
+        4,
+        "waits for anyone: swan-lake#1: obsolete: its change is in origin/master; close it",
+    );
+    assert_eq!(
+        t.f.api.writes()[writes..],
+        [] as [String; 0],
+        "land writes nothing"
+    );
+    assert_eq!(t.rev("swan-lake", "master"), master);
+
+    // Common moves on before bump reruns: the branch is rebuilt on master
+    // and its MR reused, retitled; nothing is closed.
+    t.f.commit_on_forge("zwanenzang", "master", "z3");
+    let out = t.bump(&[]);
+    failed(&out, 5, "swan-lake#1 waits for CI");
+    assert!(
+        out_text(&out).contains(&format!(
+            "as origin's {BRANCH} (replacing its own commit {})",
+            short(&old_tip)
+        )),
+        "{}",
+        text(&out)
+    );
+    let second = t.rev(COMMON, "master");
+    let tip = t.rev("swan-lake", BRANCH);
+    assert_eq!(t.rev("swan-lake", &format!("{BRANCH}^")), master);
+    assert_eq!(t.locked("swan-lake", &tip, "lib"), second);
+    assert_eq!(t.rev("swan-lake", "refs/pull/1/head"), tip);
+    let writes = t.f.api.writes();
+    assert_eq!(opened(&writes), before, "no new MR: {writes:?}");
+    assert!(
+        !writes.iter().any(|w| w.contains("\"state\"")),
+        "{writes:?}"
+    );
+    assert!(
+        writes.iter().any(|w| w
+            == &format!(
+                "PATCH /api/v1/repos/binarin/swan-lake/pulls/1 {{\"title\":\"swl: bump common to {}\"}}",
+                short(&second)
+            )),
+        "{writes:?}"
+    );
+    assert_eq!(t.pr_state("swan-lake", 1), "open");
+}
+
+#[test]
+fn bump_starts_a_consumer_over_when_its_base_moves_before_the_push() {
+    let t = Bump::new("bump-base-race");
+    t.f.commit_on_forge("zwanenzang", "master", "z2");
+    failed(&t.bump(&[]), 5, "swan-lake#1 waits for CI");
+    let bumped = t.rev(COMMON, "master");
+
+    // swan-lake has no bump branch yet, and another run's bump of the same
+    // change lands on its master while this run relocks it: not pushed
+    // over, the consumer is started over and is done.
+    let sl = t.f.forge_repo("swan-lake");
+    let sl_s = sl.display().to_string();
+    let read = t.rev("swan-lake", "master");
+    let tip = t.rev("swan-lake", BRANCH);
+    t.f.api.set_pr("swan-lake", 1, "closed", BRANCH, &tip, None);
+    t.f.git(&sl, &["update-ref", "-d", &format!("refs/heads/{BRANCH}")]);
+    let copy = t.f.git(
+        &sl,
+        &[
+            "commit-tree",
+            "-p",
+            "master",
+            "-m",
+            "swl: bump common, by another run",
+            &format!("{tip}^{{tree}}"),
+        ],
+    );
+    let writes = t.f.api.writes().len();
+    let out = t.bump_racing(
+        "swan-lake",
+        &format!("git -C {sl_s} update-ref refs/heads/master {copy}"),
+    );
+    failed(&out, 5, "nixos-config#1 waits for CI");
+    let log = out_text(&out);
+    assert!(
+        log.contains(&format!(
+            "├─ origin/master at {} moved to {} (found before pushing its bump): starting \
+             swan-lake over on it\n└─ common is at {} already\n",
+            short(&read),
+            short(&copy),
+            short(&bumped)
+        )),
+        "{log}"
+    );
+    assert!(!t.has_branch("swan-lake"));
+    assert!(
+        !t.f.api.writes()[writes..]
+            .iter()
+            .any(|w| w.contains("swan-lake/pulls")),
+        "{:?}",
+        t.f.api.writes()
+    );
+
+    // nixos-config's master gets another commit while this run rebuilds its
+    // bump branch: rebuilt on that commit, its MR reused.
+    t.f.commit_on_forge("zwanenzang", "master", "z3");
+    let nc = t.f.forge_repo("nixos-config").display().to_string();
+    let nc_read = t.rev("nixos-config", "master");
+    let out = t.bump_racing(
+        "nixos-config",
+        &format!(
+            "git -C {nc} update-ref refs/heads/master \
+             $(git -C {nc} commit-tree -p master -m elsewhere master^{{tree}})"
+        ),
+    );
+    failed(&out, 5, "nixos-config#1 waits for CI");
+    let moved = t.rev("nixos-config", "master");
+    assert_ne!(moved, nc_read);
+    assert!(
+        out_text(&out).contains(&format!(
+            "├─ origin/master at {} moved to {} (found before pushing its bump): starting \
+             nixos-config over on it\n",
+            short(&nc_read),
+            short(&moved)
+        )),
+        "{}",
+        text(&out)
+    );
+    let second = t.rev(COMMON, "master");
+    assert_eq!(t.rev("nixos-config", &format!("{BRANCH}^")), moved);
+    assert_eq!(t.locked("nixos-config", BRANCH, "lib"), second);
+    assert_eq!(
+        t.rev("nixos-config", "refs/pull/1/head"),
+        t.rev("nixos-config", BRANCH)
+    );
+    t.no_worktrees_left();
 }

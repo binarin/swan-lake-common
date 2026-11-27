@@ -93,7 +93,8 @@ pub enum MergeReply {
 
 /// GET responses by path; anything else is 404. Paths under a private repo
 /// answer only with `Authorization: token TOKEN`, as Forgejo does; any other
-/// token is a 401. Writes (`PATCH .../pulls/N` for the title, `POST
+/// token is a 401. Writes (`PATCH .../pulls/N` for the title, the body and
+/// the state, `POST
 /// .../pulls` to open an MR, `POST .../pulls/N/merge`) need the token, and
 /// merges answer as programmed with [`FakeApi::on_merge`].
 #[derive(Clone, Default)]
@@ -115,6 +116,9 @@ pub struct FakeApi {
     /// The MRs (API paths) that the list of open MRs leaves out, with
     /// [`FakeApi::unlist_until_open`].
     pub unlisted: Arc<Mutex<BTreeSet<String>>>,
+    /// The MRs (API paths) that the user may not close, with
+    /// [`FakeApi::refuse_close`].
+    pub unclosable: Arc<Mutex<BTreeSet<String>>>,
 }
 
 /// A URL path segment percent-decoded, as Forgejo routes it.
@@ -410,6 +414,15 @@ impl FakeApi {
                 return not_found();
             };
             let mut v: serde_json::Value = serde_json::from_str(pr).unwrap();
+            if let Some(state) = req["state"].as_str() {
+                if self.unclosable.lock().unwrap().contains(path) {
+                    return (
+                        "403 Forbidden".into(),
+                        r#"{"message":"user should have permission to edit pull request"}"#.into(),
+                    );
+                }
+                v["state"] = state.into();
+            }
             if let Some(title) = req["title"].as_str() {
                 v["draft"] = title.to_ascii_uppercase().starts_with("WIP:").into();
                 v["title"] = title.into();
@@ -636,6 +649,16 @@ impl FakeApi {
             .lock()
             .unwrap()
             .insert(format!("/api/v1/repos/binarin/{repo}/pulls/{n}"));
+    }
+
+    /// Closing `repo#n` is refused (403), as for a user without the right.
+    pub fn refuse_close(&self, repo: &str, n: u64, refused: bool) {
+        let path = format!("/api/v1/repos/binarin/{repo}/pulls/{n}");
+        let mut unclosable = self.unclosable.lock().unwrap();
+        match refused {
+            true => unclosable.insert(path),
+            false => unclosable.remove(&path),
+        };
     }
 
     pub fn make_private(&self, repo: &str) {
