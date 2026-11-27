@@ -325,6 +325,33 @@ fn start_from_rejoins_a_workspace_removed_by_hand() {
     assert_eq!(f.git(&common, &["rev-parse", "HEAD"]), feature);
     assert!(consumer.join(".envrc.local").is_file());
 
+    // Removed by hand again, and the MR rebased and force-pushed meanwhile:
+    // the stale local branch is reset to the remote's.
+    fs::remove_dir_all(&ws).unwrap();
+    f.commit_file_on_forge("swan-lake", "master", "other.txt", "consumer-master");
+    let elsewhere = f.root.join("consumer-sl-0004-rejoin");
+    f.git(&elsewhere, &["fetch", "-q", "origin"]);
+    f.git(&elsewhere, &["rebase", "-q", "origin/master"]);
+    f.git(
+        &elsewhere,
+        &["push", "-q", "--force", "origin", "sl-0004-rejoin"],
+    );
+    let rebased = f.git(&elsewhere, &["rev-parse", "HEAD"]);
+    f.git(
+        &f.forge_repo("swan-lake"),
+        &["update-ref", "refs/pull/5/head", &rebased],
+    );
+    let out = stdout(&f.swl(&work, &from));
+    assert!(
+        out.contains(&format!(
+            "swl start: reset the branch sl-0004-rejoin of {} from {} to origin/sl-0004-rejoin",
+            f.source("swan-lake").display(),
+            &head[..12]
+        )),
+        "{out}"
+    );
+    assert_eq!(f.git(&consumer, &["rev-parse", "HEAD"]), rebased);
+
     // A branch checked out in a worktree that exists is still refused.
     let elsewhere = work.join("elsewhere");
     let out = f.swl(

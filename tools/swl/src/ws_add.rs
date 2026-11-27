@@ -13,9 +13,9 @@ use anyhow::{Context, Result, bail};
 use crate::{
     config::Config,
     env,
-    git::{git, git_ok},
+    git::{git, git_ok, short, unpushed, valid_branch},
     report::Report,
-    style::{self, Tone},
+    style::Tone,
     workspace::{Workspace, parse_shared_name},
 };
 
@@ -158,12 +158,17 @@ fn parse_worktrees(text: &str) -> Vec<Worktree> {
 /// there, or one that has the branch. One whose directory is gone (left by
 /// a workspace removed by hand) is dropped, `git worktree remove` of just
 /// that registration in the source, and said so with its full HEAD; one
-/// that exists, or a locked one, refuses. Other registrations whose directories are gone (a
-/// worktree moved, on media not mounted) are not touched.
+/// that exists, or a locked one, refuses. A detached one's commits that are
+/// pushed nowhere ([`unpushed`], against the base `remote`) are kept first
+/// on the new branch `swl-kept/<workspace>-<checkout>` of the source; when
+/// that branch name is invalid or taken, it refuses before dropping any.
+/// Other registrations whose directories are gone (a worktree moved, on
+/// media not mounted) are not touched.
 fn clear_stale_worktrees(
     source: &Path,
     dest: &Path,
     branch: Option<&str>,
+    remote: Option<&str>,
     report: &Report,
 ) -> Result<()> {
     let all = worktrees(source)?;
@@ -184,7 +189,24 @@ fn clear_stale_worktrees(
             }
         );
     }
+    let mut prunes = Vec::new();
     for w in blocking.iter().filter(|w| w.prunable) {
+        let kept = match (&w.branch, &w.head) {
+            (None, Some(head)) => {
+                let commits = unpushed(source, head, remote, None)?;
+                if commits.is_empty() {
+                    None
+                } else {
+                    let kept_branch = kept_branch_name(&w.path);
+                    check_kept_branch(source, &kept_branch, &w.path)?;
+                    Some((kept_branch, commits))
+                }
+            }
+            _ => None,
+        };
+        prunes.push((w, kept));
+    }
+    for (w, kept) in prunes {
         let path = w.path.to_string_lossy();
         let head = w
             .head
@@ -195,12 +217,35 @@ fn clear_stale_worktrees(
             None if w.head.is_some() => format!(" (detached{head})"),
             None => String::new(),
         };
+        if let (Some((kept_branch, _)), Some(head)) = (&kept, &w.head) {
+            let kept_ref = format!("refs/heads/{kept_branch}");
+            git(
+                source,
+                &[
+                    "update-ref",
+                    "-m",
+                    "swl ws add: keep the commits of a detached worktree whose directory is gone",
+                    &kept_ref,
+                    head,
+                    "",
+                ],
+            )
+            .with_context(|| format!("keeping the commits of {path} on {kept_ref}"))?;
+        }
         git(source, &["worktree", "remove", &path])?;
+        let kept_note = kept.map_or(String::new(), |(kept_branch, commits)| {
+            format!(
+                "; its commits on no remote branch are kept on the branch {kept_branch}:\n  {}\n\
+                 git -C {} branch -D {kept_branch} drops them",
+                commits.join("\n  "),
+                source.display()
+            )
+        });
         report.say(
             Tone::Warn,
             format!(
                 "pruned the worktree {path}{what} of {}, whose directory is gone (git worktree \
-                 remove)",
+                 remove){kept_note}",
                 source.display()
             ),
         );
@@ -208,10 +253,50 @@ fn clear_stale_worktrees(
     Ok(())
 }
 
-/// Checks out the existing local `branch`, fast-forwarding it first when it
-/// is strictly behind the remote's. Never resets: a diverged branch is left
-/// with a warning.
-fn existing_branch(source: &Path, remote: Option<&str>, branch: &str) -> Result<String> {
+/// `swl-kept/<workspace>-<checkout>` for the worktree at `path`
+/// (`<workspace>/<checkout>`).
+fn kept_branch_name(path: &Path) -> String {
+    let name = |p: Option<&Path>| {
+        p.and_then(Path::file_name)
+            .map_or(String::new(), |n| n.to_string_lossy().into_owned())
+    };
+    format!("swl-kept/{}-{}", name(path.parent()), name(Some(path)))
+}
+
+/// Refuses when `kept_branch`, to keep the commits of the detached worktree
+/// at `path`, is not a valid branch name or exists already in `source`.
+fn check_kept_branch(source: &Path, kept_branch: &str, path: &Path) -> Result<()> {
+    if !valid_branch(kept_branch) {
+        bail!(
+            "{kept_branch:?}, the branch to keep the commits of the detached worktree {}, whose \
+             directory is gone, is not a valid branch name; nothing was pruned",
+            path.display()
+        );
+    }
+    if rev(source, &format!("refs/heads/{kept_branch}")).is_some() {
+        bail!(
+            "the branch {kept_branch} of {}, to keep the commits of the detached worktree {}, \
+             whose directory is gone, exists already: rename or delete it (git -C {0} branch), \
+             then rerun; nothing was pruned",
+            source.display(),
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+/// Readies the existing local `branch`, which no worktree has checked out,
+/// to be checked out: fast-forwarded when it is strictly behind the
+/// remote's, reset to it when it diverged from it (a stale branch, left
+/// at its old head when the remote's was rebased and force-pushed) and
+/// said so. A diverged branch with commits that are pushed nowhere
+/// ([`unpushed`]) is refused, naming them; nothing is lost.
+fn existing_branch(
+    source: &Path,
+    remote: Option<&str>,
+    branch: &str,
+    report: &Report,
+) -> Result<String> {
     let local = rev(source, &format!("refs/heads/{branch}")).expect("checked by the caller");
     let Some(remote) = remote else {
         return Ok(format!("existing branch {branch}"));
@@ -223,33 +308,54 @@ fn existing_branch(source: &Path, remote: Option<&str>, branch: &str) -> Result<
     if theirs == local || is_ancestor(source, &theirs, &local) {
         return Ok(format!("existing branch {branch}"));
     }
-    if is_ancestor(source, &local, &theirs) {
-        git(
+    let behind = is_ancestor(source, &local, &theirs);
+    if !behind {
+        let lost = unpushed(
             source,
-            &[
-                "update-ref",
-                "-m",
-                &format!("swl ws add: fast-forward to {tracking}"),
-                &format!("refs/heads/{branch}"),
-                &theirs,
-                &local,
-            ],
+            &local,
+            Some(remote),
+            Some(&format!("refs/remotes/{tracking}")),
         )?;
+        if !lost.is_empty() {
+            bail!(
+                "branch {branch} has diverged from {tracking}, and it has commits that are on no \
+                 remote branch, which resetting it would lose:\n  {}\nto keep them, push them \
+                 (or rebase them onto {tracking}) from a checkout of {branch}; to drop them, `git \
+                 -C {} branch -D {branch}`; then rerun to join afresh (`swl ws remove` drops a \
+                 workspace with its pushed branches, so that none is left behind)",
+                lost.join("\n  "),
+                source.display()
+            );
+        }
+    }
+    let what = if behind { "fast-forward" } else { "reset" };
+    git(
+        source,
+        &[
+            "update-ref",
+            "-m",
+            &format!("swl ws add: {what} to {tracking}"),
+            &format!("refs/heads/{branch}"),
+            &theirs,
+            &local,
+        ],
+    )?;
+    if behind {
         return Ok(format!(
             "existing branch {branch}, fast-forwarded to {tracking}"
         ));
     }
-    style::tell(
-        "swl ws add",
+    report.say(
         Tone::Warn,
         format!(
-            "warning: {branch} and {tracking} have diverged; left as it is (merge or \
-         rebase in the checkout)"
+            "reset the branch {branch} of {} from {} to {tracking} at {}: it had diverged, \
+             and its commits are on remote branches",
+            source.display(),
+            short(&local),
+            short(&theirs)
         ),
     );
-    Ok(format!(
-        "existing branch {branch}, diverged from {tracking}"
-    ))
+    Ok(format!("existing branch {branch}, reset to {tracking}"))
 }
 
 /// Adds the checkout `name` (`<repo>` or `<repo>@<input>`) to the workspace
@@ -280,7 +386,7 @@ pub fn add(
         Start::Branch(b) if rev(source, &format!("refs/heads/{b}")).is_some() => Some(b),
         _ => None,
     };
-    clear_stale_worktrees(source, &dest, existing, report)?;
+    clear_stale_worktrees(source, &dest, existing, remote.as_deref(), report)?;
     let dest_str = dest.to_string_lossy().into_owned();
     let how = match start {
         Start::Base => {
@@ -298,7 +404,7 @@ pub fn add(
             format!("detached at {}", crate::git::short(at))
         }
         Start::Branch(b) if rev(source, &format!("refs/heads/{b}")).is_some() => {
-            let how = existing_branch(source, remote.as_deref(), b)?;
+            let how = existing_branch(source, remote.as_deref(), b, report)?;
             git(source, &["worktree", "add", "--quiet", &dest_str, b])?;
             how
         }

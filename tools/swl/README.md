@@ -140,23 +140,42 @@ terminal.
     for offline work; a failed fetch is an error, not a stale base.
   - Without `--branch`, the worktree is detached at `base`. With `--branch B`:
     an existing local B is checked out, fast-forwarded first when it is
-    strictly behind `<remote>/B` (a diverged one is left with a warning;
-    swl never resets); else B is created at `<remote>/B` with that upstream,
-    to join a published branch; else B is created at `base` without an
-    upstream.
+    strictly behind `<remote>/B`; else B is created at `<remote>/B` with that
+    upstream, to join a published branch; else B is created at `base`
+    without an upstream.
+  - An existing local B that has diverged from `<remote>/B` (a stale
+    branch, left at its old head when the MR was rebased and force-pushed)
+    is reset to `<remote>/B`, and said so (`swl ws add: reset the branch B
+    of <source> from <old> to <remote>/B at <new>: …`), only when none of
+    its commits would be lost: each is on a branch of the remote it fetched
+    (`<remote>/*`; other remotes, not fetched, do not count), or its change
+    is on `<remote>/B` (the same patch, as `git cherry` tells it: a plain
+    rebase; an empty commit is never the same patch). With `--no-fetch`,
+    that is judged by the `<remote>/*` refs the source already has.
+    Otherwise it is refused, naming the commits pushed nowhere (short sha
+    and subject), with how to keep or drop them; nothing is reset. By
+    design this refuses a branch whose commits were amended, or rebased
+    with conflicts resolved, before the force-push: their patches differ.
+    Other worktrees are not touched: B is checked out in none (see below).
   - A worktree that stands in the way, registered at the checkout's
     directory or holding the existing branch B, but whose directory is gone
     (a workspace removed by hand with `rm -rf`), is pruned first: `git
     worktree remove <path>` in the source drops just that registration, and
     says so with its full HEAD sha (`swl ws add: pruned the worktree <path>
     (branch B at <sha>) of <source>, whose directory is gone (git worktree
-    remove)`; `(detached at <sha>)` for a detached one). Only those: nothing is
-    pruned when nothing stands in the way, other registrations whose
-    directories are gone (a worktree moved, or on media not mounted) are
-    left alone, and a worktree whose directory exists, or a locked one,
-    still refuses (`branch B is already checked out at <path>`; git's `is a
-    missing but locked worktree` at the checkout's directory). `start`,
-    `start --from` and `land --from` add their checkouts the same way.
+    remove)`; `(detached at <sha>)` for a detached one). A detached one's
+    commits pushed nowhere (as for the reset above, but with no remote
+    branch to compare patches with) are kept first: on the new branch
+    `swl-kept/<workspace>-<checkout>` of the source, named in that message
+    with the commits and the `git branch -D` that drops them; it refuses,
+    pruning nothing, when that branch exists already or is not a valid
+    name. Only those: nothing is pruned when nothing stands in the way,
+    other registrations whose directories are gone (a worktree moved, or
+    on media not mounted) are left alone, and a worktree whose directory
+    exists, or a locked one, still refuses (`branch B is already checked
+    out at <path>`; git's `is a missing but locked worktree` at the
+    checkout's directory). `start`, `start --from` and `land --from` add
+    their checkouts the same way.
   - Then it runs `env` for the workspace, unless `--no-env`, or while the
     workspace has no consumer checkout yet. When `env` refuses (a
     hand-written `.envrc.local`), the checkout is still added; fix it and

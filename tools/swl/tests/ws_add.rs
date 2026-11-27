@@ -1,5 +1,6 @@
 //! `swl ws add` on a disposable forge: it fetches the source first, joins a
-//! published branch, fast-forwards a stale local one, and runs `swl env`.
+//! published branch, fast-forwards or resets a stale local one, and runs
+//! `swl env`.
 
 mod support;
 
@@ -101,21 +102,40 @@ fn ws_add_joins_a_published_branch_and_fast_forwards_a_stale_one() {
     assert!(out.contains("fast-forwarded to origin/feature"), "{out}");
     assert_eq!(f.git(&checkout, &["rev-parse", "HEAD"]), newer);
 
-    // Diverged: left as it is, with a warning.
+    // Diverged, with a commit that is on no remote branch: refused, naming
+    // it; nothing is added or reset.
     fs::write(checkout.join("value.txt"), "mine").unwrap();
     f.git(&checkout, &["commit", "-qam", "mine"]);
     let mine = f.git(&checkout, &["rev-parse", "HEAD"]);
     remove(&f);
-    f.commit_on_forge("swan-lake-common", "feature", "theirs");
+    let theirs = f.commit_on_forge("swan-lake-common", "feature", "theirs");
     let out = f.swl(&f.root, &add);
-    let log = stdout(&out);
-    assert!(log.contains("diverged from origin/feature"), "{log}");
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("have diverged"),
-        "{}",
-        support::text(&out)
+    failed(
+        &out,
+        2,
+        &format!(
+            "branch feature has diverged from origin/feature, and it has commits that are on no \
+             remote branch, which resetting it would lose:\n  {} mine\n",
+            &mine[..7]
+        ),
     );
-    assert_eq!(f.git(&checkout, &["rev-parse", "HEAD"]), mine);
+    failed(
+        &out,
+        2,
+        &format!("git -C {} branch -D feature", source.display()),
+    );
+    assert!(!checkout.exists());
+    assert_eq!(f.git(&source, &["rev-parse", "feature"]), mine);
+
+    // Dropped by hand: joined afresh.
+    f.git(&source, &["branch", "-D", "feature"]);
+    let out = stdout(&f.swl(&f.root, &add));
+    assert!(
+        out.contains("new branch feature tracking origin/feature"),
+        "{out}"
+    );
+    assert_eq!(f.git(&checkout, &["rev-parse", "HEAD"]), theirs);
+    let mine = theirs;
 
     // A branch checked out in another worktree is refused; nothing is added.
     let other = ws.join("swan-lake-common@other");
@@ -330,4 +350,187 @@ fn ws_add_prunes_only_the_registration_in_the_way_and_refuses_a_locked_one_at_th
         list.contains(&format!("worktree {}\n", c.display())),
         "{list}"
     );
+}
+
+#[test]
+fn ws_add_keeps_the_unpushed_commits_of_a_detached_worktree_removed_by_hand_on_a_branch() {
+    let f = Forge::new("add-stale-detached");
+    let ws = f.root.join("ws");
+    let ws_s = ws.display().to_string();
+    let source = f.source("swan-lake-common");
+    let add = || {
+        f.swl(
+            &f.root,
+            &[
+                "ws",
+                "add",
+                "swan-lake-common@d",
+                "--workspace",
+                &ws_s,
+                "--no-env",
+            ],
+        )
+    };
+    let d = ws.join("swan-lake-common@d");
+    stdout(&add());
+    fs::write(d.join("value.txt"), "d2").unwrap();
+    f.git(&d, &["add", "value.txt"]);
+    f.git(&d, &["commit", "-qm", "d2 detached"]);
+    let d2 = f.git(&d, &["rev-parse", "HEAD"]);
+    let d2_short = f.git(&d, &["rev-parse", "--short", "HEAD"]);
+    fs::remove_dir_all(&d).unwrap();
+    let registered = |f: &Forge| {
+        f.git(&source, &["worktree", "list", "--porcelain"])
+            .contains(&format!("worktree {}\n", d.display()))
+    };
+
+    // The branch to keep them on is taken: refused, nothing pruned.
+    let kept = "swl-kept/ws-swan-lake-common@d";
+    f.git(&source, &["branch", kept, "origin/master"]);
+    let out = add();
+    failed(
+        &out,
+        2,
+        &format!(
+            "the branch {kept} of {}, to keep the commits of the detached worktree {}, whose \
+             directory is gone, exists already",
+            source.display(),
+            d.display()
+        ),
+    );
+    assert!(!support::text(&out).contains("pruned the worktree"));
+    assert!(registered(&f));
+    assert!(!d.exists());
+
+    f.git(&source, &["branch", "-D", kept]);
+    let out = stdout(&add());
+    assert!(
+        out.contains(&format!(
+            "swl ws add: pruned the worktree {} (detached at {d2}) of {}, whose directory is \
+             gone (git worktree remove); its commits on no remote branch are kept on the branch \
+             {kept}:\n",
+            d.display(),
+            source.display()
+        )),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!("\n  {d2_short} d2 detached\n")),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!(
+            "git -C {} branch -D {kept} drops them",
+            source.display()
+        )),
+        "{out}"
+    );
+    assert_eq!(
+        f.git(&source, &["rev-parse", &format!("refs/heads/{kept}")]),
+        d2
+    );
+    assert!(d.join("flake.nix").is_file());
+    assert_ne!(f.git(&d, &["rev-parse", "HEAD"]), d2);
+
+    // A workspace whose name makes no valid branch: refused, nothing pruned.
+    let bad = f.root.join("bad..ws");
+    let bad_s = bad.display().to_string();
+    let add_bad = || {
+        f.swl(
+            &f.root,
+            &[
+                "ws",
+                "add",
+                "swan-lake-common@e",
+                "--workspace",
+                &bad_s,
+                "--no-env",
+            ],
+        )
+    };
+    let e = bad.join("swan-lake-common@e");
+    stdout(&add_bad());
+    fs::write(e.join("value.txt"), "e2").unwrap();
+    f.git(&e, &["add", "value.txt"]);
+    f.git(&e, &["commit", "-qm", "e2 detached"]);
+    fs::remove_dir_all(&e).unwrap();
+    let out = add_bad();
+    failed(
+        &out,
+        2,
+        "\"swl-kept/bad..ws-swan-lake-common@e\", the branch to keep the commits of the \
+         detached worktree",
+    );
+    assert!(!support::text(&out).contains("pruned the worktree"));
+    assert!(
+        f.git(&source, &["worktree", "list", "--porcelain"])
+            .contains(&format!("worktree {}\n", e.display()))
+    );
+}
+
+#[test]
+fn ws_add_resets_a_branch_left_behind_by_a_force_push_unless_it_would_lose_work() {
+    let f = Forge::new("add-reset");
+    let ws = f.root.join("ws");
+    let ws_s = ws.display().to_string();
+    let checkout = ws.join("swan-lake-common@lib");
+    let source = f.source("swan-lake-common");
+    let add = [
+        "ws",
+        "add",
+        "swan-lake-common@lib",
+        "--workspace",
+        &ws_s,
+        "--branch",
+        "feature",
+        "--no-env",
+    ];
+    let old = f.commit_file_on_forge("swan-lake-common", "feature", "notes.txt", "a change");
+    stdout(&f.swl(&f.root, &add));
+    // The workspace is removed by hand; elsewhere, the branch is rebased
+    // onto a newer master and force-pushed.
+    fs::remove_dir_all(&ws).unwrap();
+    f.commit_on_forge("swan-lake-common", "master", "c-new");
+    let elsewhere = f.clone_elsewhere("swan-lake-common", "rebaser");
+    f.git(&elsewhere, &["checkout", "-q", "feature"]);
+    f.git(&elsewhere, &["rebase", "-q", "origin/master"]);
+    f.git(&elsewhere, &["push", "-q", "--force", "origin", "feature"]);
+    let rebased = f.git(&elsewhere, &["rev-parse", "HEAD"]);
+
+    // Its old commits' changes are on the remote branch: reset to it.
+    let out = stdout(&f.swl(&f.root, &add));
+    assert!(
+        out.contains(&format!(
+            "swl ws add: reset the branch feature of {} from {} to origin/feature at {}: it had \
+             diverged, and its commits are on remote branches",
+            source.display(),
+            &old[..12],
+            &rebased[..12]
+        )),
+        "{out}"
+    );
+    assert!(
+        out.contains("existing branch feature, reset to origin/feature"),
+        "{out}"
+    );
+    assert_eq!(f.git(&checkout, &["rev-parse", "HEAD"]), rebased);
+
+    // Amended and force-pushed: the old change is on no remote branch.
+    fs::remove_dir_all(&ws).unwrap();
+    fs::write(elsewhere.join("notes.txt"), "another change").unwrap();
+    f.git(
+        &elsewhere,
+        &["commit", "-q", "-a", "--amend", "-m", "amended"],
+    );
+    f.git(&elsewhere, &["push", "-q", "--force", "origin", "feature"]);
+    let out = f.swl(&f.root, &add);
+    failed(
+        &out,
+        2,
+        &format!(
+            "on no remote branch, which resetting it would lose:\n  {} swan-lake-common: a change\n",
+            &rebased[..7]
+        ),
+    );
+    assert_eq!(f.git(&source, &["rev-parse", "feature"]), rebased);
 }
