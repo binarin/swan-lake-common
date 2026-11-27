@@ -15,6 +15,8 @@ use crate::{
     git::{git, git_ok, short},
     lock::Lock,
     manifest::{Entry, MANIFEST_FILE, Manifest},
+    report::Report,
+    style::Tone,
     workspace::{Checkout, Workspace},
 };
 
@@ -173,18 +175,17 @@ fn refuse_merged(c: &Checkout, repo: &str, b: &Branch, reader: &dyn PrReader) ->
     )
 }
 
-fn push(c: &Checkout, b: &Branch) -> Result<()> {
+fn push(report: &Report, c: &Checkout, b: &Branch) -> Result<()> {
+    report.section(&c.name);
     if b.pushed {
-        println!("{}: {} is pushed", c.name, b.name);
+        report.step(format!("{}: {} is pushed", c.name, b.name));
         return Ok(());
     }
     let refspec = format!("refs/heads/{0}:refs/heads/{0}", b.name);
     git(&c.dir, &["push", "--quiet", "origin", &refspec])?;
-    println!(
-        "{}: pushed {} ({})",
-        c.name,
-        b.name,
-        crate::git::short(&b.head)
+    report.outcome(
+        Tone::Good,
+        format!("{}: pushed {} ({})", c.name, b.name, short(&b.head)),
     );
     Ok(())
 }
@@ -212,8 +213,10 @@ fn title_and_body(c: &Checkout, b: &Branch, extra: &str) -> Result<(String, Stri
 /// The open MR from the branch into its base, found in the forge's list of
 /// open MRs, or opened (a `WIP: ` title makes it a draft on Forgejo). When
 /// the forge refuses to open it because it has one already, that one is
-/// looked up again.
+/// looked up again. Said as the end of `c`'s section when it is `last`.
+#[allow(clippy::too_many_arguments)]
 fn find_or_open(
+    report: &Report,
     writer: &dyn ForgeWriter,
     reader: &dyn PrReader,
     repo: &str,
@@ -221,13 +224,19 @@ fn find_or_open(
     b: &Branch,
     draft: bool,
     extra: &str,
+    last: bool,
 ) -> Result<u64> {
+    report.section(&c.name);
     let lookup = || reader.open_pr_from(repo, &b.base_branch, &b.name);
     let found = |info: PrInfo| {
-        println!(
+        let msg = format!(
             "{}: MR {repo}#{} is open for {}",
             c.name, info.number, b.name
         );
+        match last {
+            true => report.end(Tone::Plain, msg),
+            false => report.step(msg),
+        }
         info.number
     };
     if let Some(info) = lookup()? {
@@ -241,7 +250,11 @@ fn find_or_open(
     };
     match writer.create_pr(repo, &b.base_branch, &b.name, &title, &body) {
         Ok(info) => {
-            println!("{}: opened MR {repo}#{}: {title}", c.name, info.number);
+            let msg = format!("{}: opened MR {repo}#{}: {title}", c.name, info.number);
+            match last {
+                true => report.end(Tone::Good, msg),
+                false => report.outcome(Tone::Good, msg),
+            }
             Ok(info.number)
         }
         Err(e) if e.is::<PrExists>() => match lookup()? {
@@ -268,6 +281,7 @@ pub fn run(
         .iter()
         .find(|c| c.name == consumer && c.is_consumer())
         .ok_or_else(|| anyhow!("no consumer checkout {consumer:?} in {}", ws.root.display()))?;
+    let report = &Report::new("swl publish");
     let lock = Lock::read(&target.dir)?;
     // input paths per shared checkout whose HEAD differs from the consumer's lock.
     let mut changed: BTreeMap<&str, (&Checkout, Vec<String>)> = BTreeMap::new();
@@ -280,10 +294,11 @@ pub fn run(
         let head = git(&checkout.dir, &["rev-parse", "HEAD"])?;
         let path: Vec<String> = o.input_path.split('/').map(str::to_string).collect();
         if lock.as_ref().and_then(|l| l.locked_rev(&path)).as_deref() == Some(head.as_str()) {
-            println!(
+            report.section(&checkout.name);
+            report.step(format!(
                 "{}: at the rev {consumer} locks for {}",
                 checkout.name, o.input_path
-            );
+            ));
             continue;
         }
         changed
@@ -304,9 +319,13 @@ pub fn run(
         fetch_base(checkout, base)?;
         let head = git(&checkout.dir, &["rev-parse", "HEAD"])?;
         if git_ok(&checkout.dir, &["merge-base", "--is-ancestor", &head, base]).is_some() {
-            println!(
-                "{}: HEAD is already in {base}; that is a lock bump, not an MR",
-                checkout.name
+            report.section(&checkout.name);
+            report.end(
+                Tone::Plain,
+                format!(
+                    "{}: HEAD is already in {base}; that is a lock bump, not an MR",
+                    checkout.name
+                ),
             );
             continue;
         }
@@ -324,9 +343,11 @@ pub fn run(
     let mut manifest = Manifest::read(&target.dir)?.unwrap_or_default();
     let mut depends = String::new();
     for (checkout, repo, paths, branch) in &shared {
-        push(checkout, branch)?;
+        push(report, checkout, branch)?;
         let extra = format!("\nUsed by {consumer} as {}.\n", paths.join(", "));
-        let mr = find_or_open(writer, reader, repo, checkout, branch, true, &extra)?;
+        let mr = find_or_open(
+            report, writer, reader, repo, checkout, branch, true, &extra, false,
+        )?;
         for p in paths {
             depends.push_str(&format!("- {repo}#{mr} ({p})\n"));
             manifest.inputs.insert(
@@ -358,12 +379,17 @@ pub fn run(
                 MANIFEST_FILE,
             ],
         )?;
-        println!(
-            "{consumer}: committed {MANIFEST_FILE}: {}",
-            names.join(", ")
+        report.section(consumer);
+        report.outcome(
+            Tone::Good,
+            format!(
+                "{consumer}: committed {MANIFEST_FILE}: {}",
+                names.join(", ")
+            ),
         );
     } else if !manifest.is_empty() {
-        println!("{consumer}: {MANIFEST_FILE} is current");
+        report.section(consumer);
+        report.step(format!("{consumer}: {MANIFEST_FILE} is current"));
     }
 
     // Again, now that the manifest commit may be on top.
@@ -379,19 +405,24 @@ pub fn run(
     )
     .is_some()
     {
-        println!(
-            "{consumer}: HEAD is already in {}; no consumer MR to open",
-            consumer_branch.base_ref
+        report.section(consumer);
+        report.end(
+            Tone::Plain,
+            format!(
+                "{consumer}: HEAD is already in {}; no consumer MR to open",
+                consumer_branch.base_ref
+            ),
         );
         return Ok(());
     }
-    push(target, &consumer_branch)?;
+    push(report, target, &consumer_branch)?;
     let extra = if depends.is_empty() {
         String::new()
     } else {
         format!("\nDepends on (see {MANIFEST_FILE}):\n{depends}")
     };
     find_or_open(
+        report,
         writer,
         reader,
         consumer,
@@ -399,6 +430,7 @@ pub fn run(
         &consumer_branch,
         false,
         &extra,
+        true,
     )?;
     Ok(())
 }

@@ -4,6 +4,7 @@
 //! checkouts are kept, missing ones are added.
 
 use std::{
+    io::Write,
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -15,8 +16,9 @@ use crate::{
     forge::{PrReader, PrState},
     git::{git, git_ok, short},
     manifest::{MANIFEST_FILE, Manifest},
+    report,
     shim::find_real_tool,
-    style::{self, Tone},
+    style::{self, BOLD, Tone, pad, paint, width},
     workspace::parse_shared_name,
     ws_add::{self, Fetcher, Start},
 };
@@ -360,7 +362,7 @@ pub fn execute(
         }
         let (branch, head) = describe_head(&dest)?;
         let at = branch.unwrap_or_else(|| format!("detached at {}", short(&head)));
-        summary.push(format!("  {}  {at}", item.name));
+        summary.push((item.name.as_str(), at));
     }
     ws_add::env_after_add(config, &root, swl, "the checkouts were")?;
     let consumers: Vec<PathBuf> = items
@@ -369,9 +371,15 @@ pub fn execute(
         .map(|i| root.join(&i.name))
         .collect();
     direnv_allow(&consumers);
-    println!("\nworkspace {}:", root.display());
-    for line in summary {
-        println!("{line}");
+    let name_w = summary.iter().map(|(n, _)| width(n)).max().unwrap_or(0);
+    let children: Vec<String> = summary
+        .iter()
+        .map(|(n, at)| format!("{}{}  {at}", paint(BOLD, n), pad(name_w, width(n))))
+        .collect();
+    let mut stdout = anstream::stdout();
+    let _ = writeln!(stdout);
+    for line in report::tree(format!("workspace {}:", root.display()), &children) {
+        let _ = writeln!(stdout, "{line}");
     }
     let cd = consumers.into_iter().next();
     if let Some(first) = &cd {

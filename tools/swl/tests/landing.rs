@@ -453,15 +453,18 @@ fn publish_is_rerunnable_and_fast_forward_only() {
     let log = stdout(&w.swl(&w.root, &publish, &[]));
     assert_eq!(w.creates(), 2, "{:?}", w.api.writes());
     assert_eq!(w.git(&w.consumer, &["rev-parse", "HEAD"]), consumer_head);
-    for line in [
-        "swan-lake-common@lib: feature is pushed",
-        "swan-lake-common@lib: MR swan-lake-common#1 is open for feature",
-        "swan-lake: swl.toml is current",
-        "swan-lake: feat is pushed",
-        "swan-lake: MR swan-lake#1 is open for feat",
-    ] {
-        assert!(log.lines().any(|l| l == line), "missing {line:?} in\n{log}");
-    }
+    assert_eq!(
+        log,
+        "\
+swl publish: swan-lake-common@lib
+├─ feature is pushed
+├─ MR swan-lake-common#1 is open for feature
+╵
+swl publish: swan-lake
+├─ swl.toml is current
+├─ feat is pushed
+└─ MR swan-lake#1 is open for feat"
+    );
 
     // A new local commit on top publishes fast-forward; the MR stays.
     fs::write(w.common.join("value.txt"), "c3").unwrap();
@@ -544,8 +547,8 @@ fn publish_finds_and_opens_its_mrs_beside_an_open_mr_it_cannot_read() {
     }
     let log = stdout(&w.swl(&w.root, &publish, &[]));
     for line in [
-        "swan-lake-common@lib: opened MR swan-lake-common#2: WIP: common: c2",
-        "swan-lake: opened MR swan-lake#2: consumer: use c2",
+        "├─ opened MR swan-lake-common#2: WIP: common: c2",
+        "└─ opened MR swan-lake#2: consumer: use c2",
     ] {
         assert!(log.lines().any(|l| l == line), "missing {line:?} in\n{log}");
     }
@@ -553,8 +556,8 @@ fn publish_finds_and_opens_its_mrs_beside_an_open_mr_it_cannot_read() {
     assert_eq!(w.mr("swan-lake", 2)["head"]["ref"], "feat");
     let log = stdout(&w.swl(&w.root, &publish, &[]));
     for line in [
-        "swan-lake-common@lib: MR swan-lake-common#2 is open for feature",
-        "swan-lake: MR swan-lake#2 is open for feat",
+        "├─ MR swan-lake-common#2 is open for feature",
+        "└─ MR swan-lake#2 is open for feat",
     ] {
         assert!(log.lines().any(|l| l == line), "missing {line:?} in\n{log}");
     }
@@ -573,7 +576,7 @@ fn publish_finds_and_opens_its_mrs_beside_an_open_mr_it_cannot_read() {
     let log = stdout(&w.swl(&w.root, &publish, &[]));
     assert!(
         log.lines()
-            .any(|l| l == "swan-lake: opened MR swan-lake#4: consumer: use c2"),
+            .any(|l| l == "└─ opened MR swan-lake#4: consumer: use c2"),
         "{log}"
     );
     assert_eq!(w.mr("swan-lake", 4)["base"]["ref"], "master");
@@ -603,7 +606,10 @@ fn publish_takes_the_open_mr_the_forge_has_when_it_refuses_to_open_one() {
     );
     let log = text(&out);
     assert!(
-        log.contains("swan-lake-common@lib: MR swan-lake-common#7 is open for feature"),
+        log.contains(
+            "swl publish: swan-lake-common@lib\n├─ feature is pushed\n├─ MR swan-lake-common#7 is \
+             open for feature\n"
+        ),
         "{log}"
     );
     assert!(
@@ -1510,7 +1516,9 @@ fn publish_refuses_a_branch_whose_mr_merged_without_its_commits() {
     w.git(&w.consumer, &["switch", "-qc", "at-base", &consumer_master]);
     let out = stdout(&w.swl(&w.root, &publish, &[]));
     assert!(
-        out.contains("swan-lake: HEAD is already in origin/master; no consumer MR to open"),
+        out.contains(
+            "swl publish: swan-lake\n└─ HEAD is already in origin/master; no consumer MR to open"
+        ),
         "{out}"
     );
 
@@ -1533,4 +1541,32 @@ fn publish_refuses_a_branch_whose_mr_merged_without_its_commits() {
         w.git(&w.forge_repo("swan-lake"), &["rev-parse", "unknown#merge"]),
         w.git(&w.consumer, &["rev-parse", "HEAD"])
     );
+}
+
+#[test]
+fn publish_closes_its_section_before_an_error() {
+    let w = World::new("publish-error");
+    let ws = w.ws.display().to_string();
+    // The forge refuses the consumer's push, which comes after common's
+    // steps and the consumer's manifest.
+    let hook = w.forge_repo("swan-lake").join("hooks/pre-receive");
+    fs::write(
+        &hook,
+        "#!/bin/sh\necho 'push refused by the test' >&2\nexit 1\n",
+    )
+    .unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+    let out = w.swl(&w.root, &["publish", "--workspace", &ws, "swan-lake"], &[]);
+    failed(&out, 2, "push refused by the test");
+    // The open section is closed on stdout; the error is on stderr only.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.ends_with("swl publish: swan-lake\n├─ committed swl.toml: swan-lake-common#1\n╵\n"),
+        "{}",
+        text(&out)
+    );
+    assert!(!stdout.contains("push refused"), "{}", text(&out));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.starts_with("swl: git -C "), "{}", text(&out));
+    assert!(!stderr.contains('╵'), "{}", text(&out));
 }

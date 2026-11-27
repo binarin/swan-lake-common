@@ -288,6 +288,21 @@ impl Drop for Report {
     }
 }
 
+/// The lines of a tree whose children are all known: `title`, then each
+/// child as `├─ <child>`, the last as `└─ <child>`.
+pub fn tree(title: impl Display, children: &[String]) -> Vec<String> {
+    let mut out = vec![title.to_string()];
+    for (i, c) in children.iter().enumerate() {
+        let glyph = if i + 1 == children.len() {
+            LAST
+        } else {
+            BRANCH
+        };
+        out.push(format!("{}{c}", paint(DIM, glyph)));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -480,5 +495,12 @@ swl bump: common
 "
         );
         assert!(text.lines().all(|l| width(l) <= LIST_WIDTH), "{text}");
+    }
+
+    #[test]
+    fn a_known_tree_ends_with_its_last_child() {
+        let lines = tree("workspace /ws:", &["a  b".into(), "c  d".into()]);
+        assert_eq!(plain(&lines), "workspace /ws:\n├─ a  b\n└─ c  d\n");
+        assert_eq!(plain(&tree("t", &[])), "t\n");
     }
 }
