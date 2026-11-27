@@ -1,7 +1,7 @@
 //! The forge (Forgejo): MR state and commit status through the REST API,
-//! anonymously or, for `status` and `start`, read-only with the login of the
-//! `fj` CLI; and MR creation through `fj`. swl itself has no token
-//! configuration.
+//! anonymously or with the login of the `fj` CLI (its `keys.json`), and the
+//! writes (opening, retitling and merging MRs) with that login. swl never
+//! runs `fj`, and has no token configuration of its own.
 
 use std::{
     env,
@@ -171,10 +171,11 @@ pub const NOT_FOUND: &str = "no such MR (or the repo is not public)";
 pub trait PrReader {
     fn pr(&self, repo: &str, number: u64) -> Result<Option<PrInfo>>;
     fn commit_status(&self, repo: &str, sha: &str) -> Result<Option<CiState>>;
-    /// The open MR whose head is the branch `branch`, from the forge's list of
-    /// open MRs; for a pull ref that lags behind a push.
-    fn open_pr_from(&self, repo: &str, branch: &str) -> Result<Option<PrInfo>> {
-        let _ = (repo, branch);
+    /// The open MR from the branch `branch` into `base`, from the forge's
+    /// list of open MRs (one that cannot be read is skipped, with a
+    /// warning); for a pull ref that lags behind a push.
+    fn open_pr_from(&self, repo: &str, base: &str, branch: &str) -> Result<Option<PrInfo>> {
+        let _ = (repo, base, branch);
         bail!("this reader does not list MRs")
     }
     /// The MR from `branch` into `base`, in any state, by the forge's
@@ -184,7 +185,8 @@ pub trait PrReader {
         bail!("this reader does not look up MRs by branch")
     }
     /// Every open MR of `repo` (drafts and every author's), from the
-    /// forge's list of open MRs; `Ok(None)` is a 404.
+    /// forge's list of open MRs, without those it cannot read (a warning
+    /// each); `Ok(None)` is a 404.
     fn open_prs(&self, repo: &str) -> Result<Option<Vec<PrInfo>>> {
         let _ = repo;
         bail!("this reader does not list MRs")
@@ -373,24 +375,63 @@ fn read_open_page(
     }
 }
 
-/// The open MR of `branch`, from `GET /repos/{owner}/{repo}/pulls?state=open`,
-/// page by page.
+/// An MR of a list of open MRs, or `None`, with a warning naming `repo#N`,
+/// when it cannot be read: one malformed MR does not hide the others.
+fn listed_pr(repo: &str, pr: &Value) -> Option<PrInfo> {
+    match PrInfo::from_api(pr) {
+        Ok(info) => Some(info),
+        Err(e) => {
+            crate::style::tell(
+                "swl",
+                crate::style::Tone::Warn,
+                skipped_warning(repo, pr, &e),
+            );
+            None
+        }
+    }
+}
+
+/// The warning for an MR of a list of open MRs that cannot be read.
+fn skipped_warning(repo: &str, pr: &Value, e: &anyhow::Error) -> String {
+    let number = pr
+        .get("number")
+        .and_then(Value::as_u64)
+        .map_or_else(|| "?".to_string(), |n| n.to_string());
+    format!("warning: skipping {repo}#{number}, an open MR that swl cannot read: {e:#}")
+}
+
+/// The open MR from `branch` into `base` on a page of open MRs, by its head
+/// and base branch; one of them that cannot be read is skipped.
+fn open_pr_on_page(repo: &str, prs: &[Value], base: &str, branch: &str) -> Option<PrInfo> {
+    prs.iter()
+        .filter(|pr| {
+            pr.pointer("/head/ref").and_then(Value::as_str) == Some(branch)
+                && pr.pointer("/base/ref").and_then(Value::as_str) == Some(base)
+        })
+        .find_map(|pr| listed_pr(repo, pr))
+}
+
+/// The MRs of a page of open MRs, without those that cannot be read.
+fn open_prs_on_page(repo: &str, prs: &[Value]) -> Vec<PrInfo> {
+    prs.iter().filter_map(|pr| listed_pr(repo, pr)).collect()
+}
+
+/// The open MR from `branch` into `base`, from `GET
+/// /repos/{owner}/{repo}/pulls?state=open`, page by page.
 fn read_open_pr_from(
-    base: &str,
+    api: &str,
     token: Option<&str>,
     repo: &str,
+    base: &str,
     branch: &str,
     hint: &str,
 ) -> Result<Option<PrInfo>> {
     for page in 1..=20 {
-        let Some(prs) = read_open_page(base, token, repo, page, hint)? else {
+        let Some(prs) = read_open_page(api, token, repo, page, hint)? else {
             return Ok(None);
         };
-        if let Some(pr) = prs
-            .iter()
-            .find(|pr| pr.pointer("/head/ref").and_then(Value::as_str) == Some(branch))
-        {
-            return PrInfo::from_api(pr).map(Some);
+        if let Some(pr) = open_pr_on_page(repo, &prs, base, branch) {
+            return Ok(Some(pr));
         }
         if prs.len() < OPEN_PAGE_LIMIT {
             break;
@@ -400,7 +441,8 @@ fn read_open_pr_from(
 }
 
 /// Every open MR of `repo`, from `GET /repos/{owner}/{repo}/pulls?state=open`,
-/// page by page (up to 20 pages); `Ok(None)` is a 404.
+/// page by page (up to 20 pages), without those that cannot be read;
+/// `Ok(None)` is a 404.
 fn read_open_prs(
     base: &str,
     token: Option<&str>,
@@ -412,9 +454,7 @@ fn read_open_prs(
         let Some(prs) = read_open_page(base, token, repo, page, hint)? else {
             return Ok(None);
         };
-        for pr in &prs {
-            out.push(PrInfo::from_api(pr)?);
-        }
+        out.extend(open_prs_on_page(repo, &prs));
         if prs.len() < OPEN_PAGE_LIMIT {
             break;
         }
@@ -493,8 +533,8 @@ impl PrReader for AnonApi {
         read_commit_status(&self.base, None, repo, sha, ANON_HINT)
     }
 
-    fn open_pr_from(&self, repo: &str, branch: &str) -> Result<Option<PrInfo>> {
-        read_open_pr_from(&self.base, None, repo, branch, ANON_HINT)
+    fn open_pr_from(&self, repo: &str, base: &str, branch: &str) -> Result<Option<PrInfo>> {
+        read_open_pr_from(&self.base, None, repo, base, branch, ANON_HINT)
     }
 
     fn pr_of_branch(&self, repo: &str, base: &str, branch: &str) -> Result<Option<PrInfo>> {
@@ -712,10 +752,10 @@ impl PrReader for ForgeReader {
         )
     }
 
-    fn open_pr_from(&self, repo: &str, branch: &str) -> Result<Option<PrInfo>> {
+    fn open_pr_from(&self, repo: &str, base: &str, branch: &str) -> Result<Option<PrInfo>> {
         self.read(
-            || self.anon.open_pr_from(repo, branch),
-            |t| read_open_pr_from(&self.anon.base, Some(t), repo, branch, AUTH_HINT),
+            || self.anon.open_pr_from(repo, base, branch),
+            |t| read_open_pr_from(&self.anon.base, Some(t), repo, base, branch, AUTH_HINT),
         )
     }
 
@@ -1132,6 +1172,67 @@ mod tests {
         assert!(wip.draft);
         let draft = api(r#"{"number":24,"state":"open","merged":false,"title":"t","draft":true,"head":{"sha":"abc","ref":"b"}}"#).unwrap();
         assert!(draft.draft);
+    }
+
+    /// An open MR from `head` into `base`, as the list of open MRs has it.
+    fn listed(n: u64, head: &str, base: &str) -> Value {
+        serde_json::json!({
+            "number": n, "state": "open", "merged": false, "title": "t",
+            "head": { "sha": format!("sha{n}"), "ref": head }, "base": { "ref": base },
+        })
+    }
+
+    /// An open MR that swl cannot read (as fj could not read swan-lake#53):
+    /// no head sha, and null lists.
+    fn malformed(n: u64, head: &str, base: &str) -> Value {
+        serde_json::json!({
+            "number": n, "state": "open", "merged": false, "title": "t",
+            "head": { "sha": null, "ref": head }, "base": { "ref": base },
+            "labels": null, "assignees": null,
+        })
+    }
+
+    #[test]
+    fn a_list_of_open_mrs_skips_those_it_cannot_read() {
+        let page = [
+            listed(1, "a", "master"),
+            malformed(53, "b", "master"),
+            serde_json::json!({ "state": "open" }),
+            listed(54, "c", "master"),
+        ];
+        let numbers: Vec<u64> = open_prs_on_page("swan-lake", &page)
+            .iter()
+            .map(|p| p.number)
+            .collect();
+        assert_eq!(numbers, [1, 54]);
+        let e = PrInfo::from_api(&page[1]).unwrap_err();
+        assert_eq!(
+            skipped_warning("swan-lake", &page[1], &e),
+            "warning: skipping swan-lake#53, an open MR that swl cannot read: MR 53 has no head sha"
+        );
+        let e = PrInfo::from_api(&page[2]).unwrap_err();
+        assert_eq!(
+            skipped_warning("swan-lake", &page[2], &e),
+            "warning: skipping swan-lake#?, an open MR that swl cannot read: no number in the pull \
+             request JSON"
+        );
+    }
+
+    #[test]
+    fn the_open_mr_of_a_branch_matches_head_and_base_and_skips_those_it_cannot_read() {
+        let page = [
+            malformed(53, "other", "master"),
+            listed(2, "feat", "release"),
+            malformed(3, "feat", "master"),
+            listed(4, "feat", "master"),
+        ];
+        let found = |base: &str, branch: &str| {
+            open_pr_on_page("swan-lake", &page, base, branch).map(|p| p.number)
+        };
+        assert_eq!(found("master", "feat"), Some(4));
+        assert_eq!(found("release", "feat"), Some(2));
+        assert_eq!(found("master", "other"), None);
+        assert_eq!(found("main", "feat"), None);
     }
 
     #[test]

@@ -1006,7 +1006,7 @@ impl Bumper<'_> {
         }
         // A pull ref that lags behind a push hides the MR: ask the list.
         if mr.is_none() {
-            mr = self.reader.open_pr_from(name, BUMP_BRANCH)?;
+            mr = self.reader.open_pr_from(name, &c.branch, BUMP_BRANCH)?;
         }
         let info = match mr {
             Some(info) => match self.reader.pr(name, info.number)? {
