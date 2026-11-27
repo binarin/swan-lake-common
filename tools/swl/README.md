@@ -372,10 +372,12 @@ line: its stage, who it waits for and the next step, from the rows that
 tree (the consumers, and rows under no consumer), whose verdicts already
 wait for the rows below them, the line is an `unknown` one first, else the
 least advanced (in the order of the stages, see [Status](#status)) that has
-a next step, else the least advanced. A directory without checkouts is `no
-change (no checkouts)`; one that cannot be read, `unknown (<reason>)`. The
-workspaces are read one after another, with one fetch per source (as
-`status` fetches) for all of them.
+a next step, else the least advanced. Its next step ends with the other
+roots that have a next step at another stage, `(+ <row>: <stage>, …)`: a
+CI-green consumer's `merge swan-lake#3 (+ nixos-config: merged)`. A
+directory without checkouts is `no change (no checkouts)`; one that cannot
+be read, `unknown (<reason>)`. The workspaces are read one after another,
+with one fetch per source (as `status` fetches) for all of them.
 
 A workspace that `swl ws prune` would remove is marked `removable`: each of
 its checkouts has its HEAD in its base (also detached at the base), its

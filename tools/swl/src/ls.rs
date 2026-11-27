@@ -78,7 +78,9 @@ fn rank(stage: &Stage) -> u8 {
 /// The workspace's one line from its rows: of the roots of `status`'s tree
 /// (the consumers, and rows under no consumer), whose verdicts already wait
 /// for the rows below them, an unknown one first, else the least advanced
-/// that has a next step, else the least advanced.
+/// that has a next step, else the least advanced. Its next step ends with
+/// the other roots that have a next step at another stage, `(+ <row>:
+/// <stage>, …)`.
 fn summary(ws: &Workspace, rows: &[Row]) -> Verdict {
     if ws.checkouts.is_empty() {
         return Verdict {
@@ -88,22 +90,29 @@ fn summary(ws: &Workspace, rows: &[Row]) -> Verdict {
             landable: false,
         };
     }
-    rows.iter()
-        .filter(|r| r.under.is_empty())
+    let roots: Vec<&Row> = rows.iter().filter(|r| r.under.is_empty()).collect();
+    let Some((chosen, _)) = roots.iter().enumerate().min_by_key(|(i, r)| {
+        let v = &r.verdict;
+        let class = match (&v.stage, v.next == "-") {
+            (Stage::Unknown(_), _) => 0,
+            (_, false) => 1,
+            (_, true) => 2,
+        };
+        (class, rank(&v.stage), *i)
+    }) else {
+        return unknown(&anyhow::anyhow!("no rows"));
+    };
+    let mut verdict = roots[chosen].verdict.clone();
+    let others: Vec<String> = roots
+        .iter()
         .enumerate()
-        .min_by_key(|(i, r)| {
-            let v = &r.verdict;
-            let class = match (&v.stage, v.next == "-") {
-                (Stage::Unknown(_), _) => 0,
-                (_, false) => 1,
-                (_, true) => 2,
-            };
-            (class, rank(&v.stage), *i)
-        })
-        .map_or_else(
-            || unknown(&anyhow::anyhow!("no rows")),
-            |(_, r)| r.verdict.clone(),
-        )
+        .filter(|(i, r)| *i != chosen && r.verdict.next != "-" && r.verdict.stage != verdict.stage)
+        .map(|(_, r)| format!("{}: {}", r.name, r.verdict.stage))
+        .collect();
+    if !others.is_empty() {
+        verdict.next = format!("{} (+ {})", verdict.next, others.join(", "));
+    }
+    verdict
 }
 
 /// What the workspace holds of the forge's MRs: its checkouts' branches,
@@ -396,7 +405,15 @@ mod tests {
         let local = || row("c", &[], Stage::Local, "swl publish c");
         let pick = |rows: &[Row]| summary(&ws, rows).next;
         assert_eq!(pick(&[landed(), open()]), "wait for CI");
-        assert_eq!(pick(&[landed(), open(), local()]), "swl publish c");
+        // The other roots with a step at another stage are named.
+        assert_eq!(
+            pick(&[landed(), open(), local()]),
+            "swl publish c (+ b: MR open)"
+        );
+        let merged = row("n", &[], Stage::Merged, "remove the workspace");
+        let ci = |name| row(name, &[], Stage::Ci(CiState::Green), "swl land");
+        assert_eq!(pick(&[ci("s"), merged]), "swl land (+ n: merged)");
+        assert_eq!(pick(&[ci("s"), ci("t")]), "swl land");
         // Rows below a consumer count through the consumer's verdict only.
         let child = row("x@lib", &[("a", "lib")], Stage::Local, "swl publish a");
         assert_eq!(pick(&[child, landed(), open()]), "wait for CI");

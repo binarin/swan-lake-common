@@ -86,3 +86,97 @@ fn checkout_keep_reason(c: &Checkout, base: &str) -> Result<Option<String>> {
     }
     Ok(None)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, path::PathBuf, process::Command};
+
+    use super::*;
+    use crate::{env::GENERATED_MARKER, git::GIT, tempdir::TempDir};
+
+    fn g(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new(GIT)
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.org"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// A clone of a forge repo with one commit on master, detached at
+    /// `origin/master`.
+    fn checkout(tmp: &TempDir) -> Checkout {
+        let forge = tmp.path().join("forge");
+        let dir = tmp.path().join("swan-lake");
+        fs::create_dir_all(&forge).unwrap();
+        g(&forge, &["init", "-q", "--bare", "-b", "master"]);
+        g(
+            tmp.path(),
+            &["clone", "-q", &forge.display().to_string(), "swan-lake"],
+        );
+        g(&dir, &["commit", "-q", "--allow-empty", "-m", "base"]);
+        g(&dir, &["push", "-q", "origin", "HEAD:master"]);
+        g(&dir, &["fetch", "-q", "origin"]);
+        g(&dir, &["checkout", "-q", "--detach", "origin/master"]);
+        Checkout {
+            name: "swan-lake".into(),
+            dir,
+            shared: None,
+        }
+    }
+
+    fn keep(c: &Checkout) -> Option<String> {
+        checkout_keep_reason(c, "origin/master").unwrap()
+    }
+
+    #[test]
+    fn a_checkout_detached_at_its_base_is_removable() {
+        let tmp = TempDir::new("swl-ws-prune-test").unwrap();
+        let c = checkout(&tmp);
+        assert_eq!(keep(&c), None);
+        g(&c.dir, &["commit", "-q", "--allow-empty", "-m", "local"]);
+        assert!(keep(&c).unwrap().contains("is not in origin/master"));
+    }
+
+    #[test]
+    fn a_branch_whose_remote_branch_is_in_the_base_is_removable() {
+        let tmp = TempDir::new("swl-ws-prune-test").unwrap();
+        let c = checkout(&tmp);
+        g(&c.dir, &["switch", "-q", "-c", "sl-1-x"]);
+        g(&c.dir, &["commit", "-q", "--allow-empty", "-m", "change"]);
+        g(&c.dir, &["push", "-q", "origin", "sl-1-x"]);
+        // Pushed, and not merged: kept, also with HEAD back at the base.
+        g(&c.dir, &["reset", "-q", "--hard", "origin/master"]);
+        assert_eq!(
+            keep(&c).as_deref(),
+            Some("origin/sl-1-x has commits not in origin/master")
+        );
+        // Merged: the remote branch is in the base.
+        g(&c.dir, &["push", "-q", "origin", "origin/sl-1-x:master"]);
+        g(&c.dir, &["fetch", "-q", "origin"]);
+        assert_eq!(keep(&c), None);
+    }
+
+    #[test]
+    fn only_swls_generated_envrc_local_does_not_keep_a_checkout() {
+        let tmp = TempDir::new("swl-ws-prune-test").unwrap();
+        let c = checkout(&tmp);
+        let envrc: PathBuf = c.dir.join(".envrc.local");
+        fs::write(&envrc, "use_flake_args+=(--impure)\n").unwrap();
+        assert_eq!(
+            keep(&c).as_deref(),
+            Some("uncommitted or untracked files: ?? .envrc.local")
+        );
+        fs::write(&envrc, format!("{GENERATED_MARKER} for the workspace x\n")).unwrap();
+        assert!(envrc.is_file());
+        assert_eq!(keep(&c), None);
+        fs::write(c.dir.join("notes.txt"), "x").unwrap();
+        assert_eq!(
+            keep(&c).as_deref(),
+            Some("uncommitted or untracked files: ?? notes.txt")
+        );
+    }
+}
