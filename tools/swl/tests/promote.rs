@@ -101,14 +101,14 @@ fn promote_fast_forwards_past_master_and_waits_for_the_mirror() {
     let log = stdout(&t.promote(&["--dry-run"]));
     for want in [
         format!(
-            "swl promote: swan-lake-common origin/master: current at {} gets 2 commit(s):\n  {}\n  {}\n",
+            "swl promote: swan-lake-common origin/master\n├─ current at {} gets 2 commit(s):\n│  {}\n│  {}\n",
             short(&c1),
             t.oneline(&c2),
             t.oneline(&c3)
         ),
         format!(
-            "swl promote: would promote swan-lake-common origin/master: git -C {source} push \
-             origin {c3}:refs/heads/current"
+            "├─ would promote swan-lake-common origin/master\n│  git -C {source} push origin \
+             {c3}:refs/heads/current\n"
         ),
     ] {
         assert!(log.contains(&want), "{want:?} in\n{log}");
@@ -121,7 +121,7 @@ fn promote_fast_forwards_past_master_and_waits_for_the_mirror() {
         &t.promote(&[]),
         3,
         &format!(
-            "swl promote: waits for the owner: promote: git -C {source} push origin \
+            "└─ waits for the owner: promote: git -C {source} push origin \
              {c3}:refs/heads/current (the push was refused: remote: current is protected"
         ),
     );
@@ -134,7 +134,7 @@ fn promote_fast_forwards_past_master_and_waits_for_the_mirror() {
         &out,
         5,
         &format!(
-            "swl promote: waits for nobody: swan-lake-common origin/master: waiting for {} \
+            "└─ waits for nobody: swan-lake-common origin/master: waiting for {} \
              current to have {} (not yet); rerun swl promote",
             t.mirror_url(),
             short(&c3)
@@ -142,7 +142,7 @@ fn promote_fast_forwards_past_master_and_waits_for_the_mirror() {
     );
     assert!(
         out_text(&out).contains(&format!(
-            "swl promote: promoted current to {}; next: swl bump",
+            "├─ promoted current to {}; next: swl bump",
             short(&c3)
         )),
         "{}",
@@ -154,10 +154,13 @@ fn promote_fast_forwards_past_master_and_waits_for_the_mirror() {
     t.f.sync_mirror(&t.mirror);
     let log = stdout(&t.promote(&[]));
     assert!(
-        log.contains(&format!("swl promote: current has {} already", short(&c3))),
+        log.contains(&format!(
+            "swl promote: swan-lake-common origin/master\n├─ current has {} already",
+            short(&c3)
+        )),
         "{log}"
     );
-    assert!(log.contains("swl promote: nothing to promote"), "{log}");
+    assert!(log.contains("└─ nothing to promote"), "{log}");
     assert!(!log.contains("next: swl bump"), "{log}");
 }
 
@@ -168,10 +171,10 @@ fn promote_is_a_no_op_when_promoted() {
     let refs = t.forge_refs();
     let log = stdout(&t.promote(&[]));
     assert!(
-        log.contains(&format!("swl promote: current has {} already", short(&c1))),
+        log.contains(&format!("├─ current has {} already", short(&c1))),
         "{log}"
     );
-    assert!(log.contains("swl promote: nothing to promote"), "{log}");
+    assert!(log.contains("└─ nothing to promote"), "{log}");
     assert_eq!(t.forge_refs(), refs);
 
     // An older commit of master that current has: a no-op too, which
@@ -225,7 +228,8 @@ fn promote_refuses_what_it_cannot_fast_forward() {
         &t.promote(&[]),
         3,
         &format!(
-            "swl promote: waits for the owner: promote current: origin/current at {} has \
+            "swl promote: swan-lake-common origin/master\n└─ waits for the owner: promote current: \
+             origin/current at {} has \
              commits that origin/master at {} does not, so it cannot be fast-forwarded",
             short(&side),
             short(&c2)
@@ -301,7 +305,7 @@ fn land_promotes_a_common_only_change_and_waits_for_the_mirror() {
     assert!(log.contains("swan-lake-common#1 is merged"), "{log}");
     assert!(
         log.contains(&format!(
-            "swl land: swan-lake-common#1: current at {} gets 2 commit(s):\n  {}\n  {}\n",
+            "├─ current at {} gets 2 commit(s):\n│  {}\n│  {}\n",
             short(&c1),
             t.oneline(&other),
             t.oneline(&c2)
@@ -337,7 +341,7 @@ fn land_promotes_a_common_only_change_and_waits_for_the_mirror() {
     failed(&out, 5, &waiting);
     assert!(
         out_text(&out).contains(&format!(
-            "swl land: swan-lake-common#1: promoted current to {}; next: swl bump",
+            "├─ promoted current to {}; next: swl bump",
             short(&c2)
         )),
         "{}",
@@ -467,7 +471,7 @@ fn land_promotes_common_in_its_consumer_step_after_the_other_consumers() {
     );
     assert!(
         log.contains(&format!(
-            "swl land: swan-lake-common#1: promoted current to {}; next: swl bump",
+            "├─ promoted current to {}; next: swl bump",
             short(&c2)
         )),
         "{log}"

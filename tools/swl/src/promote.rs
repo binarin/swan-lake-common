@@ -15,8 +15,9 @@ use crate::{
     forge::AnonApi,
     git::short,
     land::{self, DryRunWriter, Lander, Step, stop},
+    report::Report,
     status::Waits,
-    style::{self, Tone},
+    style::Tone,
     ws_add::{Fetcher, base_remote},
 };
 
@@ -68,16 +69,14 @@ pub fn run(config: &Config, rev: Option<&str>, opts: &land::Options) -> Result<E
     // The promotion is a git push: nothing is written on the forge's API.
     let (reader, writer) = (AnonApi::from_env(), DryRunWriter);
     let lander = Lander::new(CMD, config, &reader, &writer, opts);
+    let report = &lander.report;
+    report.section(&which);
     let moved = if is_ancestor(src, &commit, &current) {
-        style::say(
-            CMD,
-            Tone::Plain,
-            format!(
-                "{branch} has {} already (at {})",
-                short(&commit),
-                short(&current)
-            ),
-        );
+        report.step(format!(
+            "{branch} has {} already (at {})",
+            short(&commit),
+            short(&current)
+        ));
         false
     } else if !is_ancestor(src, &current, &commit) {
         return Ok(end(
@@ -91,13 +90,13 @@ pub fn run(config: &Config, rev: Option<&str>, opts: &land::Options) -> Result<E
                     short(&commit)
                 ),
             )?,
+            report,
             opts.dry_run,
         ));
     } else {
         match lander.promote(&which, COMMON_REPO, &commit, branch)? {
             Step::Progress => {
-                style::say(
-                    CMD,
+                report.outcome(
                     Tone::Good,
                     format!(
                         "promoted {branch} to {}; next: swl bump, to move the consumers",
@@ -106,13 +105,13 @@ pub fn run(config: &Config, rev: Option<&str>, opts: &land::Options) -> Result<E
                 );
                 true
             }
-            step => return Ok(end(step, opts.dry_run)),
+            step => return Ok(end(step, report, opts.dry_run)),
         }
     };
     for url in &target.mirrors {
         match lander.mirror(&which, url, branch, &commit)? {
             Step::Done => {}
-            step => return Ok(end(step, opts.dry_run)),
+            step => return Ok(end(step, report, opts.dry_run)),
         }
     }
     let msg = if moved {
@@ -120,16 +119,16 @@ pub fn run(config: &Config, rev: Option<&str>, opts: &land::Options) -> Result<E
     } else {
         "nothing to promote".to_string()
     };
-    style::say(CMD, Tone::Good, msg);
+    report.end(Tone::Good, msg);
     Ok(ExitCode::SUCCESS)
 }
 
 /// The end of a run that stopped at `step`: the exit status of what it
 /// waits for, as `land`'s.
-fn end(step: Step, dry_run: bool) -> ExitCode {
+fn end(step: Step, report: &Report, dry_run: bool) -> ExitCode {
     match step {
-        Step::Planned(then) => land::planned(CMD, &then),
-        Step::Stop(waits, msg) => land::exit(CMD, waits, &msg, dry_run),
+        Step::Planned(then) => land::planned(report, &then),
+        Step::Stop(waits, msg) => land::exit(report, waits, &msg, dry_run),
         Step::Done | Step::Progress => ExitCode::SUCCESS,
     }
 }

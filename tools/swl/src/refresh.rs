@@ -26,8 +26,9 @@ use crate::{
         waits_code,
     },
     manifest::MANIFEST_FILE,
+    report::Report,
     status::{self, MrFacts, MrRead, Row, RowFacts, Waits},
-    style::{self, Tone},
+    style::Tone,
     workspace::Workspace,
     ws_add::{Fetcher, base_remote},
 };
@@ -223,20 +224,18 @@ fn lock_moved(dir: &Path, head: &str, base_tip: &str) -> Result<bool> {
 
 /// Reruns `swl env` for the workspace at `root`, for checkouts whose
 /// `flake.lock` moved; a failure is a warning.
-fn rerun_env(cmd: &str, root: &Path, config: &Config) {
+fn rerun_env(report: &Report, root: &Path, config: &Config) {
     let result = (|| -> Result<()> {
         let ws = Workspace::scan(root)?;
-        env::run(&ws, config, &crate::swl_exe()?, false)
+        env::run_to(&ws, config, &crate::swl_exe()?, false, |line| {
+            report.detail(format!("swl env: {line}"))
+        })
     })();
     if let Err(e) = result {
-        style::say(
-            cmd,
-            Tone::Warn,
-            format!(
-                "swl env failed after the rebase: {e:#}; fix that and run swl env --workspace {}",
-                root.display()
-            ),
-        );
+        report.warn(format!(
+            "swl env failed after the rebase: {e:#}; fix that and run swl env --workspace {}",
+            root.display()
+        ));
     }
 }
 
@@ -285,11 +284,8 @@ fn refinalize(
             "its {MANIFEST_FILE} would differ from the dropped commit's"
         ));
     }
-    style::say(
-        l.cmd,
-        Tone::Plain,
-        format!("{which}: finalized anew: {}", done.subject),
-    );
+    l.report
+        .step(format!("{which}: finalized anew: {}", done.subject));
     Ok(done.head)
 }
 
@@ -528,8 +524,7 @@ pub(crate) fn refresh(l: &Lander, part: &Part) -> Result<Step> {
             ),
         };
     }
-    style::say(
-        cmd,
+    l.report.outcome(
         Tone::Good,
         format!(
             "{which}: pushed {branch} at {}, rebased onto {base}",
@@ -547,10 +542,10 @@ pub(crate) fn refresh(l: &Lander, part: &Part) -> Result<Step> {
             );
         }
         if lock_changed(source, &observed, &head)? {
-            rerun_env(cmd, root, l.config);
+            rerun_env(&l.report, root, l.config);
         }
     } else {
-        follow_local_branch(cmd, source, which, branch, &observed, &head);
+        follow_local_branch(&l.report, source, which, branch, &observed, &head);
     }
     l.await_pull_at(source, &remote, which, part.info.number, &head)
 }
@@ -560,7 +555,7 @@ pub(crate) fn refresh(l: &Lander, part: &Part) -> Result<Step> {
 /// worktree has it checked out, so that a later push of it is a
 /// fast-forward; else leaves it, and says so when it exists.
 fn follow_local_branch(
-    cmd: &str,
+    report: &Report,
     source: &Path,
     which: &str,
     branch: &str,
@@ -581,17 +576,13 @@ fn follow_local_branch(
         )
         .is_ok();
     if !moved {
-        style::say(
-            cmd,
-            Tone::Warn,
-            format!(
-                "{which}: the local {branch} of {} (at {}) was left as it is; it is not the pushed \
-                 head {}",
-                source.display(),
-                short(&local),
-                short(head)
-            ),
-        );
+        report.warn(format!(
+            "{which}: the local {branch} of {} (at {}) was left as it is; it is not the pushed \
+             head {}",
+            source.display(),
+            short(&local),
+            short(head)
+        ));
     }
 }
 
@@ -690,12 +681,12 @@ pub fn run(
     opts: &Options,
 ) -> Result<ExitCode> {
     let lander = Lander::new(CMD, config, reader, &DryRunWriter, opts);
+    let report = &lander.report;
     let ws = Workspace::scan(root)?;
     let rows = status::collect(&ws, config, reader, &Fetcher::new(true))?;
     let parts = parts(&ws, &rows);
     if parts.is_empty() {
-        style::say(
-            CMD,
+        report.say(
             Tone::Plain,
             format!("nothing to refresh: no open MR in {}", ws.root.display()),
         );
@@ -704,9 +695,9 @@ pub fn run(
     let mut pushed: Vec<&str> = Vec::new();
     for part in &parts {
         let _span = tracing::debug_span!("refresh", which = %part.which).entered();
+        report.section(&part.which);
         match refresh(&lander, part)? {
-            Step::Done => style::say(
-                CMD,
+            Step::Done => report.end(
                 Tone::Plain,
                 format!(
                     "{}: {} contains {} already",
@@ -718,7 +709,7 @@ pub fn run(
             Step::Progress => pushed.push(&part.which),
             Step::Planned(_) => {}
             Step::Stop(waits, msg) => {
-                say_waits(CMD, waits, &msg);
+                say_waits(report, waits, &msg);
                 return Ok(match opts.dry_run {
                     true => ExitCode::SUCCESS,
                     false => ExitCode::from(waits_code(waits)),
@@ -727,10 +718,9 @@ pub fn run(
         }
     }
     if opts.dry_run {
-        style::say(CMD, Tone::Plain, "dry run, nothing was written");
+        report.say(Tone::Plain, "dry run, nothing was written");
     } else if !pushed.is_empty() {
-        style::say(
-            CMD,
+        report.say(
             Tone::Good,
             format!(
                 "rebased and pushed {}: CI runs on the new heads (swl status shows CI pending), \

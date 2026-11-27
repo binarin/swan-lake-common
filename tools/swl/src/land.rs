@@ -47,12 +47,13 @@ use crate::{
     git::{git, git_ok, short, valid_branch},
     manifest::{Entry, MANIFEST_FILE, Manifest},
     refresh::{self, Part, Place},
+    report::Report,
     start,
     status::{
         self, ConsumerFacts, ConsumerPromotion, MrFacts, MrRead, RemoteBranch, Row, RowFacts,
         Stage, Waits,
     },
-    style::{self, Tone},
+    style::Tone,
     workspace::{Checkout, Workspace},
     ws_add::{Fetcher, base_remote},
 };
@@ -189,9 +190,10 @@ fn shared_entries(manifests: &[(String, Manifest)]) -> Vec<SharedMr> {
 
 /// The steps of `land` that `bump` shares: merging an MR, promoting a
 /// branch, waiting for a mirror and for the forge. `cmd` (`swl land`, `swl
-/// bump`) prefixes the messages and is what they say to rerun.
+/// bump`) is what the messages say to rerun; they go to `report`.
 pub(crate) struct Lander<'a> {
     pub(crate) cmd: &'static str,
+    pub(crate) report: Report,
     pub(crate) config: &'a Config,
     pub(crate) reader: &'a dyn PrReader,
     writer: &'a dyn ForgeWriter,
@@ -211,6 +213,7 @@ impl<'a> Lander<'a> {
     ) -> Self {
         Self {
             cmd,
+            report: Report::new(cmd),
             config,
             reader,
             writer,
@@ -229,20 +232,33 @@ impl Lander<'_> {
     /// Says what is (or with `--dry-run` would be) done. `Ok(false)` in a dry
     /// run; a [`Repeated`] error when this run did the same already.
     pub(crate) fn act(&self, key: &str, what: &str) -> Result<bool> {
+        self.act_running(key, what, None)
+    }
+
+    /// [`Lander::act`] for a step that is the command `command`, which
+    /// follows as a detail.
+    fn act_running(&self, key: &str, what: &str, command: Option<&str>) -> Result<bool> {
         let cmd = self.cmd;
-        if self.opts.dry_run {
-            style::say(self.cmd, Tone::Plain, format!("would {what}"));
-            return Ok(false);
-        }
-        if !self.done.borrow_mut().insert(key.to_string()) {
+        let full = match command {
+            Some(c) => format!("{what}: {c}"),
+            None => what.to_string(),
+        };
+        if !self.opts.dry_run && !self.done.borrow_mut().insert(key.to_string()) {
             return Err(Repeated(format!(
-                "{what}: done once in this run already, but the forge does not show it yet; rerun \
+                "{full}: done once in this run already, but the forge does not show it yet; rerun \
                  {cmd}"
             ))
             .into());
         }
-        style::say(self.cmd, Tone::Plain, what);
-        Ok(true)
+        if self.opts.dry_run {
+            self.report.step(format!("would {what}"));
+        } else {
+            self.report.step(what);
+        }
+        if let Some(c) = command {
+            self.report.detail(c);
+        }
+        Ok(!self.opts.dry_run)
     }
 
     fn dry_stop(&self, what: &str) -> Result<Step> {
@@ -286,6 +302,7 @@ impl Lander<'_> {
         let cmd = self.cmd;
         let which = format!("{}#{}", e.repo, e.mr);
         let _span = tracing::debug_span!("shared", %which, %path).entered();
+        self.report.section(&which);
         let Some(row) = rows
             .iter()
             .find(|r| r.follows.as_deref() == Some(which.as_str()))
@@ -486,14 +503,10 @@ impl Lander<'_> {
         let outcome = self.request_merge(repo, info, MergeWhen::ChecksSucceed)?;
         if outcome == MergeOutcome::Scheduled {
             if self.ci_now(repo, &info.head_sha) == Some(CiState::Green) {
-                style::say(
-                    self.cmd,
-                    Tone::Plain,
-                    format!(
-                        "{which}: its checks turned green as the merge was scheduled, and \
-                         no later status would start it"
-                    ),
-                );
+                self.report.step(format!(
+                    "{which}: its checks turned green as the merge was scheduled, and no later \
+                     status would start it"
+                ));
                 return self.merge_now(which, repo, info, rebase, true);
             }
             return stop(
@@ -614,7 +627,8 @@ impl Lander<'_> {
         let cmd = self.cmd;
         match outcome {
             MergeOutcome::Merged => {
-                style::say(self.cmd, Tone::Good, format!("{which} is merged"));
+                self.report
+                    .outcome(Tone::Good, format!("{which} is merged"));
                 Ok(Step::Progress)
             }
             MergeOutcome::Scheduled => stop(
@@ -702,19 +716,15 @@ impl Lander<'_> {
         let promoted = git(src, &["log", "--reverse", "--format=%h %s", &range])?;
         if !promoted.is_empty() {
             let lines: Vec<&str> = promoted.lines().collect();
-            style::say(
-                self.cmd,
-                Tone::Plain,
-                format!(
-                    "{which}: {branch} at {} gets {} commit(s):\n  {}",
-                    short(&tip),
-                    lines.len(),
-                    lines.join("\n  ")
-                ),
-            );
+            self.report.step(format!(
+                "{which}: {branch} at {} gets {} commit(s):\n  {}",
+                short(&tip),
+                lines.len(),
+                lines.join("\n  ")
+            ));
         }
-        let what = format!("promote {which}: {cmd}");
-        if !self.act(&format!("promote {which}"), &what)? {
+        let what = format!("promote {which}");
+        if !self.act_running(&what, &what, Some(&cmd))? {
             return self.dry_stop(&format!(
                 "{branch} has {which}, and its declared source too"
             ));
@@ -757,8 +767,7 @@ impl Lander<'_> {
             Ok(false) => {
                 let step = self.promote(which, COMMON_REPO, commit, branch)?;
                 if step == Step::Progress {
-                    style::say(
-                        self.cmd,
+                    self.report.outcome(
                         Tone::Good,
                         format!(
                             "{which}: promoted {branch} to {}; next: swl bump, to move the \
@@ -812,15 +821,11 @@ impl Lander<'_> {
                     ),
                 );
             }
-            style::say(
-                self.cmd,
-                Tone::Plain,
-                format!(
-                    "{which}: {url} {branch} does not have {} yet; checking again in {}s",
-                    short(merge_commit),
-                    self.opts.interval.as_secs()
-                ),
-            );
+            self.report.detail(format!(
+                "{which}: {url} {branch} does not have {} yet; checking again in {}s",
+                short(merge_commit),
+                self.opts.interval.as_secs()
+            ));
             thread::sleep(self.opts.interval);
         }
     }
@@ -829,12 +834,21 @@ impl Lander<'_> {
     fn consumer(&self, rows: &[Row], ws_root: &Path, c: &Checkout) -> Result<Step> {
         let cmd = self.cmd;
         let _span = tracing::debug_span!("consumer", name = %c.name).entered();
+        self.report.section(&c.name);
         let Some(row) = rows
             .iter()
             .find(|r| r.name == c.name && r.follows.is_none())
         else {
             return stop(Waits::Nobody, format!("{}: no status; rerun {cmd}", c.name));
         };
+        if let RowFacts::Consumer(ConsumerFacts {
+            mr: MrFacts::Read { number, .. },
+            ..
+        }) = &row.facts
+        {
+            self.report
+                .section_also(format!("{}#{number}", c.name), &[&c.name]);
+        }
         if let (Stage::NoChange(_) | Stage::NotAChange(_), RowFacts::Consumer(f)) =
             (&row.verdict.stage, &row.facts)
         {
@@ -990,18 +1004,17 @@ impl Lander<'_> {
                 );
             }
             Landing::WouldLand(lines) => {
-                style::say(
-                    self.cmd,
-                    Tone::Plain,
-                    format!("would finalize {}:\n  {}", c.name, lines.join("\n  ")),
-                );
+                self.report.step(format!(
+                    "would finalize {}:\n  {}",
+                    c.name,
+                    lines.join("\n  ")
+                ));
                 return self.dry_stop(&format!(
                     "then push the landing to {branch} and request the merge of {which}"
                 ));
             }
             Landing::Committed(done) => {
-                style::say(
-                    self.cmd,
+                self.report.outcome(
                     Tone::Good,
                     format!(
                         "{}: committed {} on {branch}: {}",
@@ -1214,7 +1227,8 @@ fn keep_reason(c: &Checkout, base: &str) -> Result<Option<String>> {
 /// their sources), their merged local branches (`git branch -d`), `.swl`
 /// and the directory. Dirty checkouts and those with unpushed commits are
 /// kept, and said so.
-fn remove_workspace(ws: &Workspace, config: &Config, dry_run: bool) -> Result<()> {
+fn remove_workspace(report: &Report, ws: &Workspace, config: &Config, dry_run: bool) -> Result<()> {
+    report.section(format!("workspace {}", ws.root.display()));
     let mut kept = Vec::new();
     for c in &ws.checkouts {
         let repo = c
@@ -1227,28 +1241,20 @@ fn remove_workspace(ws: &Workspace, config: &Config, dry_run: bool) -> Result<()
             git(&c.dir, &["fetch", "--quiet", &r])?;
         }
         if let Some(why) = keep_reason(c, base)? {
-            style::say(
-                "swl land",
-                Tone::Warn,
-                format!("keeping {}: {why}", c.dir.display()),
-            );
+            report.warn(format!("keeping {}: {why}", c.dir.display()));
             kept.push(c.name.clone());
             continue;
         }
         let branch = git_ok(&c.dir, &["symbolic-ref", "--quiet", "--short", "HEAD"]);
         if dry_run {
-            style::say(
-                "swl land",
-                Tone::Plain,
-                format!(
-                    "would remove {}{}",
-                    c.dir.display(),
-                    branch
-                        .as_deref()
-                        .map(|b| format!(" and its branch {b}"))
-                        .unwrap_or_default()
-                ),
-            );
+            report.step(format!(
+                "would remove {}{}",
+                c.dir.display(),
+                branch
+                    .as_deref()
+                    .map(|b| format!(" and its branch {b}"))
+                    .unwrap_or_default()
+            ));
             continue;
         }
         let envrc = c.dir.join(".envrc.local");
@@ -1260,16 +1266,11 @@ fn remove_workspace(ws: &Workspace, config: &Config, dry_run: bool) -> Result<()
             // `git branch -d` sees it merged.
             git(&c.dir, &["switch", "--quiet", "--detach", base])?;
             match git(&c.dir, &["branch", "--quiet", "-d", b]) {
-                Ok(_) => style::say(
-                    "swl land",
+                Ok(_) => report.outcome(
                     Tone::Good,
                     format!("deleted the merged branch {b} of {repo}"),
                 ),
-                Err(e) => style::say(
-                    "swl land",
-                    Tone::Warn,
-                    format!("kept the branch {b} of {repo}: {e:#}"),
-                ),
+                Err(e) => report.warn(format!("kept the branch {b} of {repo}: {e:#}")),
             }
         }
         git(
@@ -1277,15 +1278,10 @@ fn remove_workspace(ws: &Workspace, config: &Config, dry_run: bool) -> Result<()
             &["worktree", "remove", &c.dir.to_string_lossy()],
         )
         .with_context(|| format!("removing the worktree {}", c.dir.display()))?;
-        style::say(
-            "swl land",
-            Tone::Good,
-            format!("removed {}", c.dir.display()),
-        );
+        report.outcome(Tone::Good, format!("removed {}", c.dir.display()));
     }
     if !kept.is_empty() {
-        style::say(
-            "swl land",
+        report.end(
             Tone::Warn,
             format!(
                 "kept {} and the workspace {}",
@@ -1296,11 +1292,7 @@ fn remove_workspace(ws: &Workspace, config: &Config, dry_run: bool) -> Result<()
         return Ok(());
     }
     if dry_run {
-        style::say(
-            "swl land",
-            Tone::Plain,
-            format!("would remove {}", ws.root.display()),
-        );
+        report.end(Tone::Plain, format!("would remove {}", ws.root.display()));
         return Ok(());
     }
     let dot_swl = ws.root.join(".swl");
@@ -1308,13 +1300,8 @@ fn remove_workspace(ws: &Workspace, config: &Config, dry_run: bool) -> Result<()
         fs::remove_dir_all(&dot_swl).with_context(|| format!("removing {}", dot_swl.display()))?;
     }
     match fs::remove_dir(&ws.root) {
-        Ok(()) => style::say(
-            "swl land",
-            Tone::Good,
-            format!("removed {}", ws.root.display()),
-        ),
-        Err(e) => style::say(
-            "swl land",
+        Ok(()) => report.end(Tone::Good, format!("removed {}", ws.root.display())),
+        Err(e) => report.end(
             Tone::Warn,
             format!("kept {}, which has other files: {e}", ws.root.display()),
         ),
@@ -1322,14 +1309,15 @@ fn remove_workspace(ws: &Workspace, config: &Config, dry_run: bool) -> Result<()
     Ok(())
 }
 
-/// Says what the next step waits for, `<cmd>: waits for <who>: <msg>`.
-pub(crate) fn say_waits(cmd: &str, waits: Waits, msg: &str) {
+/// Says what the next step waits for, `waits for <who>: <msg>`: the end of
+/// the current section.
+pub(crate) fn say_waits(report: &Report, waits: Waits, msg: &str) {
     let (who, tone) = match waits {
         Waits::Owner => ("the owner", Tone::Owner),
         Waits::Anyone => ("anyone", Tone::Warn),
         Waits::Nobody => ("nobody", Tone::Nobody),
     };
-    style::say(cmd, tone, format!("waits for {who}: {msg}"));
+    report.end(tone, format!("waits for {who}: {msg}"));
 }
 
 /// The exit status of a run whose next step waits for `waits`.
@@ -1341,10 +1329,10 @@ pub(crate) fn waits_code(waits: Waits) -> u8 {
     }
 }
 
-/// The end of a `cmd` run whose next step waits for `waits`: its exit
-/// status, success for a dry run.
-pub(crate) fn exit(cmd: &str, waits: Waits, msg: &str, dry_run: bool) -> ExitCode {
-    say_waits(cmd, waits, msg);
+/// The end of a run whose next step waits for `waits`: its exit status,
+/// success for a dry run.
+pub(crate) fn exit(report: &Report, waits: Waits, msg: &str, dry_run: bool) -> ExitCode {
+    say_waits(report, waits, msg);
     if dry_run {
         return ExitCode::SUCCESS;
     }
@@ -1352,9 +1340,8 @@ pub(crate) fn exit(cmd: &str, waits: Waits, msg: &str, dry_run: bool) -> ExitCod
 }
 
 /// The end of a dry run that reached a write.
-pub(crate) fn planned(cmd: &str, then: &str) -> ExitCode {
-    style::say(
-        cmd,
+pub(crate) fn planned(report: &Report, then: &str) -> ExitCode {
+    report.end(
         Tone::Plain,
         format!("dry run, nothing was written; then: {then}"),
     );
@@ -1391,6 +1378,7 @@ pub fn run(
     opts: &Options,
 ) -> Result<ExitCode> {
     let lander = Lander::new("swl land", config, reader, writer, opts);
+    let report = &lander.report;
     for pass in 0..MAX_STEPS {
         let _span = tracing::debug_span!("land", pass).entered();
         let ws = Workspace::scan(root)?;
@@ -1410,15 +1398,15 @@ pub fn run(
                 "{why}; commit on a topic branch and swl publish the consumer, or join a \
                  published change with swl land --from <consumer>#<MR>"
             );
-            return Ok(exit("swl land", Waits::Anyone, &msg, opts.dry_run));
+            report.leave();
+            return Ok(exit(report, Waits::Anyone, &msg, opts.dry_run));
         }
         match step {
             Step::Progress => continue,
-            Step::Planned(then) => return Ok(planned("swl land", &then)),
-            Step::Stop(waits, msg) => return Ok(exit("swl land", waits, &msg, opts.dry_run)),
+            Step::Planned(then) => return Ok(planned(report, &then)),
+            Step::Stop(waits, msg) => return Ok(exit(report, waits, &msg, opts.dry_run)),
             Step::Done if !lander.landed_by_merge(&ws, &rows)? => {
-                style::say(
-                    "swl land",
+                report.say(
                     Tone::Plain,
                     format!(
                         "nothing to land: no consumer of {} has a merged MR; the workspace \
@@ -1429,22 +1417,22 @@ pub fn run(
                 return Ok(ExitCode::SUCCESS);
             }
             Step::Done => {
-                style::say("swl land", Tone::Good, "every MR of the change is merged");
+                report.say(Tone::Good, "every MR of the change is merged");
                 if opts.keep {
-                    style::say(
-                        "swl land",
+                    report.say(
                         Tone::Plain,
                         format!("keeping the workspace {} (--keep)", ws.root.display()),
                     );
                 } else {
-                    remove_workspace(&ws, config, opts.dry_run)?;
+                    remove_workspace(report, &ws, config, opts.dry_run)?;
                 }
                 return Ok(ExitCode::SUCCESS);
             }
         }
     }
+    report.leave();
     Ok(exit(
-        "swl land",
+        report,
         Waits::Nobody,
         "too many steps in one run; rerun swl land",
         opts.dry_run,
@@ -1492,11 +1480,8 @@ pub fn run_from(
         return match workspace.as_deref().filter(|w| w.exists()) {
             Some(ws) => run(ws, config, reader, writer, opts),
             None => {
-                style::say(
-                    "swl land",
-                    Tone::Good,
-                    format!("{from} has landed: nothing left to do"),
-                );
+                Report::new("swl land")
+                    .say(Tone::Good, format!("{from} has landed: nothing left to do"));
                 Ok(ExitCode::SUCCESS)
             }
         };
@@ -1507,25 +1492,24 @@ pub fn run_from(
         if dir.exists() {
             return run(&dir, config, reader, writer, opts);
         }
-        style::say(
-            "swl land",
+        let lander = Lander::new("swl land", config, reader, writer, opts);
+        let report = &lander.report;
+        report.say(
             Tone::Plain,
             format!(
                 "would run swl start --from {from} (the workspace {})",
                 dir.display()
             ),
         );
-        let lander = Lander::new("swl land", config, reader, writer, opts);
         for mr in shared_entries(&[(consumer.clone(), mr.manifest)]) {
             match lander.shared(&rows, None, &mr)? {
                 Step::Done => {}
                 Step::Progress => unreachable!("a dry run writes nothing"),
-                Step::Planned(then) => return Ok(planned("swl land", &then)),
-                Step::Stop(waits, msg) => return Ok(exit("swl land", waits, &msg, true)),
+                Step::Planned(then) => return Ok(planned(report, &then)),
+                Step::Stop(waits, msg) => return Ok(exit(report, waits, &msg, true)),
             }
         }
-        style::say(
-            "swl land",
+        report.say(
             Tone::Plain,
             format!("then, in the workspace, finalize, push and merge {from}"),
         );
@@ -1548,6 +1532,8 @@ fn promote_from(
     opts: &Options,
 ) -> Result<ExitCode> {
     let lander = Lander::new("swl land", config, reader, writer, opts);
+    let report = &lander.report;
+    report.section(from);
     let (consumer, _) = start::parse_from(from)?;
     for pass in 0..MAX_STEPS {
         let _span = tracing::debug_span!("land", pass).entered();
@@ -1575,20 +1561,17 @@ fn promote_from(
         };
         match step {
             Step::Progress => continue,
-            Step::Planned(then) => return Ok(planned("swl land", &then)),
-            Step::Stop(waits, msg) => return Ok(exit("swl land", waits, &msg, opts.dry_run)),
+            Step::Planned(then) => return Ok(planned(report, &then)),
+            Step::Stop(waits, msg) => return Ok(exit(report, waits, &msg, opts.dry_run)),
             Step::Done => {
-                style::say(
-                    "swl land",
-                    Tone::Good,
-                    format!("{from} has landed: nothing left to do"),
-                );
+                report.end(Tone::Good, format!("{from} has landed: nothing left to do"));
                 return Ok(ExitCode::SUCCESS);
             }
         }
     }
+    report.leave();
     Ok(exit(
-        "swl land",
+        report,
         Waits::Nobody,
         "too many steps in one run; rerun swl land",
         opts.dry_run,

@@ -24,6 +24,7 @@ mod pin_policy;
 mod promote;
 mod publish;
 mod refresh;
+mod report;
 mod shim;
 mod start;
 mod status;

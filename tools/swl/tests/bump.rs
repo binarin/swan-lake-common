@@ -154,7 +154,7 @@ fn bump_runs_to_the_end_over_reruns() {
     // Nothing has moved: nothing to bump, nothing written.
     let log = stdout(&t.bump(&[]));
     assert!(
-        log.contains("swl bump: common: up to date: zwanenzang"),
+        log.contains("swl bump: common\n├─ up to date: zwanenzang\n"),
         "{log}"
     );
     assert!(log.contains("swl bump: nothing to bump"), "{log}");
@@ -166,17 +166,17 @@ fn bump_runs_to_the_end_over_reruns() {
     let log = stdout(&t.bump(&["--dry-run"]));
     for want in [
         format!(
-            "swl bump: common: zwanenzang {} -> {} (the default branch)",
+            "swl bump: common\n├─ zwanenzang {} -> {} (the default branch)",
             short(&z1),
             short(&z2)
         ),
         format!(
-            "swl bump: would relock zwanenzang on master at {} commit \"swl: bump zwanenzang\" and \
+            "├─ would relock zwanenzang on master at {} commit \"swl: bump zwanenzang\" and \
              push it to origin's master (fast-forward)",
             short(&c1)
         ),
-        "then: promote current, wait for its declared source; then the bump MRs of nixos-config, \
-         swan-lake"
+        "└─ dry run, nothing was written; then: promote current, wait for its declared source; \
+         then the bump MRs of nixos-config, swan-lake"
             .to_string(),
     ] {
         assert!(log.contains(&want), "{want:?} in\n{log}");
@@ -192,7 +192,7 @@ fn bump_runs_to_the_end_over_reruns() {
         &out,
         3,
         &format!(
-            "swl bump: waits for the owner: push common's bump to master: rerun swl bump as the \
+            "└─ waits for the owner: push common's bump to master: rerun swl bump as the \
              owner, or git -C {} push origin ",
             t.common_source()
         ),
@@ -219,7 +219,7 @@ fn bump_runs_to_the_end_over_reruns() {
         ),
     );
     assert!(out_text(&out).contains(&format!(
-        "common: pushed {} to master: swl: bump zwanenzang",
+        "├─ pushed {} to master: swl: bump zwanenzang",
         short(&bumped)
     )));
     assert_eq!(t.rev(COMMON, "master^"), c1);
@@ -243,7 +243,12 @@ fn bump_runs_to_the_end_over_reruns() {
     failed(
         &out,
         5,
-        "swl bump: waits for nobody: swan-lake#1 waits for CI, then it merges",
+        "swl bump: swan-lake\n├─ push swan-lake's bump of lib to ",
+    );
+    failed(
+        &out,
+        5,
+        "└─ waits for nobody: swan-lake#1 waits for CI, then it merges",
     );
     failed(&out, 5, "nixos-config#1 waits for CI, then it merges");
     assert_eq!(t.rev(COMMON, "current"), bumped);
@@ -311,12 +316,12 @@ fn bump_runs_to_the_end_over_reruns() {
     failed(
         &out,
         3,
-        "swl bump: waits for the owner: merge nixos-config#1 (the forge refused: HTTP 405: User not \
+        "└─ waits for the owner: merge nixos-config#1 (the forge refused: HTTP 405: User not \
          allowed to merge PR)",
     );
     assert!(
         out_text(&out).contains(&format!(
-            "swan-lake: common is at {} already",
+            "swl bump: swan-lake\n└─ common is at {} already\n",
             short(&bumped)
         )),
         "{}",
@@ -402,23 +407,23 @@ fn bump_leaves_an_input_that_does_not_move_forward() {
     let log = stdout(&t.bump(&["--dry-run", "--check"]));
     for want in [
         format!(
-            "common: zwanenzang {} -> {} (the default branch)",
+            "├─ zwanenzang {} -> {} (the default branch)",
             short(&z1),
             short(&z2)
         ),
         format!(
-            "common: zw-next: not bumped: {} -> {} (next) is not a forward move, the new rev does \
+            "├─ zw-next: not bumped: {} -> {} (next) is not a forward move, the new rev does \
              not descend from the locked one; left at {}",
             short(&n1),
             short(&n2),
             short(&n1)
         ),
-        format!("common: zw-slash {} -> {} (a/b)", short(&s1), short(&s2)),
+        format!("├─ zw-slash {} -> {} (a/b)", short(&s1), short(&s2)),
         format!(
-            "common: zw-pinned: not bumped: flake.nix pins it to a rev; left at {}",
+            "├─ zw-pinned: not bumped: flake.nix pins it to a rev; left at {}",
             short(&pinned)
         ),
-        "would relock zw-slash, zwanenzang on master".to_string(),
+        "├─ would relock zw-slash, zwanenzang on master".to_string(),
         "checked with nix flake check --no-build".to_string(),
     ] {
         assert!(log.contains(&want), "{want:?} in\n{log}");
@@ -493,7 +498,8 @@ fn bump_stops_for_what_is_not_its_own() {
     let log = stdout(&t.bump(&[]));
     assert!(
         log.contains(&format!(
-            "nixos-config: not bumped: lib locks {}, which is ahead of the promoted {}; left at {}",
+            "swl bump: nixos-config\n├─ not bumped: lib locks {}, which is ahead of the promoted \
+             {}; left at {}\n╵\n",
             short(&ahead),
             short(&c1),
             short(&ahead)
@@ -536,7 +542,7 @@ fn bump_stops_for_what_is_not_its_own() {
     let out = t.bump(&[]);
     failed(&out, 5, "swan-lake#1 waits for CI");
     assert!(
-        out_text(&out).contains(&format!("common: nothing to bump at {}", short(&c2))),
+        out_text(&out).contains(&format!("├─ nothing to bump at {}", short(&c2))),
         "{}",
         text(&out)
     );

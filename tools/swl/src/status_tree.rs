@@ -9,15 +9,17 @@
 //! Each row's line has the tree glyphs and `<input path>: <name>` (the
 //! name alone for a root), then aligned columns: the stage, `waits: <who>`
 //! and `next: <step>`. Its detail lines follow, indented below it. The
-//! glyphs are Unicode box drawing (`├─ `, `└─ `, `│  `), also without
-//! colour; colour comes on a terminal only (see [`crate::style`]), by whom
-//! the row waits for, with the detail lines dimmed.
+//! glyphs are those of the progress output ([`crate::report`]): Unicode box
+//! drawing, also without colour; colour comes on a terminal only (see
+//! [`crate::style`]), by whom the row waits for, with names bold and the
+//! glyphs and detail lines dimmed.
 
 use std::io::Write;
 
 use anstyle::Style;
 
 use crate::{
+    report::{BRANCH, GAP, LAST, RAIL},
     status::{Row, Stage, Verdict, Waits},
     style::{BAD, BOLD, DIM, GOOD, NOBODY, OWNER, WARN, paint},
 };
@@ -169,11 +171,7 @@ struct Flat<'a> {
 }
 
 fn flatten<'a>(node: &'a Node<'a>, lead: String, cont: &str, out: &mut Vec<Flat<'a>>) {
-    let below = if node.children.is_empty() {
-        "   "
-    } else {
-        "│  "
-    };
+    let below = if node.children.is_empty() { GAP } else { RAIL };
     out.push(Flat {
         node,
         lead,
@@ -183,11 +181,7 @@ fn flatten<'a>(node: &'a Node<'a>, lead: String, cont: &str, out: &mut Vec<Flat<
     let n = node.children.len();
     for (i, child) in node.children.iter().enumerate() {
         let last = i + 1 == n;
-        let (branch, more) = if last {
-            ("└─ ", "   ")
-        } else {
-            ("├─ ", "│  ")
-        };
+        let (branch, more) = if last { (LAST, GAP) } else { (BRANCH, RAIL) };
         flatten(
             child,
             format!("{cont}{branch}"),

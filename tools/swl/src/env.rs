@@ -188,6 +188,18 @@ fn is_generated(path: &Path) -> Result<bool> {
 }
 
 pub fn run(ws: &Workspace, config: &Config, swl: &Path, force: bool) -> Result<()> {
+    run_to(ws, config, swl, force, |line| println!("{line}"))
+}
+
+/// [`run`], with its per-checkout lines (`<checkout>: <overrides>`) given to
+/// `say` instead of printed: `refresh` puts them in its report.
+pub fn run_to(
+    ws: &Workspace,
+    config: &Config,
+    swl: &Path,
+    force: bool,
+    say: impl Fn(&str),
+) -> Result<()> {
     let consumers: Vec<_> = ws.checkouts.iter().filter(|c| c.is_consumer()).collect();
     if consumers.is_empty() {
         bail!(
@@ -235,11 +247,11 @@ pub fn run(ws: &Workspace, config: &Config, swl: &Path, force: bool) -> Result<(
         } else {
             overrides_summary(&overrides)
         };
-        println!(
+        say(&format!(
             "{}: {summary}{}",
             c.name,
             if changed { "" } else { " (unchanged)" }
-        );
+        ));
         let envrc = fs::read_to_string(c.dir.join(".envrc")).unwrap_or_default();
         if !envrc.contains(".envrc.local") || !envrc.contains("use_flake_args") {
             style::tell(

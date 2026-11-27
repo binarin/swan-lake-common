@@ -38,7 +38,9 @@ use crate::{
     land::{self, Lander, Rejection, Repeated, Step, push_rejection, stop},
     lock_change, lock_rules,
     nix::Nix,
-    pin_policy, start,
+    pin_policy,
+    report::Report,
+    start,
     status::Waits,
     style::{self, Tone},
     tempdir::TempDir,
@@ -402,43 +404,33 @@ fn judge(
 }
 
 /// Says how common's inputs stand.
-fn report_plan(plans: &[InputPlan]) {
+fn report_plan(report: &Report, plans: &[InputPlan]) {
     let current: Vec<&str> = plans
         .iter()
         .filter(|p| p.judged == Judged::Current)
         .map(|p| p.name.as_str())
         .collect();
     if !current.is_empty() {
-        style::say(
-            CMD,
-            Tone::Plain,
-            format!("common: up to date: {}", current.join(", ")),
-        );
+        report.list("common: up to date", &current);
     }
     for p in plans {
         let (old, name) = (short(&p.old), &p.name);
         match &p.judged {
             Judged::Current => {}
-            Judged::Forward(new) => style::say(
-                CMD,
-                Tone::Plain,
-                format!("common: {name} {old} -> {} ({})", short(new), p.branch),
-            ),
-            Judged::NotForward(new) => style::say(
-                CMD,
-                Tone::Warn,
-                format!(
-                    "common: {name}: not bumped: {old} -> {} ({}) is not a forward move, the new \
-                     rev does not descend from the locked one; left at {old}",
-                    short(new),
-                    p.branch
-                ),
-            ),
-            Judged::Unknown(why) => style::say(
-                CMD,
-                Tone::Warn,
-                format!("common: {name}: not bumped: {why}; left at {old}"),
-            ),
+            Judged::Forward(new) => report.step(format!(
+                "common: {name} {old} -> {} ({})",
+                short(new),
+                p.branch
+            )),
+            Judged::NotForward(new) => report.warn(format!(
+                "common: {name}: not bumped: {old} -> {} ({}) is not a forward move, the new rev \
+                 does not descend from the locked one; left at {old}",
+                short(new),
+                p.branch
+            )),
+            Judged::Unknown(why) => {
+                report.warn(format!("common: {name}: not bumped: {why}; left at {old}"))
+            }
         }
     }
 }
@@ -574,6 +566,10 @@ impl Bumper<'_> {
         self.opts.land.dry_run
     }
 
+    fn report(&self) -> &Report {
+        &self.lander.report
+    }
+
     /// Steps 1 and 2: common bumped, promoted to `promoted` and in the
     /// declared sources.
     fn common(&self, promoted: &str, mirrors: &BTreeSet<String>) -> Result<Common> {
@@ -587,6 +583,8 @@ impl Bumper<'_> {
             );
         };
         let master = base_branch(base);
+        let which = format!("{COMMON_REPO} {master}");
+        self.report().section_also("common", &[&which]);
         self.fetcher.fetch(src, &remote)?;
         let tracking = |b: &str| {
             rev_parse(src, &format!("refs/remotes/{remote}/{b}")).ok_or_else(|| {
@@ -635,14 +633,10 @@ impl Bumper<'_> {
             )?));
         }
         let target = if !unpromoted.is_empty() {
-            style::say(
-                CMD,
-                Tone::Plain,
-                format!(
-                    "common: {master} at {} has swl bump's commit, not promoted to {promoted} yet",
-                    short(&head)
-                ),
-            );
+            self.report().step(format!(
+                "common: {master} at {} has swl bump's commit, not promoted to {promoted} yet",
+                short(&head)
+            ));
             head
         } else {
             match self.bump_common(src, &remote, master, &head, promoted, mirrors)? {
@@ -650,14 +644,12 @@ impl Bumper<'_> {
                 Err(step) => return Ok(Common::Stopped(step)),
             }
         };
-        let which = format!("{COMMON_REPO} {master}");
         if target != current {
             match self
                 .lander
                 .promote(&which, COMMON_REPO, &target, promoted)?
             {
-                Step::Progress => style::say(
-                    CMD,
+                Step::Progress => self.report().outcome(
                     Tone::Good,
                     format!("common: promoted {promoted} to {}", short(&target)),
                 ),
@@ -688,7 +680,7 @@ impl Bumper<'_> {
             bail!("{COMMON_REPO} has no flake.lock at {}", short(head));
         };
         let plans = plan_inputs(&old, self.history)?;
-        report_plan(&plans);
+        report_plan(self.report(), &plans);
         let moves: Vec<(String, Value, String)> = plans
             .iter()
             .filter_map(|p| match &p.judged {
@@ -697,11 +689,8 @@ impl Bumper<'_> {
             })
             .collect();
         if moves.is_empty() {
-            style::say(
-                CMD,
-                Tone::Plain,
-                format!("common: nothing to bump at {}", short(head)),
-            );
+            self.report()
+                .step(format!("common: nothing to bump at {}", short(head)));
             return Ok(Ok(head.to_string()));
         }
         let names: Vec<&str> = moves.iter().map(|(n, _, _)| n.as_str()).collect();
@@ -761,8 +750,7 @@ impl Bumper<'_> {
         let refspec = format!("HEAD:refs/heads/{master}");
         match git(&scratch.dir, &["push", "--quiet", remote, &refspec]) {
             Ok(_) => {
-                style::say(
-                    CMD,
+                self.report().outcome(
                     Tone::Good,
                     format!("common: pushed {} to {master}: {subject}", short(&new_head)),
                 );
@@ -826,40 +814,27 @@ impl Bumper<'_> {
             )
             .is_none()
             {
-                style::say(
-                    CMD,
-                    Tone::Warn,
-                    format!(
-                        "{name}: {} locks {}, which {COMMON_REPO} does not have; not bumped",
-                        i.name,
-                        short(&i.rev)
-                    ),
-                );
+                self.report().warn(format!(
+                    "{name}: {} locks {}, which {COMMON_REPO} does not have; not bumped",
+                    i.name,
+                    short(&i.rev)
+                ));
             } else if is_ancestor(common_src, target, &i.rev) {
-                style::say(
-                    CMD,
-                    Tone::Warn,
-                    format!(
-                        "{name}: not bumped: {} locks {}, which is ahead of the promoted {}; left \
-                         at {}",
-                        i.name,
-                        short(&i.rev),
-                        short(target),
-                        short(&i.rev)
-                    ),
-                );
+                self.report().warn(format!(
+                    "{name}: not bumped: {} locks {}, which is ahead of the promoted {}; left at {}",
+                    i.name,
+                    short(&i.rev),
+                    short(target),
+                    short(&i.rev)
+                ));
             } else if !is_ancestor(common_src, &i.rev, target) {
-                style::say(
-                    CMD,
-                    Tone::Warn,
-                    format!(
-                        "{name}: not bumped: {} {} -> {} is not a forward move; left at {}",
-                        i.name,
-                        short(&i.rev),
-                        short(target),
-                        short(&i.rev)
-                    ),
-                );
+                self.report().warn(format!(
+                    "{name}: not bumped: {} {} -> {} is not a forward move; left at {}",
+                    i.name,
+                    short(&i.rev),
+                    short(target),
+                    short(&i.rev)
+                ));
             } else {
                 moves.push((i.name.clone(), i.locked.clone(), target.to_string()));
             }
@@ -870,22 +845,25 @@ impl Bumper<'_> {
         )?;
         let tip = remote_tip.split_whitespace().next().map(str::to_string);
         if moves.is_empty() {
-            if c.inputs.iter().all(|i| i.rev == target) {
-                style::say(
-                    CMD,
-                    Tone::Good,
-                    format!("{name}: common is at {} already", short(target)),
-                );
-            }
-            if let Some(tip) = &tip {
-                style::say(
-                    CMD,
-                    Tone::Plain,
-                    format!(
-                        "{name}: {BUMP_BRANCH} (at {}) is not needed any more",
-                        short(tip)
-                    ),
-                );
+            let at = c
+                .inputs
+                .iter()
+                .all(|i| i.rev == target)
+                .then(|| format!("{name}: common is at {} already", short(target)));
+            let unneeded = tip.as_ref().map(|tip| {
+                format!(
+                    "{name}: {BUMP_BRANCH} (at {}) is not needed any more",
+                    short(tip)
+                )
+            });
+            match (at, unneeded) {
+                (Some(at), Some(unneeded)) => {
+                    self.report().outcome(Tone::Good, at);
+                    self.report().end(Tone::Plain, unneeded);
+                }
+                (Some(at), None) => self.report().end(Tone::Good, at),
+                (None, Some(unneeded)) => self.report().end(Tone::Plain, unneeded),
+                (None, None) => {}
             }
             return Ok(Step::Done);
         }
@@ -1049,8 +1027,7 @@ impl Bumper<'_> {
         let rebase = format!("rerun {CMD}, which rebuilds {BUMP_BRANCH} on {}", c.branch);
         match self.lander.merge(&which, name, &info, &rebase)? {
             Step::Progress => {
-                style::say(
-                    CMD,
+                self.report().end(
                     Tone::Good,
                     format!("{name}: common is at {}", short(target)),
                 );
@@ -1134,19 +1111,21 @@ impl Bumper<'_> {
             Common::Ready(target) => target,
             Common::Stopped(Step::Planned(then)) => {
                 return Ok(land::planned(
-                    CMD,
+                    self.report(),
                     &format!("{then}; then the bump MRs of {}", names.join(", ")),
                 ));
             }
             Common::Stopped(Step::Stop(waits, msg)) => {
-                return Ok(self.end(&[(waits, msg)], &[], &[]));
+                land::say_waits(self.report(), waits, &msg);
+                return Ok(self.end(&[waits], &[]));
             }
             Common::Stopped(step) => bail!("common stopped at an unexpected step: {step:?}"),
         };
         let mut stops = Vec::new();
-        let mut plans = Vec::new();
+        let mut planned = false;
         let mut errors = Vec::new();
         for c in &consumers {
+            self.report().section(&c.name);
             let step = match self.consumer(c, &target, &common_rc.source) {
                 Err(e) => match e.downcast_ref::<Repeated>() {
                     Some(r) => Step::Stop(Waits::Nobody, r.0.clone()),
@@ -1161,11 +1140,17 @@ impl Bumper<'_> {
             tracing::debug!(consumer = %c.name, ?step, "the consumer's step");
             match step {
                 Step::Done | Step::Progress => {}
-                Step::Planned(then) => plans.push(then),
-                Step::Stop(waits, msg) => stops.push((waits, msg)),
+                Step::Planned(then) => {
+                    land::planned(self.report(), &then);
+                    planned = true;
+                }
+                Step::Stop(waits, msg) => {
+                    land::say_waits(self.report(), waits, &msg);
+                    stops.push(waits);
+                }
             }
         }
-        if stops.is_empty() && plans.is_empty() && errors.is_empty() {
+        if stops.is_empty() && !planned && errors.is_empty() {
             let msg = if self.lander.wrote() {
                 format!(
                     "done: {} lock common at {}",
@@ -1175,29 +1160,25 @@ impl Bumper<'_> {
             } else {
                 "nothing to bump".to_string()
             };
-            style::say(CMD, Tone::Good, msg);
+            self.report().say(Tone::Good, msg);
             return Ok(ExitCode::SUCCESS);
         }
-        Ok(self.end(&stops, &plans, &errors))
+        Ok(self.end(&stops, &errors))
     }
 
-    /// Says what each stopped item waits for, what a dry run planned, and
-    /// the consumers that failed. The exit status is 2 with a failure, else
-    /// the most urgent wait's: the owner, anyone, then nobody.
-    fn end(&self, stops: &[(Waits, String)], plans: &[String], errors: &[String]) -> ExitCode {
-        for (waits, msg) in stops {
-            land::say_waits(CMD, *waits, msg);
-        }
-        for then in plans {
-            land::planned(CMD, then);
-        }
+    /// Says which consumers failed, after what each stopped item waits for
+    /// and what a dry run planned, which close their sections. The exit
+    /// status is 2 with a failure, else the most urgent wait's: the owner,
+    /// anyone, then nobody.
+    fn end(&self, stops: &[Waits], errors: &[String]) -> ExitCode {
+        self.report().close();
         for e in errors {
             style::tell(CMD, Tone::Error, format!("error: {e}"));
         }
         if !errors.is_empty() {
             return ExitCode::from(2);
         }
-        match stops.iter().map(|(w, _)| land::waits_code(*w)).min() {
+        match stops.iter().map(|w| land::waits_code(*w)).min() {
             Some(code) if !self.dry_run() => ExitCode::from(code),
             _ => ExitCode::SUCCESS,
         }

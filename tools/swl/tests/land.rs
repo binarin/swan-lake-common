@@ -321,7 +321,7 @@ fn land_runs_to_the_end_over_reruns() {
     let writes = t.f.api.writes().len();
     let log = stdout(&t.land(&["--dry-run"]));
     assert!(
-        log.contains("would promote swan-lake-common#1: git -C"),
+        log.contains("├─ would promote swan-lake-common#1\n│  git -C"),
         "{log}"
     );
     assert_eq!(t.forge_refs(), refs);
@@ -590,8 +590,9 @@ fn land_refuses_a_workspace_whose_consumer_is_detached_at_the_base() {
         &out,
         4,
         &format!(
-            "swl land: waits for anyone: nixos-config: not a change (detached at origin/master); \
-             next: git -C {} switch sl-0022-held, then swl land\n  nixos-config#9 is open on \
+            "swl land: nixos-config\n└─ waits for anyone: nixos-config: not a change (detached at \
+             origin/master); next: git -C {} switch sl-0022-held, then swl land\n   nixos-config#9 \
+             is open on \
              sl-0022-held, the workspace's branch; or swl land --from nixos-config#9 --workspace \
              <new-path>, which makes a workspace of its own and needs the branches of its shared \
              MRs not checked out here",
@@ -1008,7 +1009,7 @@ fn land_merges_directly_when_the_checks_turn_green_as_the_merge_is_scheduled() {
     let out = t.land(&[]);
     let log = out_text(&out);
     assert!(
-        log.contains("swan-lake-common#1: its checks turned green as the merge was scheduled"),
+        log.contains("├─ its checks turned green as the merge was scheduled"),
         "{log}"
     );
     assert!(log.contains("swan-lake-common#1 is merged"), "{log}");
@@ -1256,7 +1257,9 @@ fn land_rebases_a_shared_mr_behind_its_base_and_schedules_its_merge() {
     );
     let log = stdout(&t.refresh(&[]));
     assert!(
-        log.contains("swan-lake-common#1: sl-0020-land contains origin/master already"),
+        log.contains(
+            "swl refresh: swan-lake-common#1\n└─ sl-0020-land contains origin/master already"
+        ),
         "{log}"
     );
 }
@@ -1267,11 +1270,13 @@ fn refresh_is_a_no_op_when_every_branch_contains_its_base() {
     let refs = t.forge_refs();
     let log = stdout(&t.refresh(&[]));
     assert!(
-        log.contains("swan-lake-common#1: sl-0020-land contains origin/master already"),
+        log.contains(
+            "swl refresh: swan-lake-common#1\n└─ sl-0020-land contains origin/master already"
+        ),
         "{log}"
     );
     assert!(
-        log.contains("swan-lake#2: sl-0020-land contains origin/master already"),
+        log.contains("swl refresh: swan-lake#2\n└─ sl-0020-land contains origin/master already"),
         "{log}"
     );
     assert_eq!(t.forge_refs(), refs);
@@ -1518,7 +1523,7 @@ fn land_makes_the_consumer_landing_anew_on_a_master_whose_lock_moved() {
         &out,
         4,
         "and its landing commit, dropped to rebase it, cannot be made anew: it landed lib, but \
-         what lands now is none:\n  lib (swan-lake-common#1): stays: merged as",
+         what lands now is none:\n   lib (swan-lake-common#1): stays: merged as",
     );
     assert!(out_text(&out).contains("nothing was pushed"));
     assert_eq!(t.forge_head("swan-lake", "sl-0020-land"), head);
@@ -1547,7 +1552,7 @@ fn land_makes_the_consumer_landing_anew_on_a_master_whose_lock_moved() {
         "{log}"
     );
     assert!(
-        log.contains("swan-lake#2: finalized anew: swl: land swan-lake-common#1 (lib)"),
+        log.contains("├─ finalized anew: swl: land swan-lake-common#1 (lib)"),
         "{log}"
     );
     // swl env ran again for the moved lock.
@@ -1674,7 +1679,9 @@ fn refresh_rebases_only_the_changes_own_mr_branches_into_the_base() {
     });
     let log = stdout(&t.refresh(&[]));
     assert!(
-        log.contains("swan-lake-common#1: sl-0020-land contains origin/master already"),
+        log.contains(
+            "swl refresh: swan-lake-common#1\n└─ sl-0020-land contains origin/master already"
+        ),
         "{log}"
     );
 
@@ -1845,7 +1852,7 @@ fn refresh_makes_a_partial_landing_anew_with_the_same_entries() {
         "{log}"
     );
     assert!(
-        log.contains("swan-lake#2: finalized anew: swl: land swan-lake-common#1 (lib)"),
+        log.contains("├─ finalized anew: swl: land swan-lake-common#1 (lib)"),
         "{log}"
     );
     let head = t.forge_head("swan-lake", "sl-0020-land");
@@ -1962,7 +1969,9 @@ fn refresh_warns_when_swl_env_fails_after_a_rebase_moved_a_lock() {
     let out = t.refresh(&[]);
     let log = stdout(&out);
     assert!(
-        log.contains("swan-lake-common#1: pushed sl-0020-land at"),
+        log.contains(
+            "swl refresh: swan-lake-common#1\n├─ rebase sl-0020-land of swan-lake-common#1"
+        ) && log.contains("├─ pushed sl-0020-land at"),
         "{log}"
     );
     assert!(
