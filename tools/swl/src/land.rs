@@ -44,7 +44,7 @@ use crate::{
     forge::{
         CiState, ForgeWriter, MergeOutcome, MergeWhen, PrInfo, PrReader, PrState, ready_title,
     },
-    git::{git, git_ok, short, valid_branch},
+    git::{STATUS_PORCELAIN, git, git_ok, short, valid_branch},
     manifest::{Entry, MANIFEST_FILE, Manifest},
     refresh::{self, Part, Place},
     report::Report,
@@ -1188,7 +1188,7 @@ impl Lander<'_> {
 /// untracked or ignored files (but [`disposable`] ones), or commits in
 /// neither the base nor its remote branch.
 fn keep_reason(c: &Checkout, base: &str) -> Result<Option<String>> {
-    let status = git(&c.dir, &["status", "--porcelain", "--ignored"])?;
+    let status = git(&c.dir, &[&STATUS_PORCELAIN[..], &["--ignored"]].concat())?;
     let mut changed = Vec::new();
     let mut ignored = Vec::new();
     for line in status.lines() {

@@ -40,6 +40,7 @@ swl start SL-0060-foo swan-lake swan-lake-common@common   # a workspace for one 
 swl start --from swan-lake#12             # join a published consumer MR
 swl ws add swan-lake                      # fetch, worktree detached at the base, then env
 swl ws add swan-lake-common@common --branch sl-0036-x
+swl ws remove [sl-60] [--force]           # drop a workspace: its worktrees, pushed branches, the directory
 swl env                                   # .envrc.local per consumer, and the wrappers
 swl status [--from swan-lake#12]          # where the change stands, and the next step
 swl ls [--no-fetch]                       # every workspace's stage, and the open MRs in none
@@ -60,11 +61,12 @@ regardless of the current directory (also with `--from`). Its default is
 `~/personal-workspace/swan-lake-umbrella/workspaces`. `start --workspace DIR`
 still creates or resumes an explicit directory instead.
 
-`status`, `land`, `refresh`, `publish`, `env` and `ws add` select the enclosing
-workspace when run anywhere inside it, including inside a checkout. They also
-accept `--workspace NAME|TICKET|PATH` from anywhere. `status`, `land`, `refresh`
-and `env` accept the same selector as an optional positional argument; `publish`
-and `ws add` keep their existing consumer/checkout positional argument:
+`status`, `land`, `refresh`, `publish`, `env`, `ws add` and `ws remove` select
+the enclosing workspace when run anywhere inside it, including inside a
+checkout. They also accept `--workspace NAME|TICKET|PATH` from anywhere.
+`status`, `land`, `refresh`, `env` and `ws remove` accept the same selector as
+an optional positional argument; `publish` and `ws add` keep their existing
+consumer/checkout positional argument:
 
 ```sh
 swl status sl-88
@@ -72,6 +74,7 @@ swl env --workspace SL-0088-swl-version
 swl refresh sl-88 --dry-run
 swl publish swan-lake --workspace sl-88
 swl ws add swan-lake-common@common --workspace sl-88
+swl ws remove sl-88
 ```
 
 Names are looked up directly below `workspaces`, case-insensitively and ignoring
@@ -180,6 +183,56 @@ terminal.
     workspace has no consumer checkout yet. When `env` refuses (a
     hand-written `.envrc.local`), the checkout is still added; fix it and
     rerun `swl env` (`--force` replaces the file).
+- `ws remove [WORKSPACE] [--workspace NAME|TICKET|PATH] [--force] [--no-fetch]`
+  drops a workspace that is abandoned, or that is to be joined afresh
+  (`start --from`, `land --from`); it is the supported way, rather than `rm
+  -rf`, which leaves the sources with the worktrees registered and the
+  local branches (see [Recovering from a workspace removed by
+  hand](#recovering-from-a-workspace-removed-by-hand)).
+  - First it fetches each source's base remote, as `ws add` does, and
+    checks every checkout before removing any: it must be a linked worktree
+    of its repo's configured source, there and not through a symbolic link,
+    not the source's main working tree, and not locked, else nothing is
+    removed (`.envrc.local` included). A checkout with uncommitted changes
+    or untracked files (but swl's generated `.envrc.local`; whatever
+    `status.showUntrackedFiles` says), or with commits pushed nowhere, is
+    listed with why, commits by short sha and subject; then nothing is
+    removed and it fails, unless `--force`. Pushed means as for `ws add`'s
+    reset: on a branch of the base remote that this run fetched, or the
+    same patch as one on the checkout's remote branch (never for an empty
+    commit). `--no-fetch` skips the fetch, and then judges by the refs the
+    source already has, which can be stale: a branch deleted on the forge
+    still counts as pushed. Ignored files do not keep a checkout (as for
+    `ls`'s `removable`); those it deletes are listed (`deleting the ignored
+    files of <checkout>: …`), but for direnv's `.direnv/`, `result*` links
+    and `.swl`.
+  - Then per checkout: `git worktree remove` from its source (`git worktree
+    remove --force` with `--force`), after the generated `.envrc.local` is
+    deleted. Without `--force`, a checkout whose HEAD, branch or files
+    changed after it was checked is kept, and the run stops there (`stopped
+    at <checkout>: …`; the checkouts removed before it are said so). Then
+    its branch, `git branch -D` in the source, when the branch's commits are
+    all pushed. A branch with commits pushed nowhere (only with `--force`)
+    is kept, and said so, with the `git branch -D` that drops it. So are a
+    detached checkout's commits pushed nowhere, with `--force`: on the new
+    branch `swl-kept/<workspace>-<checkout>` of its source, said so with
+    the full sha (`kept the commits of <checkout>, detached at <sha>, on the
+    branch swl-kept/…`); the run refuses up front, removing nothing, when
+    that branch exists already.
+  - Last `.swl` and the directory go; a directory with other files is kept,
+    and said so.
+  - Run from inside the workspace (a checkout included), it works the same;
+    it says that the current directory was in the workspace, to `cd` out of
+    it.
+
+  ```
+  swl ws remove: workspace /ws/SL-0005-rm
+  ├─ removed /ws/SL-0005-rm/swan-lake
+  ├─ deleted the branch sl-0005-rm of swan-lake: its commits are on remote branches
+  ├─ removed /ws/SL-0005-rm/swan-lake-common@lib
+  ├─ deleted the branch sl-0005-rm of swan-lake-common: its commits are on remote branches
+  └─ removed /ws/SL-0005-rm
+  ```
 - `env` writes each consumer's `.envrc.local` and `<ws>/.swl/bin/{nix,nh,deploy}`,
   and roots the swl they exec (see [Generated files](#generated-files)).
   It writes only files whose content changes, so that direnv does not reload
@@ -218,10 +271,30 @@ terminal.
 described under [Manifest and landing](#manifest-and-landing), `bump` under
 [Bump](#bump), `promote` under [Promote](#promote).
 
+### Recovering from a workspace removed by hand
+
+A workspace directory removed with `rm -rf` leaves two things in each source
+(bare repo): its worktrees stay registered, holding their branches (`swl
+land --from swan-lake#61` then failed with `branch … is already checked out
+at <gone path>`), and its local branches stay where they were, which after
+the MR was rebased and force-pushed is a stale, diverged head (that `land`
+then asked to merge or rebase). Since swl 0.10.0, `start`, `start --from`,
+`land --from` and `ws add` prune such a worktree and reset such a branch
+when they join (see `ws add` above), and `ws remove` is the way to drop a
+workspace. With an older swl, by hand, in each source of the workspace's
+checkouts:
+
+```sh
+git -C <source> worktree prune                         # forget worktrees whose directories are gone
+git -C <source> log --oneline <remote>/<branch>..<branch>   # what only the local branch has
+git -C <source> branch -D <branch>                     # drop the stale branch, joining creates it anew
+# or keep the name and move it: git -C <source> branch -f <branch> <remote>/<branch>
+```
+
 ## Progress output
 
 The multi-step commands (`land`, `bump`, `promote`, `refresh`, `publish`,
-`finalize`) print their progress as a tree, as the run goes on: a section
+`finalize`, `ws remove`) print their progress as a tree, as the run goes on: a section
 per repo, MR or phase, headed `swl <cmd>: <name>`, its steps nested below.
 A `swl bump` that bumps common and opens the consumers' bump MRs:
 
@@ -256,7 +329,8 @@ swl bump: swan-lake
   MR and per consumer MR (`swan-lake#31`), and `workspace <dir>` for the
   removal; `bump` one for common and one per consumer; `promote` one for
   what it promotes (`swan-lake-common origin/master`); `refresh` one per MR;
-  `publish` one per checkout; `finalize` one for `swl.toml`.
+  `publish` one per checkout; `finalize` one for `swl.toml`; `ws remove`
+  one, `workspace <dir>`.
 - `├─ ` a step: what swl does (with `--dry-run`, `would …`) or found;
   outcomes (pushed, promoted, merged, committed, an MR opened) bold, in
   green.

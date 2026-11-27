@@ -8,6 +8,16 @@ pub const GIT: &str = match option_env!("SWL_GIT") {
     None => "git",
 };
 
+/// `git status --porcelain` with all changes and untracked files, whatever
+/// the git config says of untracked files (`status.showUntrackedFiles`) or
+/// submodules: what removing a checkout would lose.
+pub const STATUS_PORCELAIN: [&str; 4] = [
+    "status",
+    "--porcelain",
+    "--untracked-files=normal",
+    "--ignore-submodules=none",
+];
+
 /// Runs git in `dir`; stdout without the trailing newline, or an error with
 /// git's stderr.
 pub fn git(dir: &Path, args: &[&str]) -> Result<String> {

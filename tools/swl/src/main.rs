@@ -36,6 +36,7 @@ mod workspace;
 mod workspace_location;
 mod ws_add;
 mod ws_prune;
+mod ws_remove;
 
 use std::{ffi::OsString, path::PathBuf, process::ExitCode, time::Duration};
 
@@ -306,6 +307,21 @@ enum WsCommands {
         #[arg(long)]
         no_env: bool,
     },
+    /// Remove a workspace: each checkout's worktree, its branch when the branch is pushed, then the directory
+    Remove {
+        /// Workspace name, ticket ID or path (alternative to --workspace)
+        #[arg(value_name = "WORKSPACE", conflicts_with = "workspace")]
+        workspace_name: Option<PathBuf>,
+        /// Workspace name, ticket ID or path [default: enclosing workspace]
+        #[arg(long, value_name = "WORKSPACE")]
+        workspace: Option<PathBuf>,
+        /// Remove checkouts with uncommitted or untracked files, or commits on no remote branch, too
+        #[arg(long)]
+        force: bool,
+        /// Do not fetch the sources first; use the refs they already have
+        #[arg(long)]
+        no_fetch: bool,
+    },
 }
 
 /// The swl that the workspace's wrappers and CI's nix wrapper exec, and
@@ -353,6 +369,26 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 branch.as_deref(),
                 &ws_add::Fetcher::new(!no_fetch),
                 swl.as_deref(),
+            )?;
+        }
+        Commands::Ws {
+            command:
+                WsCommands::Remove {
+                    workspace_name,
+                    workspace,
+                    force,
+                    no_fetch,
+                },
+        } => {
+            let config = Config::load(config_flag)?;
+            let cwd = std::env::current_dir().context("current directory")?;
+            let workspace = workspace.or(workspace_name);
+            ws_remove::run(
+                &config,
+                &workspace_location::resolve(&config, &cwd, workspace.as_deref())?,
+                &cwd,
+                force,
+                &ws_add::Fetcher::new(!no_fetch),
             )?;
         }
         Commands::Start {

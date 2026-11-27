@@ -246,7 +246,7 @@ fn describe_head(dir: &Path) -> Result<(Option<String>, String)> {
 }
 
 /// The canonical git common directory of the repository at `dir`.
-fn common_dir(dir: &Path) -> Option<PathBuf> {
+pub fn common_dir(dir: &Path) -> Option<PathBuf> {
     let common = git_ok(dir, &["rev-parse", "--git-common-dir"])?;
     dir.join(common).canonicalize().ok()
 }

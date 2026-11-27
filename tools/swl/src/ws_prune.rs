@@ -9,7 +9,7 @@ use anyhow::Result;
 
 use crate::{
     config::Config,
-    git::{git, git_ok, short},
+    git::{STATUS_PORCELAIN, git, git_ok, short},
     land::disposable,
     workspace::{Checkout, Workspace},
     ws_add::base_remote,
@@ -40,6 +40,20 @@ fn in_base(dir: &Path, rev: &str, base: &str) -> bool {
     git_ok(dir, &["merge-base", "--is-ancestor", rev, base]).is_some()
 }
 
+/// The `git status --porcelain` lines of the checkout at `dir`: its changes
+/// and untracked files, but swl's generated `.envrc.local`; ignored files
+/// do not count. Also what `swl ws remove` refuses without `--force`.
+pub fn uncommitted(dir: &Path) -> Result<Vec<String>> {
+    Ok(git(dir, &STATUS_PORCELAIN)?
+        .lines()
+        .filter(|l| {
+            l.strip_prefix("?? ")
+                .is_none_or(|path| !disposable(dir, path, false))
+        })
+        .map(str::to_string)
+        .collect())
+}
+
 /// Why the checkout holds something not in `base`, if it does.
 fn checkout_keep_reason(c: &Checkout, base: &str) -> Result<Option<String>> {
     let dir = &c.dir;
@@ -56,14 +70,7 @@ fn checkout_keep_reason(c: &Checkout, base: &str) -> Result<Option<String>> {
     {
         return Ok(Some(format!("its base {base} is not known here")));
     }
-    let changed: Vec<String> = git(dir, &["status", "--porcelain"])?
-        .lines()
-        .filter(|l| {
-            l.strip_prefix("?? ")
-                .is_none_or(|path| !disposable(dir, path, false))
-        })
-        .map(str::to_string)
-        .collect();
+    let changed = uncommitted(dir)?;
     if !changed.is_empty() {
         return Ok(Some(format!(
             "uncommitted or untracked files: {}",
