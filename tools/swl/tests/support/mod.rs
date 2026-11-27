@@ -140,13 +140,40 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// Git config for every git the tests run: no automatic maintenance. Since
+/// git 2.54 the maintenance that commit, fetch or receive-pack starts in the
+/// background repacks even a tiny repo (two loose objects under
+/// `objects/17` make it estimate a hundred), so it can write into a clone
+/// that a test is removing.
+pub const NO_AUTO_MAINTENANCE: [(&str, &str); 2] =
+    [("maintenance.auto", "false"), ("gc.auto", "0")];
+
+/// Writes [`NO_AUTO_MAINTENANCE`] as the global git config of a test HOME,
+/// for the gits run with that HOME, swl's and the forge side's included: a
+/// push to a local path runs receive-pack without the caller's
+/// `GIT_CONFIG_COUNT`.
+pub fn write_test_gitconfig(home: &Path) {
+    fs::create_dir_all(home).unwrap();
+    let text: String = NO_AUTO_MAINTENANCE
+        .iter()
+        .map(|(name, value)| {
+            let (section, key) = name.split_once('.').unwrap();
+            format!("[{section}]\n\t{key} = {value}\n")
+        })
+        .collect();
+    fs::write(home.join(".gitconfig"), text).unwrap();
+}
+
+/// git in the fake API's thread, which has no test HOME: the config of
+/// [`NO_AUTO_MAINTENANCE`] comes through the environment.
 fn git_in(dir: &Path, args: &[&str]) -> Option<String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
-        .ok()?;
+    let mut c = Command::new("git");
+    c.env("GIT_CONFIG_COUNT", NO_AUTO_MAINTENANCE.len().to_string());
+    for (i, (name, value)) in NO_AUTO_MAINTENANCE.iter().enumerate() {
+        c.env(format!("GIT_CONFIG_KEY_{i}"), name)
+            .env(format!("GIT_CONFIG_VALUE_{i}"), value);
+    }
+    let out = c.arg("-C").arg(dir).args(args).output().ok()?;
     out.status
         .success()
         .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
@@ -794,6 +821,7 @@ impl Forge {
         }
         fs::create_dir_all(&root).unwrap();
         let root = root.canonicalize().unwrap();
+        write_test_gitconfig(&root.join("home"));
         let base_path = env::var("PATH").unwrap();
         let mut nix_config =
             "experimental-features = nix-command flakes\nflake-registry =\n".to_string();

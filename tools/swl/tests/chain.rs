@@ -4,6 +4,8 @@
 //! beyond each other. Set SWL_TEST_NIX_STORE to use a store in a scratch
 //! directory, as the package check does inside the build sandbox.
 
+mod support;
+
 use std::{
     env, fs,
     os::unix::fs::PermissionsExt,
@@ -84,6 +86,7 @@ impl Chain {
         }
         fs::create_dir_all(&root).unwrap();
         let root = root.canonicalize().unwrap();
+        support::write_test_gitconfig(&root.join("home"));
         let base_path = env::var("PATH").unwrap();
         let mut nix_config =
             "experimental-features = nix-command flakes\nflake-registry =\n".to_string();
@@ -523,14 +526,10 @@ wrappers' swl: {version} at {swl}"
 
     // Without it, a rerun of `env` drops its override and watch, and the
     // zwanenzang below common comes from the common checkout's lock.
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(&zw_src)
-        .args(["worktree", "remove", "--force"])
-        .arg(&zw)
-        .output()
-        .unwrap();
-    assert!(out.status.success(), "{}", text(&out));
+    t.git(
+        &zw_src,
+        &["worktree", "remove", "--force", &zw.display().to_string()],
+    );
     assert_eq!(
         stdout(&t.swl(&["env"])),
         "swan-lake: common←swan-lake-common@common"

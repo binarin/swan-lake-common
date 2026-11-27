@@ -15,7 +15,7 @@ use std::{
     thread,
 };
 
-use support::{FakeApi, TOKEN};
+use support::{FakeApi, TOKEN, write_test_gitconfig};
 
 /// Common pins zwanenzang's `current`, for nested (`lib/zwanenzang`) entries.
 const COMMON_FLAKE: &str = r#"{
@@ -130,6 +130,7 @@ impl World {
         }
         fs::create_dir_all(&root).unwrap();
         let root = root.canonicalize().unwrap();
+        write_test_gitconfig(&root.join("home"));
         let base_path = env::var("PATH").unwrap();
         let mut nix_config =
             "experimental-features = nix-command flakes\nflake-registry =\n".to_string();
