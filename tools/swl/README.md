@@ -425,7 +425,7 @@ line waits for them through the consumer's verdict only. The exit status is
 
 `SWL_LOG` sets what swl logs on stderr, as a `tracing` filter: `debug`,
 `swl::forge=trace`, `swl::cmd=debug,swl::land=debug`. The default is
-`warn`. At debug: every external command (git, nix, curl, fj, direnv) with
+`warn`. At debug: every external command (git, nix, curl, direnv) with
 its arguments, exit status and duration (target `swl::cmd`); each forge or
 GitHub API request with its method, URL, whether it carried fj's token, and
 the HTTP status (`swl::forge`; the answer's body at trace); and the
@@ -660,9 +660,14 @@ From a workspace, for the consumer checkout `<consumer>`:
    `origin`, fast-forward only. A HEAD already in the repo's base (config
    `base`, default `origin/master`, fetched first) is a lock bump or merged
    work, not an MR, and is skipped.
-2. Find the open MR whose head is that branch (`fj pr search --all` and
-   `fj pr view`), or open one as a draft (`fj pr create`, title `WIP: ` and
-   the first commit's subject, body the commit list), into the base branch.
+2. Find the open MR from that branch into the base branch, in the forge's
+   list of open MRs (`GET /repos/{owner}/{repo}/pulls?state=open`, by its
+   head and base branch; an open MR swl cannot read is skipped with a
+   warning), or open one as a draft (`POST /repos/{owner}/{repo}/pulls`,
+   title `WIP: ` and the first commit's subject, body the commit list).
+   When the forge refuses to open it because it has one already (409 or
+   422), that one is looked up again and used; publish fails only when the
+   list still does not have it.
 3. Write `mr = N` entries for its input paths into the consumer's
    `swl.toml` and commit only that file on the consumer branch
    (`swl: manifest for swan-lake-common#24`). With nothing published, an
@@ -684,13 +689,12 @@ manifest never names unpushed commits. Rerunning finds the existing MRs,
 leaves a current manifest alone and pushes only new commits. Entries are
 added or updated, never removed by `publish`.
 
-`publish` pushes with git and opens MRs only through `fj`, which must be on
-PATH and logged in (`fj auth`); swl has no token configuration (`status`
-and `start` read fj's token, see [Forge access](#forge-access)). swl parses
-fj 0.7's English
-output, and passes `-H forgejo.lynx-lizard.ts.net`. `publish` fetches each
-checkout's base branch (an `origin/<branch>` base) and reads the remote
-branch state with `ls-remote`; it fetches nothing else. A squash-merged MR is
+`publish` pushes with git and reads and writes the forge through its REST
+API with fj's login (see [Forge access](#forge-access)); it never runs
+`fj`. Without a usable login (`fj auth login`) it refuses before anything
+is pushed. `publish` fetches each checkout's base branch (an
+`origin/<branch>` base) and reads the remote branch state with
+`ls-remote`; it fetches nothing else. A squash-merged MR is
 not recognised as merged: its commits are not in the base.
 
 ### `swl check [DIR] [--event mr|master] [--base REV]`
@@ -1148,6 +1152,9 @@ for the owner, 4 for anyone, 5 for nobody, 2 on errors.
 
 ### Forge access
 
+swl never runs `fj`: it talks to the forge through its REST API, with curl,
+and needs fj only for its login (`fj auth login`).
+
 `status`, `ls` and `start --from` read MR state and commit status (and
 `ls` the list of open MRs) anonymously first: public repos are read
 without a token unless the read 404s. On a 404 they ask again with the
@@ -1161,7 +1168,9 @@ server; an address with user info is refused). An OAuth login whose
 `expires_at` has passed is no login, with a warning; a token the forge
 rejects (401 or 403) makes the row `unknown (fj login rejected: run fj auth
 login)`. Without a login what the anonymous API cannot see is `unknown`.
-swl has no token configuration of its own.
+swl has no token configuration of its own. A list of open MRs skips an MR
+that swl cannot read (a field missing or of the wrong type), with a
+warning naming it (`<repo>#<n>`); a read of one MR fails instead.
 
 `land` reads the same way, and writes with fj's login, which it needs: the
 title of a draft (`PATCH /repos/{owner}/{repo}/pulls/{n}`) and merge
@@ -1178,8 +1187,10 @@ and CI fetches
 public. Should one become private, give CI a dedicated read-only token as a
 secret, through nix `access-tokens` or a netrc for the fetch, and the same for
 the API; Forgejo's automatic Actions token is scoped to the job's own repo
-and is not enough. `publish` uses `fj` and its login, and reads the MR of a
-branch that is not on `origin` as `status` does.
+and is not enough. `publish` reads as `status` does (the list of open MRs,
+and the MR of a branch that is not on `origin`), and needs fj's login: it
+opens MRs (`POST /repos/{owner}/{repo}/pulls`) under the same token rules
+as `land`.
 
 `SWL_FORGE_API` (default `https://forgejo.lynx-lizard.ts.net/api/v1`) and
 `SWL_FORGE_GIT` (default `https://forgejo.lynx-lizard.ts.net`, the base of
@@ -1366,9 +1377,7 @@ are not.
 - nh's lock-flag refusal applies to any flake, not only to workspace ones.
 - Not verified: `nh os switch/boot/test` activation, `--build-host`,
   `--target-host`, and deploy-rs `--remote-build`.
-- `publish` parses fj's text output; a different fj version or output
-  language can break it. It opens MRs against the base branch only (no
-  stacked MRs).
+- `publish` opens MRs against the base branch only (no stacked MRs).
 - `finalize`'s history fetch is cheap for swan-lake-common, but would fetch
   the whole commit history of a large fork such as nixpkgs.
 - `ls` reads the workspaces one after another, each as `status` does, so

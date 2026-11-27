@@ -46,11 +46,11 @@ in
         # swl runs git for worktrees and status, and curl for the forge API.
         # It is not wrapped with a PATH: the shim must find the caller's
         # nix, nh and deploy, and the generated wrappers exec swl by its
-        # store path. From the caller's PATH come fj, for `swl publish`;
-        # nix, for `swl env` to make the workspace's GC root of this store
-        # path; and direnv, optional, for `swl start` to allow the consumers'
-        # .envrc. `status`, `start`, `land` and `bump` use fj's login from its
-        # keys.json, not fj itself.
+        # store path. From the caller's PATH come nix, for `swl env` to make
+        # the workspace's GC root of this store path; and direnv, optional,
+        # for `swl start` to allow the consumers' .envrc. swl never runs fj:
+        # the commands that need the forge's login (`status`, `start`,
+        # `publish`, `land`, `bump`) read it from fj's keys.json.
         env.SWL_GIT = lib.getExe pkgs.git;
         env.SWL_CURL = lib.getExe pkgs.curl;
         # The tests drive real git and nix on throwaway local flakes, with a
