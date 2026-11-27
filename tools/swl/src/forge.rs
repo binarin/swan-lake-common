@@ -183,6 +183,12 @@ pub trait PrReader {
         let _ = (repo, base, branch);
         bail!("this reader does not look up MRs by branch")
     }
+    /// Every open MR of `repo` (drafts and every author's), from the
+    /// forge's list of open MRs; `Ok(None)` is a 404.
+    fn open_prs(&self, repo: &str) -> Result<Option<Vec<PrInfo>>> {
+        let _ = repo;
+        bail!("this reader does not list MRs")
+    }
     /// What a 404 means for this reader.
     fn not_found(&self) -> &'static str {
         NOT_FOUND
@@ -339,6 +345,34 @@ fn read_commit_status(
     }
 }
 
+/// Pages of `GET /repos/{owner}/{repo}/pulls?state=open` hold this many MRs.
+const OPEN_PAGE_LIMIT: usize = 50;
+
+/// Page `page` of the open MRs of `repo`; `Ok(None)` is a 404.
+fn read_open_page(
+    base: &str,
+    token: Option<&str>,
+    repo: &str,
+    page: usize,
+    hint: &str,
+) -> Result<Option<Vec<Value>>> {
+    let path = format!(
+        "repos/{}/pulls?state=open&limit={OPEN_PAGE_LIMIT}&page={page}",
+        slug(repo)
+    );
+    let prs = match api_get(base, &path, token)? {
+        (200, body) => {
+            serde_json::from_str::<Value>(&body).with_context(|| format!("GET {path}: not JSON"))?
+        }
+        (404, _) => return Ok(None),
+        (code, _) => return Err(http_error(&path, code, token, hint)),
+    };
+    match prs {
+        Value::Array(prs) => Ok(Some(prs)),
+        _ => bail!("GET {path}: not a list"),
+    }
+}
+
 /// The open MR of `branch`, from `GET /repos/{owner}/{repo}/pulls?state=open`,
 /// page by page.
 fn read_open_pr_from(
@@ -348,32 +382,44 @@ fn read_open_pr_from(
     branch: &str,
     hint: &str,
 ) -> Result<Option<PrInfo>> {
-    const LIMIT: usize = 50;
     for page in 1..=20 {
-        let path = format!(
-            "repos/{}/pulls?state=open&limit={LIMIT}&page={page}",
-            slug(repo)
-        );
-        let prs = match api_get(base, &path, token)? {
-            (200, body) => serde_json::from_str::<Value>(&body)
-                .with_context(|| format!("GET {path}: not JSON"))?,
-            (404, _) => return Ok(None),
-            (code, _) => return Err(http_error(&path, code, token, hint)),
+        let Some(prs) = read_open_page(base, token, repo, page, hint)? else {
+            return Ok(None);
         };
-        let prs = prs
-            .as_array()
-            .ok_or_else(|| anyhow!("GET {path}: not a list"))?;
         if let Some(pr) = prs
             .iter()
             .find(|pr| pr.pointer("/head/ref").and_then(Value::as_str) == Some(branch))
         {
             return PrInfo::from_api(pr).map(Some);
         }
-        if prs.len() < LIMIT {
+        if prs.len() < OPEN_PAGE_LIMIT {
             break;
         }
     }
     Ok(None)
+}
+
+/// Every open MR of `repo`, from `GET /repos/{owner}/{repo}/pulls?state=open`,
+/// page by page (up to 20 pages); `Ok(None)` is a 404.
+fn read_open_prs(
+    base: &str,
+    token: Option<&str>,
+    repo: &str,
+    hint: &str,
+) -> Result<Option<Vec<PrInfo>>> {
+    let mut out = Vec::new();
+    for page in 1..=20 {
+        let Some(prs) = read_open_page(base, token, repo, page, hint)? else {
+            return Ok(None);
+        };
+        for pr in &prs {
+            out.push(PrInfo::from_api(pr)?);
+        }
+        if prs.len() < OPEN_PAGE_LIMIT {
+            break;
+        }
+    }
+    Ok(Some(out))
 }
 
 /// `s` for a URL path: anything but letters, digits, `._-` and, with
@@ -453,6 +499,10 @@ impl PrReader for AnonApi {
 
     fn pr_of_branch(&self, repo: &str, base: &str, branch: &str) -> Result<Option<PrInfo>> {
         read_pr_of_branch(&self.base, None, repo, base, branch, ANON_HINT)
+    }
+
+    fn open_prs(&self, repo: &str) -> Result<Option<Vec<PrInfo>>> {
+        read_open_prs(&self.base, None, repo, ANON_HINT)
     }
 }
 
@@ -673,6 +723,13 @@ impl PrReader for ForgeReader {
         self.read(
             || self.anon.pr_of_branch(repo, base, branch),
             |t| read_pr_of_branch(&self.anon.base, Some(t), repo, base, branch, AUTH_HINT),
+        )
+    }
+
+    fn open_prs(&self, repo: &str) -> Result<Option<Vec<PrInfo>>> {
+        self.read(
+            || self.anon.open_prs(repo),
+            |t| read_open_prs(&self.anon.base, Some(t), repo, AUTH_HINT),
         )
     }
 

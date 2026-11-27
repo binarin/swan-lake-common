@@ -51,6 +51,36 @@ fn matches_selector(selector: &str, name: &str) -> bool {
             && name.starts_with(&format!("{selector}-")))
 }
 
+/// The ticket ID `SL-NNNN` in a branch or workspace name, as spelled there
+/// but upper-cased (`feature/sl-0094-x` gives `SL-0094`). It starts the
+/// name or follows a character that is not a letter or digit.
+pub fn ticket_spelling(name: &str) -> Option<String> {
+    let lower = name.to_lowercase();
+    let mut from = 0;
+    while let Some(i) = lower[from..].find("sl-").map(|i| i + from) {
+        let starts = lower[..i]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_alphanumeric());
+        let digits: String = lower[i + 3..]
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        if starts && !digits.is_empty() {
+            return Some(format!("SL-{digits}"));
+        }
+        from = i + 1;
+    }
+    None
+}
+
+/// The ticket ID in a branch or workspace name ([`ticket_spelling`]),
+/// normalised as names are compared: lower-case, without leading zeros
+/// (`sl-0094-x` and `feature/SL-94` give `sl-94`).
+pub fn ticket_in(name: &str) -> Option<String> {
+    ticket_spelling(name).map(|t| normalized(&t))
+}
+
 /// The workspace directories below `root`, sorted: its subdirectories but
 /// dot directories; none when `root` does not exist.
 pub fn directories(root: &Path) -> Result<Vec<PathBuf>> {
@@ -207,6 +237,22 @@ mod tests {
         assert!(!matches_selector("sl-88-other", "SL-0088-swl-version"));
         assert_eq!(normalized("SL-0000-X"), "sl-0-x");
         assert_eq!(normalized("Feature-X"), "feature-x");
+    }
+
+    #[test]
+    fn ticket_ids_in_branch_names() {
+        assert_eq!(ticket_in("sl-0094-swl-ls").as_deref(), Some("sl-94"));
+        assert_eq!(ticket_in("SL-94").as_deref(), Some("sl-94"));
+        assert_eq!(ticket_in("feature/SL-0094_x").as_deref(), Some("sl-94"));
+        assert_eq!(ticket_in("sl-0000-x").as_deref(), Some("sl-0"));
+        assert_eq!(ticket_in("swl-bump-common"), None);
+        assert_eq!(ticket_in("basl-12"), None);
+        assert_eq!(ticket_in("sl-x-sl-12").as_deref(), Some("sl-12"));
+        assert_eq!(ticket_in("sl-"), None);
+        assert_eq!(
+            ticket_spelling("feature/sl-0094-x").as_deref(),
+            Some("SL-0094")
+        );
     }
 
     #[test]

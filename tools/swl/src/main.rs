@@ -18,6 +18,7 @@ mod ls;
 mod manifest;
 mod nix;
 mod nix_args;
+mod open_mrs;
 mod package;
 mod pin_policy;
 mod promote;

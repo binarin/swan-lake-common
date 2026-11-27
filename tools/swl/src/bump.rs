@@ -484,6 +484,15 @@ fn consumers(config: &Config, fetcher: &Fetcher) -> Result<Vec<Consumer>> {
     Ok(out)
 }
 
+/// The names of the [`consumers`]: the repos of the config other than
+/// common whose base branch locks common, each fetched.
+pub(crate) fn consumer_names(config: &Config, fetcher: &Fetcher) -> Result<Vec<String>> {
+    Ok(consumers(config, fetcher)?
+        .into_iter()
+        .map(|c| c.name)
+        .collect())
+}
+
 /// Where common is promoted: the one branch its consumers declare for it
 /// (`swan-lake-current`), and the union of their declared sources (the
 /// GitHub mirror), which must have it.

@@ -42,7 +42,7 @@ swl ws add swan-lake                      # fetch, worktree detached at the base
 swl ws add swan-lake-common@common --branch sl-0036-x
 swl env                                   # .envrc.local per consumer, and the wrappers
 swl status [--from swan-lake#12]          # where the change stands, and the next step
-swl ls [--no-fetch]                       # every workspace's stage
+swl ls [--no-fetch]                       # every workspace's stage, and the open MRs in none
 swl shim nix --workspace <ws> -- ARGS…    # what the wrappers run
 swl publish swan-lake                     # push, open MRs, write swl.toml
 swl check                                 # CI: the MR or master gate
@@ -157,8 +157,8 @@ terminal.
   checkouts, or after a checkout's `flake.lock` changes.
 - `status [--no-fetch]` shows where the workspace's change stands; see
   [Status](#status).
-- `ls [--no-fetch]` shows all work in progress: a line per workspace; see
-  [Ls](#ls).
+- `ls [--no-fetch]` shows all work in progress: a line per workspace, and
+  the forge's open MRs that no workspace holds; see [Ls](#ls).
 - `hook zsh|bash` prints, on stdout, the shell function `swl` for an
   interactive shell, to be loaded with `eval "$(swl hook zsh)"` (or `bash`)
   in its rc file; `homeModules.swl` adds that line to home-manager's zsh and
@@ -341,13 +341,23 @@ line.
 
 ## Ls
 
-`swl ls [--no-fetch]` shows all work in progress: the workspaces.
+`swl ls [--no-fetch]` shows all work in progress: the workspaces, and what
+the forge has open that no workspace holds.
 
 ```
 workspaces in /home/binarin/personal-workspace/swan-lake-umbrella/workspaces:
   SL-0060-foo                     CI green  waits: owner   next: wait for swan-lake-common#24 (merge swan-lake-common#24)
   SL-0088-swl-version  removable  landed    waits: nobody  next: -
   SL-0094-swl-ls                  local     waits: anyone  next: swl publish swan-lake
+
+open on the forge, in no workspace:
+  SL-0042
+    swan-lake#5         open (draft)  sl-0042-a        WIP: a
+    swan-lake-common#7  open          sl-0042-a        a
+    swl start --from swan-lake#5
+  swl-bump-common
+    swan-lake#8 (bump)  open          swl-bump-common  swl: bump common to 33a2bda17982
+    swl start --from swan-lake#8
 ```
 
 The workspaces are the directories below the repos config's `workspaces`
@@ -370,10 +380,28 @@ shows no changes and no untracked files but swl's own generated
 count). A workspace without checkouts is not removable. This reads the refs
 as the fetch left them, from git alone.
 
-`--no-fetch` gives a quick offline view: no fetch and no forge request at
-all, so a row that needs the forge (an MR's state or CI) is `unknown
-(--no-fetch: the forge is not read)` there. The exit status is 0, also
-with unknown lines.
+Then the open MRs (drafts too, by anyone) of every repo of the config,
+from `GET /repos/{owner}/{repo}/pulls?state=open` (read as `status` reads
+the forge, see [Forge access](#forge-access)), but those that a workspace
+holds: an MR is held when a checkout of its repo is on its branch, or a
+consumer's `swl.toml` in a workspace names it. They are grouped by the
+ticket ID in their branch (`SL-NNNN`, anywhere in it after a character
+that is not a letter or digit, compared case-insensitively and without
+leading zeros, as workspace names are; shown as the first MR's branch spells
+it), else by branch: tickets by number first, then branches by name; in a
+group, by repo and number. An MR of the branch `swl-bump-common` (`swl
+bump`'s) is labelled `bump`. Each group ends with the MR to join it from,
+`swl start --from <consumer>#<MR>`: the first MR of a consumer (a repo
+whose base branch locks common, as for `swl bump`), naming the other
+consumer MRs too; with none, common's MR, as a change of common alone (common
+as the consumer); with neither, it says that there are only shared-repo MRs
+and no consumer MR to start from. A repo whose MRs cannot be read is a
+line `<repo>: not read (<reason>)` (a private repo without fj's login, say).
+
+`--no-fetch` gives a quick offline view of the workspaces only: no fetch
+and no forge request at all, so a row that needs the forge (an MR's state
+or CI) is `unknown (--no-fetch: the forge is not read)` there, and the
+open MRs are not listed. The exit status is 0, also with unknown lines.
 
 ## Diagnostics
 
@@ -1102,9 +1130,9 @@ for the owner, 4 for anyone, 5 for nobody, 2 on errors.
 
 ### Forge access
 
-`status`, `ls` and `start --from` read MR state and commit status
-anonymously first: public repos are read without a token unless the read
-404s. On a 404 they ask again with the
+`status`, `ls` and `start --from` read MR state and commit status (and
+`ls` the list of open MRs) anonymously first: public repos are read
+without a token unless the read 404s. On a 404 they ask again with the
 login of `fj`: the token for `forgejo.lynx-lizard.ts.net` in fj's
 `keys.json` (`$XDG_DATA_HOME/forgejo-cli/keys.json`, default
 `~/.local/share/forgejo-cli/keys.json`; `SWL_FJ_KEYS` overrides the path).
@@ -1327,7 +1355,11 @@ are not.
   the whole commit history of a large fork such as nixpkgs.
 - `ls` reads the workspaces one after another, each as `status` does, so
   it takes as long as their `status` runs together (less the repeated
-  fetches); `--no-fetch` is the quick view.
+  fetches); `--no-fetch` is the quick view. It lists up to 20 pages of 50
+  open MRs per repo. Which MRs a workspace holds it tells by its checkouts'
+  branches and its `swl.toml` entries only: an MR of the workspace's
+  ticket on a repo it has no checkout of, and that no entry names, is
+  listed.
 - `land` follows one change in one workspace, step by step: an MR that waits
   for CI stops the run, also when later MRs could proceed. It knows a
   merge's outcome from Forgejo's answer (200 merged, 201 scheduled, 409

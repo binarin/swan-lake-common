@@ -1,17 +1,23 @@
 //! `swl ls`: all work in progress. One line per workspace below the repos
 //! config's `workspaces` directory, with where its change stands (from
-//! `swl status`'s rows) and whether `swl ws prune` would remove it.
+//! `swl status`'s rows) and whether `swl ws prune` would remove it; then the
+//! forge's open MRs that no workspace holds, grouped by change, each group
+//! with the `swl start --from` that joins it.
 
 use std::{io::Write, path::Path};
 
 use anyhow::{Result, bail};
 
 use crate::{
+    bump::{COMMON_REPO, consumer_names},
     config::Config,
     forge::{CiState, ForgeReader, PrInfo, PrReader},
+    git::git_ok,
+    manifest::Manifest,
+    open_mrs::{self, Group, Held, OpenMr},
     status::{self, Row, Stage, Verdict, Waits},
     status_tree::verdict_style,
-    style::{BOLD, OWNER, paint},
+    style::{BOLD, DIM, OWNER, paint},
     workspace::Workspace,
     workspace_location::directories,
     ws_add::Fetcher,
@@ -100,11 +106,32 @@ fn summary(ws: &Workspace, rows: &[Row]) -> Verdict {
         )
 }
 
+/// What the workspace holds of the forge's MRs: its checkouts' branches,
+/// and its consumers' `swl.toml` entries.
+fn hold(ws: &Workspace, held: &mut Held) {
+    for c in &ws.checkouts {
+        let repo = c
+            .shared
+            .as_ref()
+            .map_or(c.name.as_str(), |(r, _)| r.as_str());
+        if let Some(b) = git_ok(&c.dir, &["symbolic-ref", "--quiet", "--short", "HEAD"]) {
+            held.branches.entry(repo.to_string()).or_default().push(b);
+        }
+        if c.is_consumer()
+            && let Ok(Some(m)) = Manifest::read(&c.dir)
+        {
+            held.entries
+                .extend(m.inputs.values().map(|e| format!("{}#{}", e.repo, e.mr)));
+        }
+    }
+}
+
 fn workspace_line(
     dir: &Path,
     config: &Config,
     reader: &dyn PrReader,
     fetcher: &Fetcher,
+    held: &mut Held,
 ) -> WorkspaceLine {
     let name = dir.file_name().map_or_else(
         || dir.display().to_string(),
@@ -121,6 +148,7 @@ fn workspace_line(
             };
         }
     };
+    hold(&ws, held);
     let verdict = match status::collect(&ws, config, reader, fetcher) {
         Ok(rows) => summary(&ws, &rows),
         Err(e) => unknown(&e),
@@ -195,10 +223,82 @@ fn local_lines(lines: &[WorkspaceLine]) -> Vec<String> {
     out
 }
 
+/// The `swl start --from` line of a group.
+fn start_line(group: &Group, consumers: &Result<Vec<String>, String>) -> String {
+    let consumers = match consumers {
+        Ok(c) => c,
+        Err(e) => return format!("unknown which repos are consumers ({e})"),
+    };
+    match group.start_from(consumers) {
+        Some((from, _)) if from.repo == COMMON_REPO && !consumers.contains(&from.repo) => {
+            format!(
+                "swl start --from {} (only shared-repo MRs: common alone, as the consumer)",
+                from.which()
+            )
+        }
+        Some((from, others)) if others.is_empty() => {
+            format!("swl start --from {}", from.which())
+        }
+        Some((from, others)) => format!(
+            "swl start --from {} (also {})",
+            from.which(),
+            others
+                .iter()
+                .map(|m| m.which())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        None => "only shared-repo MRs: no consumer MR to swl start --from".to_string(),
+    }
+}
+
+/// The groups' lines: the group, then per MR `<repo>#<n>[ (bump)]  open
+/// [(draft)]  <branch>  <title>`, then the `swl start --from` line.
+fn forge_lines(groups: &[Group], consumers: &Result<Vec<String>, String>) -> Vec<String> {
+    let mrs: Vec<&OpenMr> = groups.iter().flat_map(|g| &g.mrs).collect();
+    let which = |m: &OpenMr| {
+        if m.is_bump() {
+            format!("{} (bump)", m.which())
+        } else {
+            m.which()
+        }
+    };
+    let state = |m: &OpenMr| if m.info.draft { "open (draft)" } else { "open" };
+    let which_w = mrs.iter().map(|m| width(&which(m))).max().unwrap_or(0);
+    let state_w = mrs.iter().map(|m| width(state(m))).max().unwrap_or(0);
+    let branch_w = mrs
+        .iter()
+        .map(|m| width(&m.info.head_ref))
+        .max()
+        .unwrap_or(0);
+    let mut out = Vec::new();
+    for g in groups {
+        out.push(format!("  {}", paint(BOLD, g.label())));
+        for m in &g.mrs {
+            let w = which(m);
+            let s = state(m);
+            let b = &m.info.head_ref;
+            out.push(
+                format!(
+                    "    {w}{}  {s}{}  {b}{}  {}",
+                    pad(which_w, width(&w)),
+                    pad(state_w, width(s)),
+                    pad(branch_w, width(b)),
+                    m.info.title
+                )
+                .trim_end()
+                .to_string(),
+            );
+        }
+        out.push(paint(DIM, format!("    {}", start_line(g, consumers))));
+    }
+    out
+}
+
 /// `swl ls [--no-fetch]`. Each workspace's rows come from `swl status`'s
 /// computation, one workspace after another, with one fetcher, so that
 /// each source is fetched once. `--no-fetch` neither fetches nor asks the
-/// forge.
+/// forge, and lists no open MRs.
 pub fn run(config: &Config, no_fetch: bool) -> Result<()> {
     let root = config.workspaces()?;
     let fetcher = Fetcher::new(!no_fetch);
@@ -207,9 +307,10 @@ pub fn run(config: &Config, no_fetch: bool) -> Result<()> {
         Some(r) => r,
         None => &Offline,
     };
+    let mut held = Held::default();
     let lines: Vec<WorkspaceLine> = directories(&root)?
         .iter()
-        .map(|dir| workspace_line(dir, config, reader, &fetcher))
+        .map(|dir| workspace_line(dir, config, reader, &fetcher, &mut held))
         .collect();
     let mut stdout = anstream::stdout();
     if lines.is_empty() {
@@ -219,6 +320,33 @@ pub fn run(config: &Config, no_fetch: bool) -> Result<()> {
         for l in local_lines(&lines) {
             let _ = writeln!(stdout, "{l}");
         }
+    }
+    let Some(reader) = &forge else {
+        let _ = writeln!(
+            stdout,
+            "\n{}",
+            paint(DIM, format!("{OFFLINE}: its open MRs are not listed"))
+        );
+        return Ok(());
+    };
+    let listing = open_mrs::list(config, reader);
+    let groups = open_mrs::groups(listing.mrs.into_iter().filter(|m| !held.holds(m)));
+    let _ = writeln!(stdout);
+    if groups.is_empty() && listing.unread.is_empty() {
+        let _ = writeln!(stdout, "no open MR on the forge that no workspace holds");
+        return Ok(());
+    }
+    let _ = writeln!(stdout, "open on the forge, in no workspace:");
+    let consumers = if groups.is_empty() {
+        Ok(Vec::new())
+    } else {
+        consumer_names(config, &fetcher).map_err(|e| format!("{e:#}"))
+    };
+    for l in forge_lines(&groups, &consumers) {
+        let _ = writeln!(stdout, "{l}");
+    }
+    for (repo, why) in &listing.unread {
+        let _ = writeln!(stdout, "  {}: not read ({why})", paint(BOLD, repo));
     }
     Ok(())
 }
