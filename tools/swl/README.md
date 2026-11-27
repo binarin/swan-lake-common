@@ -484,9 +484,9 @@ detail line `<consumer>#<MR>: its change is in <base> already
 (`swl publish`). Once it is closed the row reads as any closed MR's,
 `reopen <consumer>#<MR>, or swl publish <consumer> for a new MR`; neither
 applies here (a new MR would be obsolete too): remove the workspace
-instead (`swl ws remove`). The test is git's: merging the MR head into the base's tip
-with `git merge-tree --write-tree` (in the object store, no checkout) is
-clean and gives the tip's own tree. A head that its base contains is
+instead (`swl ws remove`). The test is git's: merging the MR head into the
+base's tip with `git merge-tree --write-tree` (in the object store, no
+checkout) is clean and gives the tip's own tree. A head that its base contains is
 `landed` instead; a change that the base has only in part, or that
 conflicts with how the base changed the same lines since (a bump to an
 older rev), is not obsolete. A rebase onto the tip would tell the same but
@@ -1511,7 +1511,8 @@ mirror, and goes on from there.
   rev may be another run's newer bump, pushed meanwhile: it is left too,
   and waits for nobody (`… moves lib to <rev>, past <target>, which this
   run bumps to: another run's newer bump, maybe; left as it is; rerun swl
-  bump`). A close that the forge refuses (403:
+  bump`). When reruns do not clear it (the promotion branch will never
+  reach that rev), delete `swl-bump-common` on the forge. A close that the forge refuses (403:
   the agent may not edit the MR) waits for the owner, to close it on the
   forge (its URL is given), then rerun, which deletes the branch; a refused
   deletion (a protected branch) waits for the owner with `git -C <source>
