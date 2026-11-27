@@ -18,7 +18,7 @@ use std::io::Write;
 use anstyle::Style;
 
 use crate::{
-    status::{Row, Stage, Waits},
+    status::{Row, Stage, Verdict, Waits},
     style::{BAD, BOLD, DIM, GOOD, NOBODY, OWNER, WARN, paint},
 };
 
@@ -39,8 +39,7 @@ enum Mood {
     Unknown,
 }
 
-fn mood(row: &Row) -> Mood {
-    let v = &row.verdict;
+fn mood(v: &Verdict) -> Mood {
     match (&v.stage, v.waits) {
         (Stage::Unknown(_), _) => Mood::Unknown,
         _ if v.next == "-" => Mood::Done,
@@ -58,6 +57,13 @@ fn mood_style(m: Mood) -> Style {
         Mood::Done => GOOD,
         Mood::Unknown => BAD,
     }
+}
+
+/// The colour of a verdict's stage and waits, as `status` paints a row;
+/// with whether its next step is painted too (it waits for the owner).
+pub fn verdict_style(v: &Verdict) -> (Style, bool) {
+    let m = mood(v);
+    (mood_style(m), m == Mood::Owner)
 }
 
 struct Node<'a> {
@@ -248,7 +254,7 @@ pub fn lines(rows: &[Row]) -> Vec<String> {
     for f in &flat {
         let row = f.node.row;
         let v = &row.verdict;
-        let mood = mood(row);
+        let mood = mood(v);
         let color = mood_style(mood);
         let (plain_label, styled_label) = label(f.node);
         let stage = one_line(&v.stage);

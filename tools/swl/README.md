@@ -11,8 +11,9 @@ MRs in a manifest, `swl.toml`. `swl publish` pushes the work and writes the
 manifest, CI builds against the MRs' heads (`swl ci env`) and gates MRs and
 master (`swl check`), and `swl finalize` turns landed entries into a lock
 bump. `swl start` sets up the workspace for a change, `swl status` shows
-where it stands, `swl refresh` rebases its MR branches onto their bases,
-and `swl land` takes it to master. `swl bump` moves
+where it stands (and `swl ls` where all work in progress stands), `swl
+refresh` rebases its MR branches onto their bases, and `swl land` takes it
+to master. `swl bump` moves
 common's inputs forward and the consumers after it; `swl promote` promotes
 what reached common's master without a consumer. `plan` is not part of
 swl yet.
@@ -41,6 +42,7 @@ swl ws add swan-lake                      # fetch, worktree detached at the base
 swl ws add swan-lake-common@common --branch sl-0036-x
 swl env                                   # .envrc.local per consumer, and the wrappers
 swl status [--from swan-lake#12]          # where the change stands, and the next step
+swl ls [--no-fetch]                       # every workspace's stage
 swl shim nix --workspace <ws> -- ARGS…    # what the wrappers run
 swl publish swan-lake                     # push, open MRs, write swl.toml
 swl check                                 # CI: the MR or master gate
@@ -155,6 +157,8 @@ terminal.
   checkouts, or after a checkout's `flake.lock` changes.
 - `status [--no-fetch]` shows where the workspace's change stands; see
   [Status](#status).
+- `ls [--no-fetch]` shows all work in progress: a line per workspace; see
+  [Ls](#ls).
 - `hook zsh|bash` prints, on stdout, the shell function `swl` for an
   interactive shell, to be loaded with `eval "$(swl hook zsh)"` (or `bash`)
   in its rc file; `homeModules.swl` adds that line to home-manager's zsh and
@@ -316,7 +320,7 @@ landing as `pushed`. A login the forge rejects makes the row
 
 `--from CONSUMER#MR` reads the consumer MR as `start --from` does (with git),
 then shows a row per `swl.toml` entry at its head and the consumer row. A
-cross-repo list of all open changes is not part of swl.
+cross-repo list of all open changes is `swl ls` (see [Ls](#ls)).
 
 For a workspace, after the rows, `status` names the running swl (at the
 package's wrapper that `SWL_SELF` names, when set) and the one the wrappers
@@ -334,6 +338,42 @@ executable, or its `--version` does not finish in 5 s, after which it is
 killed), a warning on stderr says to rerun `swl env`. Without wrappers
 yet the line says `none yet`, without a warning. `--from` prints neither
 line.
+
+## Ls
+
+`swl ls [--no-fetch]` shows all work in progress: the workspaces.
+
+```
+workspaces in /home/binarin/personal-workspace/swan-lake-umbrella/workspaces:
+  SL-0060-foo                     CI green  waits: owner   next: wait for swan-lake-common#24 (merge swan-lake-common#24)
+  SL-0088-swl-version  removable  landed    waits: nobody  next: -
+  SL-0094-swl-ls                  local     waits: anyone  next: swl publish swan-lake
+```
+
+The workspaces are the directories below the repos config's `workspaces`
+(see [Config](#config)), dot directories aside, by name. Each gets one
+line: its stage, who it waits for and the next step, from the rows that
+`swl status` computes for it (and as it colours them). Of the roots of its
+tree (the consumers, and rows under no consumer), whose verdicts already
+wait for the rows below them, the line is an `unknown` one first, else the
+least advanced (in the order of the stages, see [Status](#status)) that has
+a next step, else the least advanced. A directory without checkouts is `no
+change (no checkouts)`; one that cannot be read, `unknown (<reason>)`. The
+workspaces are read one after another, with one fetch per source (as
+`status` fetches) for all of them.
+
+A workspace that `swl ws prune` would remove is marked `removable`: each of
+its checkouts has its HEAD in its base (also detached at the base), its
+branch is gone on the remote or in the base, and `git status --porcelain`
+shows no changes and no untracked files but swl's own generated
+`.envrc.local` (the one with the generated marker; ignored files do not
+count). A workspace without checkouts is not removable. This reads the refs
+as the fetch left them, from git alone.
+
+`--no-fetch` gives a quick offline view: no fetch and no forge request at
+all, so a row that needs the forge (an MR's state or CI) is `unknown
+(--no-fetch: the forge is not read)` there. The exit status is 0, also
+with unknown lines.
 
 ## Diagnostics
 
@@ -1062,9 +1102,9 @@ for the owner, 4 for anyone, 5 for nobody, 2 on errors.
 
 ### Forge access
 
-`status` and `start --from` read MR state and commit status anonymously
-first: public repos are read without a token unless the read 404s. On a
-404 they ask again with the
+`status`, `ls` and `start --from` read MR state and commit status
+anonymously first: public repos are read without a token unless the read
+404s. On a 404 they ask again with the
 login of `fj`: the token for `forgejo.lynx-lizard.ts.net` in fj's
 `keys.json` (`$XDG_DATA_HOME/forgejo-cli/keys.json`, default
 `~/.local/share/forgejo-cli/keys.json`; `SWL_FJ_KEYS` overrides the path).
@@ -1285,6 +1325,9 @@ are not.
   stacked MRs).
 - `finalize`'s history fetch is cheap for swan-lake-common, but would fetch
   the whole commit history of a large fork such as nixpkgs.
+- `ls` reads the workspaces one after another, each as `status` does, so
+  it takes as long as their `status` runs together (less the repeated
+  fetches); `--no-fetch` is the quick view.
 - `land` follows one change in one workspace, step by step: an MR that waits
   for CI stops the run, also when later MRs could proceed. It knows a
   merge's outcome from Forgejo's answer (200 merged, 201 scheduled, 409

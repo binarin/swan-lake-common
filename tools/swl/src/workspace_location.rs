@@ -51,7 +51,9 @@ fn matches_selector(selector: &str, name: &str) -> bool {
             && name.starts_with(&format!("{selector}-")))
 }
 
-fn directories(root: &Path) -> Result<Vec<PathBuf>> {
+/// The workspace directories below `root`, sorted: its subdirectories but
+/// dot directories; none when `root` does not exist.
+pub fn directories(root: &Path) -> Result<Vec<PathBuf>> {
     let entries = match fs::read_dir(root) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),

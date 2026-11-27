@@ -14,6 +14,7 @@ mod lock;
 mod lock_change;
 mod lock_rules;
 mod logging;
+mod ls;
 mod manifest;
 mod nix;
 mod nix_args;
@@ -32,6 +33,7 @@ mod version;
 mod workspace;
 mod workspace_location;
 mod ws_add;
+mod ws_prune;
 
 use std::{ffi::OsString, path::PathBuf, process::ExitCode, time::Duration};
 
@@ -123,6 +125,12 @@ enum Commands {
         #[arg(long, value_name = "CONSUMER#MR")]
         from: Option<String>,
         /// Do not fetch; use the refs already known
+        #[arg(long)]
+        no_fetch: bool,
+    },
+    /// All work in progress: each workspace's stage, waits and next step, and the forge's open MRs that no workspace holds
+    Ls {
+        /// Do not fetch or ask the forge: the workspaces only, from the refs already known
         #[arg(long)]
         no_fetch: bool,
     },
@@ -425,6 +433,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     &fetcher,
                 )?,
             }
+        }
+        Commands::Ls { no_fetch } => {
+            ls::run(&Config::load(config_flag)?, no_fetch)?;
         }
         Commands::Land {
             workspace_name,
