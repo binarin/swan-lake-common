@@ -1,0 +1,765 @@
+//! `swl refresh`, and the step of `swl land` that it shares: an open MR's
+//! branch whose head does not contain its base's tip is rebased onto it, in
+//! a scratch worktree, and pushed with `--force-with-lease` on the head that
+//! was read. The workspace checkout of the branch, which must be clean, on
+//! the branch and at that head, is then moved to the pushed head.
+//!
+//! Only the change's own MR branches are rewritten: never a base branch, a
+//! promotion branch (`swan-lake-current…`) or swl bump's branch. A consumer
+//! branch whose tip is swl's own landing commit, behind a base whose
+//! `flake.lock` moved, is rebased without it and finalized anew before the
+//! one push, so that no pushed head lacks a landing: the MR's scheduled
+//! merge could merge such a head.
+
+use std::{collections::BTreeSet, path::Path, process::ExitCode};
+
+use anyhow::{Context, Result};
+
+use crate::{
+    bump::{BUMP_BRANCH, Scratch},
+    config::Config,
+    env, finalize,
+    forge::{PrInfo, PrReader, slug},
+    git::{git, git_ok, short, valid_branch},
+    land::{
+        self, DryRunWriter, Lander, Options, Rejection, Step, push_rejection, say_waits, stop,
+        waits_code,
+    },
+    manifest::MANIFEST_FILE,
+    status::{self, MrFacts, MrRead, Row, RowFacts, Waits},
+    style::{self, Tone},
+    workspace::Workspace,
+    ws_add::{Fetcher, base_remote},
+};
+
+/// Where a part's branch is rebased from.
+pub(crate) enum Place<'a> {
+    /// The workspace's checkout `dir` of the branch, in the workspace at
+    /// `root`: it is moved to the pushed head.
+    Checkout { dir: &'a Path, root: &'a Path },
+    /// No checkout: only the scratch worktree.
+    Scratch,
+}
+
+/// One MR branch of the change.
+pub(crate) struct Part<'a> {
+    /// `repo#n`.
+    pub(crate) which: String,
+    pub(crate) repo: &'a str,
+    /// The open MR, as the forge has it.
+    pub(crate) info: &'a PrInfo,
+    pub(crate) place: Place<'a>,
+    /// A consumer MR: swl's own landing commit at its tip is made anew on
+    /// a base whose lock moved.
+    pub(crate) consumer: bool,
+}
+
+/// Why swl never rewrites `branch`, if it does not: the base branch, a
+/// promotion branch, or swl bump's own branch.
+fn never_rewritten(branch: &str, base_branch: &str) -> Option<&'static str> {
+    if branch == base_branch || branch == "master" || branch == "main" {
+        Some("a base branch")
+    } else if branch == "swan-lake-current" || branch.starts_with("swan-lake-current/") {
+        Some("a promotion branch")
+    } else if branch == BUMP_BRANCH {
+        Some("swl bump's branch, which swl bump rebuilds")
+    } else {
+        None
+    }
+}
+
+fn rev(dir: &Path, refname: &str) -> Result<String> {
+    git(
+        dir,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{refname}^{{commit}}"),
+        ],
+    )
+    .with_context(|| format!("{refname} is not known in {}", dir.display()))
+}
+
+fn is_ancestor(dir: &Path, a: &str, b: &str) -> bool {
+    git_ok(dir, &["merge-base", "--is-ancestor", a, b]).is_some()
+}
+
+/// Why the checkout at `dir` cannot be moved to a rebased `branch`, and
+/// what to do: changed or untracked files (but swl's `.envrc.local`),
+/// another branch, or a HEAD other than `observed`, the head of `tracking`.
+fn checkout_problem(
+    dir: &Path,
+    branch: &str,
+    observed: &str,
+    tracking: &str,
+) -> Result<Option<String>> {
+    if let Some(changed) = changed_files(dir)? {
+        return Ok(Some(format!(
+            "it has uncommitted or untracked files: {changed}; commit or remove them"
+        )));
+    }
+    let on = git_ok(dir, &["symbolic-ref", "--quiet", "--short", "HEAD"]);
+    if on.as_deref() != Some(branch) {
+        return Ok(Some(format!(
+            "it is on {}, not {branch}; switch to {branch}",
+            on.as_deref().unwrap_or("a detached HEAD")
+        )));
+    }
+    let head = git(dir, &["rev-parse", "HEAD"])?;
+    if head == observed {
+        return Ok(None);
+    }
+    Ok(Some(if is_ancestor(dir, observed, &head) {
+        format!(
+            "{branch} has commits that {tracking} lacks; push them first (swl publish, or swl \
+             land for a landing commit)"
+        )
+    } else if is_ancestor(dir, &head, observed) {
+        format!("{tracking} has commits that {branch} lacks; git pull --ff-only first")
+    } else {
+        format!("{branch} and {tracking} have diverged; merge or rebase onto {tracking} first")
+    }))
+}
+
+/// The changed and untracked files of the checkout at `dir`, as `git status
+/// --porcelain` lines, but swl's generated `.envrc.local` (as removing a
+/// landed checkout counts them); `None` when there are none.
+fn changed_files(dir: &Path) -> Result<Option<String>> {
+    let status = git(dir, &["status", "--porcelain"])?;
+    let changed: Vec<&str> = status
+        .lines()
+        .filter(|l| !(l.starts_with("?? ") && land::disposable(dir, &l[3..], false)))
+        .collect();
+    Ok((!changed.is_empty()).then(|| changed.join(", ")))
+}
+
+/// Moves the checkout at `dir` from `observed` to the pushed `head`,
+/// checked again now: `branch` by compare-and-swap from `observed`, then,
+/// when HEAD is that branch, the index and working tree (`git read-tree -m
+/// -u`, which refuses to overwrite changes; the branch is moved back then).
+/// Why not, with the commands to do it by hand.
+fn move_checkout(dir: &Path, branch: &str, observed: &str, head: &str) -> Result<Option<String>> {
+    let by_hand = format!(
+        "git -C {d} switch {branch} && git -C {d} reset --keep {head}",
+        d = dir.display()
+    );
+    let refname = format!("refs/heads/{branch}");
+    let on = git_ok(dir, &["symbolic-ref", "--quiet", "HEAD"]);
+    let checked_out = on.as_deref() == Some(refname.as_str());
+    if checked_out && let Some(changed) = changed_files(dir)? {
+        return Ok(Some(format!(
+            "it has uncommitted or untracked files now: {changed}; once they are committed or \
+             removed (commits go on top of the pushed head), {by_hand}"
+        )));
+    }
+    let cas = ["update-ref", "-m", "swl refresh", &refname, head, observed];
+    if git(dir, &cas).is_err() {
+        let now = git_ok(dir, &["rev-parse", "--verify", "--quiet", &refname]);
+        return Ok(Some(format!(
+            "{branch} is at {} now, not {}; bring its new commits onto the pushed head: git -C {} \
+             switch {branch} && git -C {} rebase {head}",
+            now.as_deref().map_or("(none)", short),
+            short(observed),
+            dir.display(),
+            dir.display()
+        )));
+    }
+    if !checked_out {
+        return Ok(Some(format!(
+            "{branch} was moved to it, but the checkout is on {} now; git -C {} switch {branch}",
+            on.as_deref()
+                .and_then(|r| r.strip_prefix("refs/heads/"))
+                .unwrap_or("a detached HEAD"),
+            dir.display()
+        )));
+    }
+    if let Err(e) = git(dir, &["read-tree", "-m", "-u", observed, head]) {
+        let _ = git(dir, &["update-ref", &refname, observed, head]);
+        return Ok(Some(format!(
+            "its working tree cannot be updated ({e:#}); {by_hand}"
+        )));
+    }
+    Ok(None)
+}
+
+/// Rebases the detached HEAD of `dir` onto `onto`, without the repo's
+/// hooks; on a conflict aborts and says where: the commit and the files.
+fn rebase(dir: &Path, onto: &str) -> Result<Option<String>> {
+    let args = [
+        "-c",
+        "core.hooksPath=/dev/null",
+        "rebase",
+        "--quiet",
+        "--no-autosquash",
+        "--no-update-refs",
+        onto,
+    ];
+    let Err(e) = git(dir, &args) else {
+        return Ok(None);
+    };
+    let files = git_ok(dir, &["diff", "--name-only", "--diff-filter=U"]).unwrap_or_default();
+    let commit = git_ok(dir, &["log", "-1", "--format=%h %s", "REBASE_HEAD"]);
+    let _ = git(dir, &["rebase", "--abort"]);
+    if files.is_empty() {
+        return Err(e.context("rebasing"));
+    }
+    Ok(Some(format!(
+        "{}: {}",
+        commit.as_deref().unwrap_or("a commit"),
+        files.lines().collect::<Vec<_>>().join(", ")
+    )))
+}
+
+/// Whether `base_tip` changes `flake.lock` since its merge base with `head`.
+fn lock_moved(dir: &Path, head: &str, base_tip: &str) -> Result<bool> {
+    let mb = git(dir, &["merge-base", head, base_tip])?;
+    Ok(!git(
+        dir,
+        &["diff", "--name-only", &mb, base_tip, "--", "flake.lock"],
+    )?
+    .is_empty())
+}
+
+/// Reruns `swl env` for the workspace at `root`, for checkouts whose
+/// `flake.lock` moved; a failure is a warning.
+fn rerun_env(cmd: &str, root: &Path, config: &Config) {
+    let result = (|| -> Result<()> {
+        let ws = Workspace::scan(root)?;
+        env::run(&ws, config, &crate::swl_exe()?, false)
+    })();
+    if let Err(e) = result {
+        style::say(
+            cmd,
+            Tone::Warn,
+            format!(
+                "swl env failed after the rebase: {e:#}; fix that and run swl env --workspace {}",
+                root.display()
+            ),
+        );
+    }
+}
+
+/// A local branch of a source that `finalize` needs in a scratch worktree;
+/// deleted on drop, which must come after the worktree's removal (declare
+/// it before the [`Scratch`]): a branch checked out cannot be deleted.
+struct TempBranch<'a> {
+    source: &'a Path,
+    name: String,
+}
+
+impl<'a> TempBranch<'a> {
+    fn new(source: &'a Path) -> Self {
+        Self {
+            source,
+            name: format!("swl-refresh-{}", std::process::id()),
+        }
+    }
+}
+
+impl Drop for TempBranch<'_> {
+    fn drop(&mut self) {
+        let _ = git(self.source, &["branch", "--quiet", "-D", &self.name]);
+    }
+}
+
+/// Makes the dropped landing commit `dropped`, which landed `paths`, anew
+/// on the scratch worktree's HEAD, on the temporary branch `tmp` (which
+/// `finalize` needs), without hooks: the same entries landed, and the same
+/// `swl.toml` left. The new head, or why not.
+fn refinalize(
+    l: &Lander,
+    s: &Scratch,
+    tmp: &TempBranch,
+    which: &str,
+    dropped: &str,
+    paths: &BTreeSet<String>,
+) -> Result<String, String> {
+    let err = |e: anyhow::Error| format!("{e:#}");
+    git(&s.dir, &["switch", "--quiet", "-C", &tmp.name]).map_err(err)?;
+    let done = finalize::land_exactly(&s.dir, l.reader, paths).map_err(err)??;
+    let source = tmp.source;
+    let manifest = |rev: &str| git_ok(source, &["show", &format!("{rev}:{MANIFEST_FILE}")]);
+    if manifest(&done.head) != manifest(dropped) {
+        return Err(format!(
+            "its {MANIFEST_FILE} would differ from the dropped commit's"
+        ));
+    }
+    style::say(
+        l.cmd,
+        Tone::Plain,
+        format!("{which}: finalized anew: {}", done.subject),
+    );
+    Ok(done.head)
+}
+
+/// Rebases `part`'s branch onto its base's tip and pushes it with a lease,
+/// when its head does not contain that tip: [`Step::Done`] when it does,
+/// [`Step::Progress`] once pushed and the forge shows the new head.
+pub(crate) fn refresh(l: &Lander, part: &Part) -> Result<Step> {
+    let cmd = l.cmd;
+    let which = &part.which;
+    let branch = part.info.head_ref.as_str();
+    let rc = l.config.repo(part.repo)?;
+    let source = &rc.source;
+    let base = rc.base();
+    let base_branch = base.split_once('/').map_or(base, |(_, b)| b);
+    let Some(remote) = base_remote(source, base)? else {
+        return stop(
+            Waits::Anyone,
+            format!(
+                "{which}: the base {base} names no remote of {}, so {branch} is not refreshed",
+                source.display()
+            ),
+        );
+    };
+    let base_ref = format!("refs/remotes/{remote}/{base_branch}");
+    let fetch = |refspec: &str| git(source, &["fetch", "--quiet", &remote, refspec]);
+    fetch(&format!("+refs/heads/{base_branch}:{base_ref}"))?;
+    let base_tip = rev(source, &base_ref)?;
+    // Whether a rebase is needed is the MR head's to say, whatever branch
+    // or repo it comes from.
+    let head_sha = part.info.head_sha.as_str();
+    if rev(source, head_sha).is_err() {
+        let _ = fetch(&format!("refs/pull/{}/head", part.info.number));
+    }
+    if rev(source, head_sha).is_err() {
+        return stop(
+            Waits::Nobody,
+            format!(
+                "{which}: its head {} cannot be fetched from {remote}; rerun {cmd}",
+                short(head_sha)
+            ),
+        );
+    }
+    if is_ancestor(source, &base_tip, head_sha) {
+        return Ok(Step::Done);
+    }
+    let into = part.info.base_ref.as_deref();
+    if into != Some(base_branch) {
+        return stop(
+            Waits::Anyone,
+            format!(
+                "{which} merges into {}, not {base_branch}: swl rebases only MRs into the repo's \
+                 base",
+                into.unwrap_or("a branch the forge does not name")
+            ),
+        );
+    }
+    let own = slug(part.repo);
+    let from = part.info.head_repo.as_deref();
+    if !from.is_some_and(|r| r.eq_ignore_ascii_case(&own)) {
+        return stop(
+            Waits::Anyone,
+            format!(
+                "{which}'s head branch is in {}, not {own}: swl does not rebase an MR from another \
+                 repo",
+                from.unwrap_or("a repo the forge does not name")
+            ),
+        );
+    }
+    if let Some(why) = never_rewritten(branch, base_branch) {
+        return stop(
+            Waits::Anyone,
+            format!(
+                "{which}: its head branch {branch} is {why}; swl rewrites only the change's own \
+                 MR branches"
+            ),
+        );
+    }
+    if !valid_branch(branch) {
+        return stop(
+            Waits::Anyone,
+            format!("{which}: its head branch {branch:?} is not a branch name"),
+        );
+    }
+    let tracking = format!("{remote}/{branch}");
+    let branch_ref = format!("refs/remotes/{tracking}");
+    if let Err(e) = fetch(&format!("+refs/heads/{branch}:{branch_ref}")) {
+        return stop(
+            Waits::Anyone,
+            format!(
+                "{which}: its head branch {branch} cannot be fetched from {remote} ({e:#}); check \
+                 {which} on the forge"
+            ),
+        );
+    }
+    let observed = rev(source, &branch_ref)?;
+    if observed != head_sha {
+        return stop(
+            Waits::Nobody,
+            format!(
+                "{which}: the forge has its head at {}, {tracking} is at {}; rerun {cmd}",
+                short(head_sha),
+                short(&observed)
+            ),
+        );
+    }
+    let behind = format!(
+        "{which}: {branch} does not contain {base} at {}",
+        short(&base_tip)
+    );
+    if let Place::Checkout { dir, .. } = part.place
+        && let Some(why) = checkout_problem(dir, branch, &observed, &tracking)?
+    {
+        return stop(
+            Waits::Anyone,
+            format!(
+                "{behind}, and its checkout {} is not rebased: {why}; then rerun {cmd} (or swl \
+                 refresh)",
+                dir.display()
+            ),
+        );
+    }
+    let landed = match part.consumer {
+        true => finalize::own_landing(source, &observed)?,
+        false => None,
+    };
+    let landed = match landed {
+        Some(paths) if lock_moved(source, &observed, &base_tip)? => Some(paths),
+        _ => None,
+    };
+    let drop_landing = landed.is_some();
+    let start = match drop_landing {
+        true => rev(source, &format!("{observed}^"))?,
+        false => observed.clone(),
+    };
+    let range = format!("{base_tip}..{start}");
+    let merges = git(source, &["log", "--merges", "--format=%h %s", &range])?;
+    if !merges.is_empty() {
+        return stop(
+            Waits::Anyone,
+            format!(
+                "{behind}, and it has merge commits, which a rebase would not keep (nor what they \
+                 resolve): {}; rebase it by hand, push it, then rerun {cmd}",
+                merges.lines().collect::<Vec<_>>().join(", ")
+            ),
+        );
+    }
+    let count = git(source, &["rev-list", "--count", &range])?;
+    let lease = format!("--force-with-lease=refs/heads/{branch}:{observed}");
+    let what = format!(
+        "rebase {branch} of {which} ({count} commit{}{}) onto {base} at {}{}, and push it with \
+         --force-with-lease=refs/heads/{branch}:{}",
+        if count == "1" { "" } else { "s" },
+        match drop_landing {
+            true => format!(
+                ", without swl's landing commit {}, as {base} moved flake.lock",
+                short(&observed)
+            ),
+            false => String::new(),
+        },
+        short(&base_tip),
+        match drop_landing {
+            true => " and finalize it anew",
+            false => "",
+        },
+        short(&observed)
+    );
+    if !l.act(&format!("refresh {which}"), &what)? {
+        return Ok(Step::Planned(format!(
+            "CI runs on the new head of {which}, then its merge is requested"
+        )));
+    }
+    // Dropped after the scratch worktree.
+    let tmp_branch = TempBranch::new(source);
+    let scratch = Scratch::new(source, part.repo, &start)?;
+    if let Some(conflict) = rebase(&scratch.dir, &base_tip)? {
+        let by_hand = match part.place {
+            Place::Checkout { dir, .. } => format!(" in {}", dir.display()),
+            Place::Scratch => String::new(),
+        };
+        return stop(
+            Waits::Anyone,
+            format!(
+                "{behind}, and rebasing it conflicts in {conflict}; nothing was changed: rebase it \
+                 by hand{by_hand}, push it, then rerun {cmd}"
+            ),
+        );
+    }
+    let mut head = git(&scratch.dir, &["rev-parse", "HEAD"])?;
+    if head == base_tip {
+        return stop(
+            Waits::Anyone,
+            format!(
+                "{which}: everything on {branch} is in {base} already; nothing was pushed: close \
+                 {which}"
+            ),
+        );
+    }
+    if let Some(paths) = &landed {
+        match refinalize(l, &scratch, &tmp_branch, which, &observed, paths) {
+            Ok(h) => head = h,
+            Err(why) => {
+                return stop(
+                    Waits::Anyone,
+                    format!(
+                        "{behind}, and its landing commit, dropped to rebase it, cannot be made \
+                         anew: {why}; nothing was pushed"
+                    ),
+                );
+            }
+        }
+    }
+    let refspec = format!("{head}:refs/heads/{branch}");
+    let push = [
+        "-c",
+        "core.hooksPath=/dev/null",
+        "push",
+        "--quiet",
+        &lease,
+        &remote,
+        &refspec,
+    ];
+    if let Err(e) = git(&scratch.dir, &push) {
+        return match push_rejection(&format!("{e:#}")) {
+            None => Err(e.context(format!("pushing {branch} of {which}"))),
+            Some(Rejection::Moved) => stop(
+                Waits::Nobody,
+                format!(
+                    "{which}: {tracking} moved since it was read at {}, so the lease refused the \
+                     push; nothing was changed: rerun {cmd}",
+                    short(&observed)
+                ),
+            ),
+            Some(Rejection::Refused(reason)) => stop(
+                Waits::Owner,
+                format!("{which}: the push of the rebased {branch} was refused: {reason}"),
+            ),
+        };
+    }
+    style::say(
+        cmd,
+        Tone::Good,
+        format!(
+            "{which}: pushed {branch} at {}, rebased onto {base}",
+            short(&head)
+        ),
+    );
+    if let Place::Checkout { dir, root } = part.place {
+        if let Some(why) = move_checkout(dir, branch, &observed, &head)? {
+            return stop(
+                Waits::Anyone,
+                format!(
+                    "{which}: pushed, but its checkout {} was not moved: {why}",
+                    dir.display()
+                ),
+            );
+        }
+        if lock_changed(source, &observed, &head)? {
+            rerun_env(cmd, root, l.config);
+        }
+    } else {
+        follow_local_branch(cmd, source, which, branch, &observed, &head);
+    }
+    l.await_pull_at(source, &remote, which, part.info.number, &head)
+}
+
+/// Without a checkout, moves the source's own local `branch` to the pushed
+/// `head` by compare-and-swap when it is at the `observed` head and no
+/// worktree has it checked out, so that a later push of it is a
+/// fast-forward; else leaves it, and says so when it exists.
+fn follow_local_branch(
+    cmd: &str,
+    source: &Path,
+    which: &str,
+    branch: &str,
+    observed: &str,
+    head: &str,
+) {
+    let refname = format!("refs/heads/{branch}");
+    let Some(local) = git_ok(source, &["rev-parse", "--verify", "--quiet", &refname]) else {
+        return;
+    };
+    let worktrees = git_ok(source, &["worktree", "list", "--porcelain"]).unwrap_or_default();
+    let checked_out = worktrees.lines().any(|l| l == format!("branch {refname}"));
+    let moved = local == observed
+        && !checked_out
+        && git(
+            source,
+            &["update-ref", "-m", "swl refresh", &refname, head, observed],
+        )
+        .is_ok();
+    if !moved {
+        style::say(
+            cmd,
+            Tone::Warn,
+            format!(
+                "{which}: the local {branch} of {} (at {}) was left as it is; it is not the pushed \
+                 head {}",
+                source.display(),
+                short(&local),
+                short(head)
+            ),
+        );
+    }
+}
+
+/// Whether `flake.lock` differs between two revisions.
+fn lock_changed(dir: &Path, a: &str, b: &str) -> Result<bool> {
+    Ok(!git(dir, &["diff", "--name-only", a, b, "--", "flake.lock"])?.is_empty())
+}
+
+/// The depth of a row's deepest input path: nested ones are refreshed
+/// first.
+fn depth(row: &Row) -> usize {
+    row.under
+        .iter()
+        .map(|(_, p)| p.matches('/').count())
+        .max()
+        .unwrap_or(0)
+}
+
+/// The open MRs of the workspace's rows, bottom-up: the shared ones (nested
+/// first), then the consumers'.
+fn parts<'a>(ws: &'a Workspace, rows: &'a [Row]) -> Vec<Part<'a>> {
+    let mut shared: Vec<(&Row, Part)> = Vec::new();
+    let mut consumers = Vec::new();
+    for row in rows {
+        let open = |facts: &'a MrFacts| match facts {
+            MrFacts::Read {
+                number,
+                read: MrRead::Open { info, .. },
+            } => Some((*number, info)),
+            _ => None,
+        };
+        let checkout = ws.checkouts.iter().find(|c| c.name == row.name);
+        match &row.facts {
+            RowFacts::Shared(f) => {
+                if let (Some((n, info)), Some(c)) = (open(&f.mr), checkout) {
+                    let part = Part {
+                        which: format!("{}#{n}", f.repo),
+                        repo: &f.repo,
+                        info,
+                        place: Place::Checkout {
+                            dir: &c.dir,
+                            root: &ws.root,
+                        },
+                        consumer: false,
+                    };
+                    shared.push((row, part));
+                }
+            }
+            RowFacts::Entry {
+                repo,
+                read: MrRead::Open { info, .. },
+            } => {
+                let part = Part {
+                    which: format!("{repo}#{}", info.number),
+                    repo,
+                    info,
+                    place: Place::Scratch,
+                    consumer: false,
+                };
+                shared.push((row, part));
+            }
+            RowFacts::Consumer(f) => {
+                if let (Some((n, info)), Some(c)) = (open(&f.mr), checkout) {
+                    consumers.push(Part {
+                        which: format!("{}#{n}", c.name),
+                        repo: &c.name,
+                        info,
+                        place: Place::Checkout {
+                            dir: &c.dir,
+                            root: &ws.root,
+                        },
+                        consumer: true,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    shared.sort_by_key(|(row, _)| std::cmp::Reverse(depth(row)));
+    shared
+        .into_iter()
+        .map(|(_, p)| p)
+        .chain(consumers)
+        .collect()
+}
+
+const CMD: &str = "swl refresh";
+
+/// `swl refresh`: every open MR branch of the workspace's change, bottom-up,
+/// rebased onto its base and pushed when it does not contain the base's
+/// tip. Stops at the first that cannot be.
+pub fn run(
+    root: &Path,
+    config: &Config,
+    reader: &dyn PrReader,
+    opts: &Options,
+) -> Result<ExitCode> {
+    let lander = Lander::new(CMD, config, reader, &DryRunWriter, opts);
+    let ws = Workspace::scan(root)?;
+    let rows = status::collect(&ws, config, reader, &Fetcher::new(true))?;
+    let parts = parts(&ws, &rows);
+    if parts.is_empty() {
+        style::say(
+            CMD,
+            Tone::Plain,
+            format!("nothing to refresh: no open MR in {}", ws.root.display()),
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+    let mut pushed: Vec<&str> = Vec::new();
+    for part in &parts {
+        let _span = tracing::debug_span!("refresh", which = %part.which).entered();
+        match refresh(&lander, part)? {
+            Step::Done => style::say(
+                CMD,
+                Tone::Plain,
+                format!(
+                    "{}: {} contains {} already",
+                    part.which,
+                    part.info.head_ref,
+                    config.base_for(part.repo)
+                ),
+            ),
+            Step::Progress => pushed.push(&part.which),
+            Step::Planned(_) => {}
+            Step::Stop(waits, msg) => {
+                say_waits(CMD, waits, &msg);
+                return Ok(match opts.dry_run {
+                    true => ExitCode::SUCCESS,
+                    false => ExitCode::from(waits_code(waits)),
+                });
+            }
+        }
+    }
+    if opts.dry_run {
+        style::say(CMD, Tone::Plain, "dry run, nothing was written");
+    } else if !pushed.is_empty() {
+        style::say(
+            CMD,
+            Tone::Good,
+            format!(
+                "rebased and pushed {}: CI runs on the new heads (swl status shows CI pending), \
+                 then swl land goes on",
+                pushed.join(", ")
+            ),
+        );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn branches_never_rewritten() {
+        for b in [
+            "master",
+            "main",
+            "trunk",
+            "swan-lake-current",
+            "swan-lake-current/nixos-26.05",
+            "swl-bump-common",
+        ] {
+            assert!(never_rewritten(b, "trunk").is_some(), "{b}");
+        }
+        for b in ["sl-0067-autorebase", "feature/x", "swan-lake-currentish"] {
+            assert_eq!(never_rewritten(b, "master"), None, "{b}");
+        }
+    }
+}
