@@ -112,6 +112,32 @@ pub struct FakeApi {
     pub follow_pull_refs: Arc<Mutex<bool>>,
     /// Repos whose reads answer this HTTP status, with [`FakeApi::fail_reads`].
     pub failing: Arc<Mutex<BTreeMap<String, u16>>>,
+    /// The MRs (API paths) that the list of open MRs leaves out, with
+    /// [`FakeApi::unlist_until_open`].
+    pub unlisted: Arc<Mutex<BTreeSet<String>>>,
+}
+
+/// A URL path segment percent-decoded, as Forgejo routes it.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = s
+            .get(i + 1..i + 3)
+            .and_then(|h| u8::from_str_radix(h, 16).ok());
+        match (bytes[i], hex) {
+            (b'%', Some(b)) => {
+                out.push(b);
+                i += 3;
+            }
+            (b, _) => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn git_in(dir: &Path, args: &[&str]) -> Option<String> {
@@ -223,7 +249,7 @@ impl FakeApi {
             .and_then(|r| r.split_once('/'))
             .filter(|_| allowed)
         {
-            return match self.pr_of_branch(&repo, base, head) {
+            return match self.pr_of_branch(&repo, &percent_decode(base), &percent_decode(head)) {
                 Some(b) => ("200 OK".into(), b),
                 None => (
                     "404 Not Found".into(),
@@ -263,6 +289,7 @@ impl FakeApi {
         let limit: usize = param("limit").and_then(|l| l.parse().ok()).unwrap_or(30);
         let page: usize = param("page").and_then(|p| p.parse().ok()).unwrap_or(1);
         let prefix = format!("/api/v1/repos/binarin/{repo}/pulls/");
+        let unlisted = self.unlisted.lock().unwrap().clone();
         let prs: Vec<(String, String)> = self
             .responses
             .lock()
@@ -271,6 +298,7 @@ impl FakeApi {
             .filter(|(p, _)| {
                 p.strip_prefix(&prefix)
                     .is_some_and(|n| n.parse::<u64>().is_ok())
+                    && !unlisted.contains(*p)
             })
             .map(|(p, b)| (p.clone(), b.clone()))
             .collect();
@@ -445,7 +473,8 @@ impl FakeApi {
     /// Opens an MR as Forgejo's `POST /repos/{owner}/{repo}/pulls` does: the
     /// next number, `refs/pull/N/head` at the head branch, 201 with the MR;
     /// 409 when an open MR of that head and base exists, 404 without the
-    /// head branch.
+    /// head branch. The list of open MRs then has the repo's unlisted MRs
+    /// ([`FakeApi::unlist_until_open`]) again.
     fn open_pr(&self, repo: &str, req: &serde_json::Value) -> (String, String) {
         let message = |code: &str, msg: &str| {
             (
@@ -458,6 +487,10 @@ impl FakeApi {
             req["base"].as_str().unwrap_or(""),
         );
         let prefix = format!("/api/v1/repos/binarin/{repo}/pulls/");
+        self.unlisted
+            .lock()
+            .unwrap()
+            .retain(|p| !p.starts_with(&prefix));
         let mut responses = self.responses.lock().unwrap();
         let mut last = 0;
         for (path, body) in responses.iter() {
@@ -567,6 +600,15 @@ impl FakeApi {
     /// Every read (GET) of `repo` answers `code`, as a broken forge does.
     pub fn fail_reads(&self, repo: &str, code: u16) {
         self.failing.lock().unwrap().insert(repo.to_string(), code);
+    }
+
+    /// The list of open MRs leaves `repo#n` out until the next request to
+    /// open an MR in `repo`: a list that lags behind an MR opened meanwhile.
+    pub fn unlist_until_open(&self, repo: &str, n: u64) {
+        self.unlisted
+            .lock()
+            .unwrap()
+            .insert(format!("/api/v1/repos/binarin/{repo}/pulls/{n}"));
     }
 
     pub fn make_private(&self, repo: &str) {

@@ -1,7 +1,9 @@
 //! `swl publish <consumer>`: push the workspace's changed shared checkouts
 //! fast-forward only, find or open their MRs as drafts, record them in the
 //! consumer's `swl.toml`, then push the consumer branch and find or open its
-//! MR. Rerunnable: what is already current is left alone.
+//! MR. Rerunnable: what is already current is left alone. The forge is
+//! asked and written through its REST API with fj's login, never through
+//! `fj` itself.
 
 use std::collections::BTreeMap;
 
@@ -9,7 +11,7 @@ use anyhow::{Result, anyhow, bail};
 
 use crate::{
     config::Config,
-    forge::{PrPublisher, PrReader, PrState},
+    forge::{ForgeWriter, PrExists, PrInfo, PrReader, PrState},
     git::{git, git_ok, short},
     lock::Lock,
     manifest::{Entry, MANIFEST_FILE, Manifest},
@@ -207,17 +209,29 @@ fn title_and_body(c: &Checkout, b: &Branch, extra: &str) -> Result<(String, Stri
     Ok((title, body))
 }
 
+/// The open MR from the branch into its base, found in the forge's list of
+/// open MRs, or opened (a `WIP: ` title makes it a draft on Forgejo). When
+/// the forge refuses to open it because it has one already, that one is
+/// looked up again.
 fn find_or_open(
-    forge: &dyn PrPublisher,
+    writer: &dyn ForgeWriter,
+    reader: &dyn PrReader,
     repo: &str,
     c: &Checkout,
     b: &Branch,
     draft: bool,
     extra: &str,
 ) -> Result<u64> {
-    if let Some(n) = forge.find_open(repo, &b.name)? {
-        println!("{}: MR {repo}#{n} is open for {}", c.name, b.name);
-        return Ok(n);
+    let lookup = || reader.open_pr_from(repo, &b.base_branch, &b.name);
+    let found = |info: PrInfo| {
+        println!(
+            "{}: MR {repo}#{} is open for {}",
+            c.name, info.number, b.name
+        );
+        info.number
+    };
+    if let Some(info) = lookup()? {
+        return Ok(found(info));
     }
     let (title, body) = title_and_body(c, b, extra)?;
     let title = if draft {
@@ -225,16 +239,28 @@ fn find_or_open(
     } else {
         title
     };
-    let n = forge.create(repo, &b.base_branch, &b.name, &title, &body)?;
-    println!("{}: opened MR {repo}#{n}: {title}", c.name);
-    Ok(n)
+    match writer.create_pr(repo, &b.base_branch, &b.name, &title, &body) {
+        Ok(info) => {
+            println!("{}: opened MR {repo}#{}: {title}", c.name, info.number);
+            Ok(info.number)
+        }
+        Err(e) if e.is::<PrExists>() => match lookup()? {
+            Some(info) => Ok(found(info)),
+            None => Err(e.context(format!(
+                "{}: the forge has an MR of {} into {} already, but not among the open MRs \
+                 it lists",
+                c.name, b.name, b.base_branch
+            ))),
+        },
+        Err(e) => Err(e),
+    }
 }
 
 pub fn run(
     ws: &Workspace,
     config: &Config,
     consumer: &str,
-    forge: &dyn PrPublisher,
+    writer: &dyn ForgeWriter,
     reader: &dyn PrReader,
 ) -> Result<()> {
     let target = ws
@@ -300,7 +326,7 @@ pub fn run(
     for (checkout, repo, paths, branch) in &shared {
         push(checkout, branch)?;
         let extra = format!("\nUsed by {consumer} as {}.\n", paths.join(", "));
-        let mr = find_or_open(forge, repo, checkout, branch, true, &extra)?;
+        let mr = find_or_open(writer, reader, repo, checkout, branch, true, &extra)?;
         for p in paths {
             depends.push_str(&format!("- {repo}#{mr} ({p})\n"));
             manifest.inputs.insert(
@@ -365,6 +391,14 @@ pub fn run(
     } else {
         format!("\nDepends on (see {MANIFEST_FILE}):\n{depends}")
     };
-    find_or_open(forge, consumer, target, &consumer_branch, false, &extra)?;
+    find_or_open(
+        writer,
+        reader,
+        consumer,
+        target,
+        &consumer_branch,
+        false,
+        &extra,
+    )?;
     Ok(())
 }

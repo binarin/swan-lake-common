@@ -102,9 +102,12 @@ fn selectors_and_enclosing_workspace_work_for_every_workspace_command() {
         ],
     ));
     assert!(ws.join("zwanenzang@zwanenzang/flake.nix").is_file());
-    let publish = f.swl(
+    // publish asks for fj's login first.
+    let keys = f.login();
+    let publish = f.swl_env(
         &f.root,
         &["publish", "not-a-consumer", "--workspace", "sl-88"],
+        &[("SWL_FJ_KEYS", keys.to_str().unwrap())],
     );
     failed(&publish, 2, "not-a-consumer");
     assert!(

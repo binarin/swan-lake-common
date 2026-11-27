@@ -872,8 +872,8 @@ pub enum MergeWhen {
     ChecksSucceed,
 }
 
-/// The forge writes of `swl land` and `swl bump`: marking an MR ready,
-/// opening one, and requesting its merge.
+/// The forge writes of `swl land`, `swl bump` and `swl publish`: marking an
+/// MR ready, opening one, and requesting its merge.
 pub trait ForgeWriter {
     /// Sets the MR's title (a draft is marked ready by dropping `WIP:`).
     fn set_title(&self, repo: &str, number: u64, title: &str) -> Result<()>;
@@ -889,7 +889,7 @@ pub trait ForgeWriter {
         when: MergeWhen,
     ) -> Result<MergeOutcome>;
     /// Opens an MR of the branch `head` into `base`; the MR as the forge
-    /// has it.
+    /// has it. A [`PrExists`] error when the forge has one already.
     fn create_pr(
         &self,
         repo: &str,
@@ -1009,109 +1009,26 @@ impl ForgeWriter for FjWriter {
                 PrInfo::from_api(&v)
             }
             (401, _) => bail!(LOGIN_REJECTED),
+            (code @ (409 | 422), text) => {
+                Err(PrExists(format!("POST {path}: HTTP {code}: {}", text.trim())).into())
+            }
             (code, text) => bail!("POST {path}: HTTP {code}: {}", text.trim()),
         }
     }
 }
 
-/// Finds and opens MRs for `swl publish`.
-pub trait PrPublisher {
-    /// The open MR whose head is `branch`, if any.
-    fn find_open(&self, repo: &str, branch: &str) -> Result<Option<u64>>;
-    /// Opens an MR and returns its number. A `WIP: ` title prefix makes it a
-    /// draft on Forgejo.
-    fn create(&self, repo: &str, base: &str, head: &str, title: &str, body: &str) -> Result<u64>;
-}
+/// The error of [`ForgeWriter::create_pr`] when the forge answers 409 or 422:
+/// it has an MR of that head and base branch already.
+#[derive(Debug)]
+pub struct PrExists(String);
 
-/// The `fj` CLI from PATH, logged in to the forge. Its output is text, so
-/// this parses fj 0.7's English messages.
-pub struct Fj;
-
-impl Fj {
-    fn run(&self, args: &[&str]) -> Result<String> {
-        let out = crate::logging::output(
-            Command::new("fj")
-                .arg("-H")
-                .arg(FORGE_HOST)
-                .args(args)
-                .stdin(Stdio::null()),
-        )
-        .context("running fj (the Forgejo CLI) from PATH")?;
-        if !out.status.success() {
-            bail!(
-                "fj {} failed: {}",
-                args.join(" "),
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-        }
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+impl std::fmt::Display for PrExists {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
     }
 }
 
-/// MR numbers in `fj pr search` output: lines `#N: title (by user)`.
-pub fn parse_fj_search(text: &str) -> Vec<u64> {
-    text.lines()
-        .filter_map(|l| l.trim().strip_prefix('#')?.split_once(':')?.0.parse().ok())
-        .collect()
-}
-
-/// The head branch in `fj pr view` output: the line ``From `head` into `base` ``.
-pub fn parse_fj_view_head(text: &str) -> Option<String> {
-    text.lines().find_map(|l| {
-        let rest = l.trim().strip_prefix("From `")?;
-        let (head, rest) = rest.split_once('`')?;
-        rest.trim_start()
-            .starts_with("into ")
-            .then(|| head.to_string())
-    })
-}
-
-/// The number in `fj pr create` output: `created pull request #N: title`.
-pub fn parse_fj_created(text: &str) -> Option<u64> {
-    let rest = text.split("pull request #").nth(1)?;
-    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
-    digits.parse().ok()
-}
-
-impl PrPublisher for Fj {
-    fn find_open(&self, repo: &str, branch: &str) -> Result<Option<u64>> {
-        let slug = slug(repo);
-        // `--all`: fj shows 25 per page otherwise.
-        let found = self.run(&["pr", "search", "--repo", &slug, "--state", "open", "--all"])?;
-        for n in parse_fj_search(&found) {
-            let view = self.run(&["pr", "view", &format!("{slug}#{n}")])?;
-            if parse_fj_view_head(&view).as_deref() == Some(branch) {
-                return Ok(Some(n));
-            }
-        }
-        Ok(None)
-    }
-
-    fn create(&self, repo: &str, base: &str, head: &str, title: &str, body: &str) -> Result<u64> {
-        let dir = crate::tempdir::TempDir::new("swl-publish")?;
-        let body_file = dir.path().join("body.md");
-        std::fs::write(&body_file, body)?;
-        let out = self.run(&[
-            "pr",
-            "create",
-            "--repo",
-            &slug(repo),
-            "--base",
-            base,
-            "--head",
-            head,
-            "--body-file",
-            &body_file.to_string_lossy(),
-            title,
-        ])?;
-        match parse_fj_created(&out) {
-            Some(n) => Ok(n),
-            None => self.find_open(repo, head)?.ok_or_else(|| {
-                anyhow!("fj pr create printed no MR number and none is found for {head}: {out}")
-            }),
-        }
-    }
-}
+impl std::error::Error for PrExists {}
 
 #[cfg(test)]
 mod tests {
@@ -1406,26 +1323,6 @@ mod tests {
         assert_eq!(ready_title("wip:swl: x"), "swl: x");
         assert_eq!(ready_title("[WIP] swl: x"), "swl: x");
         assert_eq!(ready_title("swl: x"), "swl: x");
-    }
-
-    #[test]
-    fn fj_output() {
-        assert_eq!(
-            parse_fj_search(
-                "2 pull requests\n#41: devshell: watch (SL-0055) (by u)\n#7: x: y (by u)\n"
-            ),
-            [41, 7]
-        );
-        assert!(parse_fj_search("Page 1 out of 0 pages in total (0 pull requests)\n").is_empty());
-        let view =
-            "swl v0: x #24\nBy u — Open — +1 -0\nFrom `sl-0036-swl` into `master`\n\n> body\n";
-        assert_eq!(parse_fj_view_head(view).as_deref(), Some("sl-0036-swl"));
-        assert_eq!(parse_fj_view_head("From me\n"), None);
-        assert_eq!(
-            parse_fj_created("created pull request #25: WIP: swl: x\n"),
-            Some(25)
-        );
-        assert_eq!(parse_fj_created("nothing"), None);
     }
 
     #[test]

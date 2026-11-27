@@ -1,21 +1,21 @@
-//! The manifest workflow on disposable local repos: `swl publish` with a
-//! fake `fj`, `swl check`, `swl ci env` and `swl finalize` against a fake
-//! forge API (a local HTTP server) and a "forge" of bare repos reached by
-//! `git+file:`. Offline, with real git and Nix; set SWL_TEST_NIX_STORE to use
-//! a store in a scratch directory, as the package check does inside the
-//! build sandbox.
+//! The manifest workflow on disposable local repos: `swl publish`, `swl
+//! check`, `swl ci env` and `swl finalize` against the fake forge API of the
+//! workspace tests (a local HTTP server, which publish reaches with a fake fj
+//! login) and a "forge" of bare repos reached by `git+file:`. Offline, with
+//! real git and Nix; set SWL_TEST_NIX_STORE to use a store in a scratch
+//! directory, as the package check does inside the build sandbox.
+
+mod support;
 
 use std::{
-    collections::BTreeMap,
     env, fs,
-    io::{BufRead, BufReader, Write},
-    net::TcpListener,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::{Command, Output},
-    sync::{Arc, Mutex},
     thread,
 };
+
+use support::{FakeApi, TOKEN};
 
 /// Common pins zwanenzang's `current`, for nested (`lib/zwanenzang`) entries.
 const COMMON_FLAKE: &str = r#"{
@@ -50,112 +50,16 @@ const CONSUMER_FLAKE: &str = r#"{
 }
 "#;
 
-/// A fake `fj`: MRs are files `<state>/<owner>_<repo>/<n>` holding
-/// `state head base` and the title; every call is logged.
-const FAKE_FJ: &str = r##"#!/bin/sh
-state="$FJ_STATE"
-echo "$*" >> "$state/log"
-if [ "$1" = -H ]; then shift 2; fi
-cmd="$1 $2"
-shift 2
-case "$cmd" in
-"pr search")
-  repo=""
-  while [ $# -gt 0 ]; do
-    case "$1" in --repo) repo="$2"; shift 2;; *) shift;; esac
-  done
-  d="$state/$(echo "$repo" | tr / _)"
-  echo "some pull requests"
-  for f in "$d"/*; do
-    [ -f "$f" ] || continue
-    read -r st head base < "$f"
-    if [ "$st" = open ]; then echo "#$(basename "$f"): $(sed -n 2p "$f") (by fake)"; fi
-  done
-  ;;
-"pr view")
-  repo="${1%#*}"
-  num="${1#*#}"
-  f="$state/$(echo "$repo" | tr / _)/$num"
-  read -r st head base < "$f"
-  echo "$(sed -n 2p "$f") #$num"
-  echo "By fake — Open — +1 -0"
-  echo "From \`$head\` into \`$base\`"
-  ;;
-"pr create")
-  while [ $# -gt 1 ]; do
-    case "$1" in
-      --repo) repo="$2"; shift 2;;
-      --base) base="$2"; shift 2;;
-      --head) head="$2"; shift 2;;
-      --body-file) cp "$2" "$state/last-body"; shift 2;;
-      *) shift;;
-    esac
-  done
-  title="$1"
-  d="$state/$(echo "$repo" | tr / _)"
-  mkdir -p "$d"
-  n=$(( $(ls "$d" | wc -l) + 1 ))
-  printf 'open %s %s\n%s\n' "$head" "$base" "$title" > "$d/$n"
-  echo "created pull request #$n: $title"
-  ;;
-*) echo "fake fj: unexpected $cmd" >&2; exit 3;;
-esac
-"##;
+/// An `fj` that only logs its calls, and fails: swl must never run it.
+const FAKE_FJ: &str = "#!/bin/sh\necho \"$*\" >> \"$FJ_LOG\"\nexit 3\n";
 
-/// GET responses by path; anything else is 404.
-#[derive(Clone, Default)]
-struct FakeApi {
-    port: u16,
-    responses: Arc<Mutex<BTreeMap<String, String>>>,
-    /// The paths of requests that carried an Authorization header.
-    authed: Arc<Mutex<Vec<String>>>,
+/// The MRs that check, ci env and finalize read, on the fake forge API of
+/// the workspace tests.
+trait SetMr {
+    fn set(&self, repo: &str, n: u64, state: &str, head: &str, merge_commit: Option<&str>);
 }
 
-impl FakeApi {
-    fn start() -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let api = Self {
-            port: listener.local_addr().unwrap().port(),
-            ..Default::default()
-        };
-        let (responses, authed) = (api.responses.clone(), api.authed.clone());
-        thread::spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(mut stream) = stream else { continue };
-                let mut reader = BufReader::new(stream.try_clone().unwrap());
-                let mut request = String::new();
-                reader.read_line(&mut request).ok();
-                let mut auth = false;
-                loop {
-                    let mut line = String::new();
-                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
-                        break;
-                    }
-                    auth |= line.to_ascii_lowercase().starts_with("authorization:");
-                }
-                let path = request.split_whitespace().nth(1).unwrap_or("").to_string();
-                if auth {
-                    authed.lock().unwrap().push(path.clone());
-                }
-                let found = responses.lock().unwrap().get(&path).cloned();
-                let (status, body) = match found {
-                    Some(b) => ("200 OK", b),
-                    None => ("404 Not Found", r#"{"message":"not found"}"#.to_string()),
-                };
-                let _ = write!(
-                    stream,
-                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-            }
-        });
-        api
-    }
-
-    fn base(&self) -> String {
-        format!("http://127.0.0.1:{}/api/v1", self.port)
-    }
-
+impl SetMr for FakeApi {
     fn set(&self, repo: &str, n: u64, state: &str, head: &str, merge_commit: Option<&str>) {
         let body = serde_json::json!({
             "number": n,
@@ -208,7 +112,8 @@ struct World {
     ws: PathBuf,
     consumer: PathBuf,
     common: PathBuf,
-    fj_state: PathBuf,
+    /// What the fake `fj` was called with, which must stay empty.
+    fj_log: PathBuf,
     api: FakeApi,
     base_path: String,
     nix_config: String,
@@ -236,17 +141,19 @@ impl World {
             forge: root.join("forge"),
             consumer: ws.join("swan-lake"),
             common: ws.join("swan-lake-common@lib"),
-            fj_state: root.join("fj-state"),
+            fj_log: root.join("fj.log"),
             ws,
             api: FakeApi::start(),
             base_path,
             nix_config,
             root,
         };
-        fs::create_dir_all(&w.fj_state).unwrap();
+        *w.api.forge.lock().unwrap() = Some(w.forge.clone());
         fs::write(
             w.root.join("fj-keys.json"),
-            r#"{"hosts":{"forgejo.lynx-lizard.ts.net":{"type":"Application","name":"u","token":"secret"}}}"#,
+            serde_json::json!({ "hosts": { "forgejo.lynx-lizard.ts.net": {
+                "type": "Application", "name": "u", "token": TOKEN } } })
+            .to_string(),
         )
         .unwrap();
         let fakebin = w.root.join("fakebin");
@@ -367,7 +274,7 @@ impl World {
             .env("SWL_CONFIG", self.root.join("repos.toml"))
             // An fj login, which check, ci env and finalize must not use.
             .env("SWL_FJ_KEYS", self.root.join("fj-keys.json"))
-            .env("FJ_STATE", &self.fj_state)
+            .env("FJ_LOG", &self.fj_log)
             .env("SWL_FORGE_API", self.api.base())
             .env("SWL_FORGE_GIT", format!("file://{}", self.forge.display()))
             // No GitHub source here: nothing may ask the real API.
@@ -388,7 +295,7 @@ impl World {
         c.current_dir(dir).args(args).output().unwrap()
     }
 
-    /// swl with the fake fj first on PATH.
+    /// swl with the fake fj, which it must not run, first on PATH.
     fn swl(&self, dir: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
         let mut c = Command::new(env!("CARGO_BIN_EXE_swl"));
         let path = format!("{}:{}", self.root.join("fakebin").display(), self.base_path);
@@ -399,8 +306,20 @@ impl World {
         c.current_dir(dir).args(args).output().unwrap()
     }
 
-    fn fj_log(&self) -> String {
-        fs::read_to_string(self.fj_state.join("log")).unwrap_or_default()
+    /// The MR `repo#n` as the fake forge API has it.
+    fn mr(&self, repo: &str, n: u64) -> serde_json::Value {
+        let path = format!("/api/v1/repos/binarin/{repo}/pulls/{n}");
+        let body = self.api.responses.lock().unwrap().get(&path).cloned();
+        serde_json::from_str(&body.unwrap_or_else(|| panic!("no MR {repo}#{n}"))).unwrap()
+    }
+
+    /// The number of requests to open an MR.
+    fn creates(&self) -> usize {
+        self.api
+            .writes()
+            .iter()
+            .filter(|w| w.starts_with("POST ") && w.split(' ').nth(1).unwrap().ends_with("/pulls"))
+            .count()
     }
 
     /// What `swl publish` would have done for common: the branch and the
@@ -436,11 +355,28 @@ impl World {
 impl Drop for World {
     fn drop(&mut self) {
         // check, ci env and finalize read anonymously, also with an fj login;
-        // publish looks up a branch's MR (`pulls/<base>/<branch>`) with it.
+        // publish lists the open MRs (`pulls?state=open`), looks up a
+        // branch's MR (`pulls/<base>/<branch>`) and opens MRs with it. No
+        // command runs fj.
         if !thread::panicking() {
-            let mut authed = self.api.authed.lock().unwrap().clone();
-            authed.retain(|p| !p.contains("/pulls/master/"));
+            let authed: Vec<String> = self
+                .api
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| r.auth.is_some())
+                .filter(|r| {
+                    !(r.method == "POST" && r.path.ends_with("/pulls")
+                        || r.method == "GET"
+                            && (r.path.contains("/pulls?state=open")
+                                || r.path.contains("/pulls/master/")))
+                })
+                .map(|r| format!("{} {}", r.method, r.path))
+                .collect();
             assert!(authed.is_empty(), "requests with a token: {authed:?}");
+            let fj = fs::read_to_string(&self.fj_log).unwrap_or_default();
+            assert!(fj.is_empty(), "fj was run: {fj}");
         }
         let _ = fs::remove_dir_all(&self.root);
     }
@@ -457,8 +393,15 @@ fn publish_is_rerunnable_and_fast_forward_only() {
     let forge_common = w.forge_repo("swan-lake-common");
     assert_eq!(w.git(&forge_common, &["rev-parse", "feature"]), common_head);
     // A draft MR for common, titled from its commit.
-    let mr = fs::read_to_string(w.fj_state.join("binarin_swan-lake-common/1")).unwrap();
-    assert_eq!(mr, "open feature master\nWIP: common: c2\n");
+    let mr = w.mr("swan-lake-common", 1);
+    assert_eq!(
+        (&mr["state"], &mr["head"]["ref"], &mr["base"]["ref"]),
+        (&"open".into(), &"feature".into(), &"master".into())
+    );
+    assert_eq!(
+        (&mr["title"], &mr["draft"]),
+        (&"WIP: common: c2".into(), &true.into())
+    );
     assert!(log.contains("opened MR swan-lake-common#1"), "{log}");
     // The manifest, committed on the consumer branch, then pushed with its MR.
     assert_eq!(
@@ -479,9 +422,22 @@ fn publish_is_rerunnable_and_fast_forward_only() {
         w.git(&w.forge_repo("swan-lake"), &["rev-parse", "feat"]),
         consumer_head
     );
-    let mr = fs::read_to_string(w.fj_state.join("binarin_swan-lake/1")).unwrap();
-    assert_eq!(mr, "open feat master\nconsumer: use c2\n");
-    let body = fs::read_to_string(w.fj_state.join("last-body")).unwrap();
+    let mr = w.mr("swan-lake", 1);
+    assert_eq!(
+        (
+            &mr["head"]["ref"],
+            &mr["base"]["ref"],
+            &mr["title"],
+            &mr["draft"]
+        ),
+        (
+            &"feat".into(),
+            &"master".into(),
+            &"consumer: use c2".into(),
+            &false.into()
+        )
+    );
+    let body = mr["body"].as_str().unwrap();
     assert!(body.contains("- swan-lake-common#1 (lib)"), "{body}");
     // The consumer's lock is untouched.
     assert_eq!(
@@ -493,10 +449,9 @@ fn publish_is_rerunnable_and_fast_forward_only() {
     );
 
     // Rerun: everything is found, nothing changes.
-    let creates = |log: &str| log.lines().filter(|l| l.contains("pr create")).count();
-    assert_eq!(creates(&w.fj_log()), 2);
+    assert_eq!(w.creates(), 2);
     let log = stdout(&w.swl(&w.root, &publish, &[]));
-    assert_eq!(creates(&w.fj_log()), 2, "{}", w.fj_log());
+    assert_eq!(w.creates(), 2, "{:?}", w.api.writes());
     assert_eq!(w.git(&w.consumer, &["rev-parse", "HEAD"]), consumer_head);
     for line in [
         "swan-lake-common@lib: feature is pushed",
@@ -516,7 +471,7 @@ fn publish_is_rerunnable_and_fast_forward_only() {
         w.git(&forge_common, &["rev-parse", "feature"]),
         w.git(&w.common, &["rev-parse", "HEAD"])
     );
-    assert_eq!(creates(&w.fj_log()), 2);
+    assert_eq!(w.creates(), 2);
     assert_eq!(w.git(&w.consumer, &["rev-parse", "HEAD"]), consumer_head);
 
     // Someone else's commit on origin's feature: not a fast-forward, refused
@@ -556,7 +511,117 @@ fn publish_is_rerunnable_and_fast_forward_only() {
     w.git(&w.common, &["checkout", "-q", "feature"]);
     fs::write(w.common.join("value.txt"), "dirty").unwrap();
     failed(&w.swl(&w.root, &publish, &[]), 2, "uncommitted changes");
-    assert_eq!(creates(&w.fj_log()), 2);
+    assert_eq!(w.creates(), 2);
+}
+
+/// An open MR that swl cannot read, as fj could not read swan-lake#53: no
+/// head sha, and null lists.
+fn set_malformed(api: &FakeApi, repo: &str, n: u64, head_ref: &str) {
+    let body = serde_json::json!({
+        "number": n,
+        "state": "open",
+        "merged": false,
+        "title": "unreadable",
+        "head": { "sha": null, "ref": head_ref, "label": head_ref },
+        "base": { "ref": "master" },
+        "labels": null,
+        "assignees": null,
+        "merge_commit_sha": null,
+    });
+    api.responses.lock().unwrap().insert(
+        format!("/api/v1/repos/binarin/{repo}/pulls/{n}"),
+        body.to_string(),
+    );
+}
+
+#[test]
+fn publish_finds_and_opens_its_mrs_beside_an_open_mr_it_cannot_read() {
+    let w = World::new("publish-malformed");
+    let ws = w.ws.display().to_string();
+    let publish = ["publish", "--workspace", &ws, "swan-lake"];
+    for repo in ["swan-lake-common", "swan-lake"] {
+        set_malformed(&w.api, repo, 1, "sl-0053-other");
+    }
+    let log = stdout(&w.swl(&w.root, &publish, &[]));
+    for line in [
+        "swan-lake-common@lib: opened MR swan-lake-common#2: WIP: common: c2",
+        "swan-lake: opened MR swan-lake#2: consumer: use c2",
+    ] {
+        assert!(log.lines().any(|l| l == line), "missing {line:?} in\n{log}");
+    }
+    assert_eq!(w.mr("swan-lake-common", 2)["head"]["ref"], "feature");
+    assert_eq!(w.mr("swan-lake", 2)["head"]["ref"], "feat");
+    let log = stdout(&w.swl(&w.root, &publish, &[]));
+    for line in [
+        "swan-lake-common@lib: MR swan-lake-common#2 is open for feature",
+        "swan-lake: MR swan-lake#2 is open for feat",
+    ] {
+        assert!(log.lines().any(|l| l == line), "missing {line:?} in\n{log}");
+    }
+    assert_eq!(w.creates(), 2, "{:?}", w.api.writes());
+
+    // An open MR of the branch into another base is not its MR.
+    w.git(&w.consumer, &["switch", "-qc", "feat2"]);
+    let mut other_base = w.mr("swan-lake", 2);
+    other_base["number"] = 3.into();
+    other_base["head"]["ref"] = "feat2".into();
+    other_base["base"]["ref"] = "release".into();
+    w.api.responses.lock().unwrap().insert(
+        "/api/v1/repos/binarin/swan-lake/pulls/3".into(),
+        other_base.to_string(),
+    );
+    let log = stdout(&w.swl(&w.root, &publish, &[]));
+    assert!(
+        log.lines()
+            .any(|l| l == "swan-lake: opened MR swan-lake#4: consumer: use c2"),
+        "{log}"
+    );
+    assert_eq!(w.mr("swan-lake", 4)["base"]["ref"], "master");
+}
+
+#[test]
+fn publish_takes_the_open_mr_the_forge_has_when_it_refuses_to_open_one() {
+    let w = World::new("publish-exists");
+    let ws = w.ws.display().to_string();
+    let publish = ["publish", "--workspace", &ws, "swan-lake"];
+    // Common's MR, opened meanwhile, is not in the list yet: the forge
+    // refuses a second one (409), and the list has it then.
+    w.git(&w.common, &["push", "-q", "origin", "feature"]);
+    let head = w.git(&w.common, &["rev-parse", "HEAD"]);
+    w.api
+        .set_pr("swan-lake-common", 7, "draft", "feature", &head, None);
+    w.api.unlist_until_open("swan-lake-common", 7);
+    // The consumer's own MR is one that swl cannot read: skipped, with a
+    // warning, and the forge refuses a second one.
+    set_malformed(&w.api, "swan-lake", 5, "feat");
+    let out = w.swl(&w.root, &publish, &[]);
+    failed(
+        &out,
+        2,
+        "swan-lake: the forge has an MR of feat into master already, but not among the open \
+         MRs it lists",
+    );
+    let log = text(&out);
+    assert!(
+        log.contains("swan-lake-common@lib: MR swan-lake-common#7 is open for feature"),
+        "{log}"
+    );
+    assert!(
+        log.contains(
+            "swl: warning: skipping swan-lake#5, an open MR that swl cannot read: MR 5 has no \
+             head sha"
+        ),
+        "{log}"
+    );
+    assert!(log.contains("HTTP 409"), "{log}");
+    // The manifest names the MR the forge had.
+    assert!(
+        fs::read_to_string(w.consumer.join("swl.toml"))
+            .unwrap()
+            .contains("mr = 7"),
+        "{log}"
+    );
+    assert_eq!(w.creates(), 2, "{:?}", w.api.writes());
 }
 
 #[test]
@@ -1191,6 +1256,18 @@ fn publish_refuses_the_base_branch_and_lock_changes() {
     let common_master = w.git(&forge_common, &["rev-parse", "master"]);
     let consumer_master = w.git(&w.forge_repo("swan-lake"), &["rev-parse", "master"]);
 
+    // Without an fj login, refused before anything is pushed.
+    let no_login = w.root.join("no-keys.json");
+    failed(
+        &w.swl(
+            &w.root,
+            &publish,
+            &[("SWL_FJ_KEYS", no_login.to_str().unwrap())],
+        ),
+        2,
+        "run fj auth login",
+    );
+
     // A shared checkout on its base branch, with a local commit.
     w.git(&w.common, &["checkout", "-q", "master"]);
     fs::write(w.common.join("value.txt"), "on master").unwrap();
@@ -1239,7 +1316,7 @@ fn publish_refuses_the_base_branch_and_lock_changes() {
     );
     let branches = w.git(&forge_common, &["branch", "--format=%(refname:short)"]);
     assert!(!branches.lines().any(|b| b == "feature"), "{branches}");
-    assert!(!w.fj_log().contains("pr create"), "{}", w.fj_log());
+    assert_eq!(w.creates(), 0, "{:?}", w.api.writes());
 }
 
 #[test]
@@ -1322,7 +1399,7 @@ fn publish_refuses_a_branch_whose_mr_merged_without_its_commits() {
     let ws = w.ws.display().to_string();
     let publish = ["publish", "--workspace", &ws, "swan-lake"];
     // `repo`'s MR `n` from `branch`, merged as `merge_commit`; its branch is
-    // gone.
+    // gone. The fake API finds it by its `head.label`.
     let merged = |repo: &str, n: u64, branch: &str, merge_commit: &str| {
         let body = serde_json::json!({
             "number": n,
@@ -1334,10 +1411,7 @@ fn publish_refuses_a_branch_whose_mr_merged_without_its_commits() {
             "merge_commit_sha": merge_commit,
         });
         w.api.responses.lock().unwrap().insert(
-            format!(
-                "/api/v1/repos/binarin/{repo}/pulls/master/{}",
-                branch.replace('#', "%23")
-            ),
+            format!("/api/v1/repos/binarin/{repo}/pulls/{n}"),
             body.to_string(),
         );
     };
@@ -1414,7 +1488,7 @@ fn publish_refuses_a_branch_whose_mr_merged_without_its_commits() {
         );
         assert!(!branches.lines().any(|b| b == branch), "{repo}: {branches}");
     }
-    assert!(!w.fj_log().contains("pr create"), "{}", w.fj_log());
+    assert_eq!(w.creates(), 0, "{:?}", w.api.writes());
 
     // A merged MR whose merge HEAD has: the branch is new work after it.
     merged("swan-lake", 5, "feat", &consumer_master);
@@ -1422,7 +1496,7 @@ fn publish_refuses_a_branch_whose_mr_merged_without_its_commits() {
         .responses
         .lock()
         .unwrap()
-        .remove("/api/v1/repos/binarin/swan-lake-common/pulls/master/feature");
+        .remove("/api/v1/repos/binarin/swan-lake-common/pulls/4");
     w.git(&w.common, &["rebase", "-q", "origin/master"]);
     stdout(&w.swl(&w.root, &publish, &[]));
     assert_eq!(

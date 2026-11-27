@@ -41,13 +41,7 @@ use std::{ffi::OsString, path::PathBuf, process::ExitCode, time::Duration};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
-use crate::{
-    check::Event,
-    config::Config,
-    forge::{AnonApi, Fj},
-    shim::Tool,
-    workspace::Workspace,
-};
+use crate::{check::Event, config::Config, forge::AnonApi, shim::Tool, workspace::Workspace};
 
 #[derive(Parser)]
 #[command(
@@ -571,11 +565,13 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 &std::env::current_dir()?,
                 workspace.as_deref(),
             )?)?;
+            // fj's login, before anything is pushed.
+            let writer = forge::FjWriter::from_env()?;
             publish::run(
                 &ws,
                 &config,
                 &consumer,
-                &Fj,
+                &writer,
                 &forge::ForgeReader::from_env(),
             )?;
         }
