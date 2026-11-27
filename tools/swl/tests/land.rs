@@ -457,6 +457,41 @@ fn land_keeps_checkouts_with_work_it_would_delete() {
 }
 
 #[test]
+fn land_from_rejoins_a_workspace_removed_by_hand() {
+    let t = Change::new("land-rejoin");
+    t.mirror_at_once();
+    t.f.api
+        .on_merge("swan-lake-common", 1, &[MergeReply::MergeNow]);
+    t.f.api.on_merge("swan-lake", 2, &[MergeReply::MergeNow]);
+    let heads = [&t.consumer, &t.common].map(|d| t.f.git(d, &["rev-parse", "HEAD"]));
+    // rm -rf: the sources keep the worktrees, holding the branches.
+    fs::remove_dir_all(&t.ws).unwrap();
+    let out = t.land_from(&[]);
+    let log = stdout(&out);
+    let rejoined = t.f.root.join("work/sl-0020-land");
+    for ((repo, dir), head) in [("swan-lake", &t.consumer), ("swan-lake-common", &t.common)]
+        .into_iter()
+        .zip(&heads)
+    {
+        assert!(
+            log.contains(&format!(
+                "swl start: pruned the worktree {} (branch sl-0020-land at {head}) of {}, \
+                 whose directory is gone (git worktree remove)",
+                dir.display(),
+                t.f.source(repo).display()
+            )),
+            "{log}"
+        );
+    }
+    assert!(log.contains("every MR of the change is merged"), "{log}");
+    assert!(
+        log.contains(&format!("removed {}", rejoined.display())),
+        "{log}"
+    );
+    assert!(!rejoined.exists(), "{log}");
+}
+
+#[test]
 fn land_refuses_a_fresh_workspace_that_holds_no_change() {
     let f = Forge::new("land-fresh");
     let keys = f.login().display().to_string();

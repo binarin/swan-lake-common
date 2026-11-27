@@ -14,6 +14,7 @@ use crate::{
     config::Config,
     env,
     git::{git, git_ok},
+    report::Report,
     style::{self, Tone},
     workspace::{Workspace, parse_shared_name},
 };
@@ -104,27 +105,113 @@ fn is_ancestor(dir: &Path, a: &str, b: &str) -> bool {
     git_ok(dir, &["merge-base", "--is-ancestor", a, b]).is_some()
 }
 
-/// The worktree that has `branch` checked out, if any.
-fn checked_out_at(source: &Path, branch: &str) -> Result<Option<String>> {
-    let list = git(source, &["worktree", "list", "--porcelain"])?;
-    let mut path = None;
-    for line in list.lines() {
+/// A worktree of a source, as `git worktree list --porcelain` shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Worktree {
+    pub path: PathBuf,
+    /// The full sha of its HEAD (none for a bare main one).
+    pub head: Option<String>,
+    /// The branch checked out, without `refs/heads/`.
+    pub branch: Option<String>,
+    pub locked: bool,
+    /// Its directory is gone (and it is not locked): `git worktree prune`
+    /// drops it.
+    pub prunable: bool,
+}
+
+/// The worktrees of the repository at `source`, its main one included.
+pub fn worktrees(source: &Path) -> Result<Vec<Worktree>> {
+    Ok(parse_worktrees(&git(
+        source,
+        &["worktree", "list", "--porcelain"],
+    )?))
+}
+
+fn parse_worktrees(text: &str) -> Vec<Worktree> {
+    let mut out: Vec<Worktree> = Vec::new();
+    for line in text.lines() {
         if let Some(p) = line.strip_prefix("worktree ") {
-            path = Some(p.to_string());
-        } else if line == format!("branch refs/heads/{branch}") {
-            return Ok(path);
+            out.push(Worktree {
+                path: PathBuf::from(p),
+                head: None,
+                branch: None,
+                locked: false,
+                prunable: false,
+            });
+        } else if let Some(w) = out.last_mut() {
+            if let Some(h) = line.strip_prefix("HEAD ") {
+                w.head = Some(h.to_string());
+            } else if let Some(b) = line.strip_prefix("branch refs/heads/") {
+                w.branch = Some(b.to_string());
+            } else if line == "locked" || line.starts_with("locked ") {
+                w.locked = true;
+            } else if line == "prunable" || line.starts_with("prunable ") {
+                w.prunable = true;
+            }
         }
     }
-    Ok(None)
+    out
+}
+
+/// Clears what stands in the way of `git worktree add` at `dest` (of
+/// `branch`, when an existing branch is checked out): a worktree registered
+/// there, or one that has the branch. One whose directory is gone (left by
+/// a workspace removed by hand) is dropped, `git worktree remove` of just
+/// that registration in the source, and said so with its full HEAD; one
+/// that exists, or a locked one, refuses. Other registrations whose directories are gone (a
+/// worktree moved, on media not mounted) are not touched.
+fn clear_stale_worktrees(
+    source: &Path,
+    dest: &Path,
+    branch: Option<&str>,
+    report: &Report,
+) -> Result<()> {
+    let all = worktrees(source)?;
+    let has_branch = |w: &Worktree| branch.is_some() && w.branch.as_deref() == branch;
+    let blocking: Vec<&Worktree> = all
+        .iter()
+        .filter(|w| w.path == dest || has_branch(w))
+        .collect();
+    if let Some(w) = blocking.iter().find(|w| !w.prunable && has_branch(w)) {
+        bail!(
+            "branch {} is already checked out at {}{}",
+            branch.expect("matched"),
+            w.path.display(),
+            if w.locked {
+                " (locked: git worktree unlock it, or remove it)"
+            } else {
+                ""
+            }
+        );
+    }
+    for w in blocking.iter().filter(|w| w.prunable) {
+        let path = w.path.to_string_lossy();
+        let head = w
+            .head
+            .as_deref()
+            .map_or(String::new(), |h| format!(" at {h}"));
+        let what = match &w.branch {
+            Some(b) => format!(" (branch {b}{head})"),
+            None if w.head.is_some() => format!(" (detached{head})"),
+            None => String::new(),
+        };
+        git(source, &["worktree", "remove", &path])?;
+        report.say(
+            Tone::Warn,
+            format!(
+                "pruned the worktree {path}{what} of {}, whose directory is gone (git worktree \
+                 remove)",
+                source.display()
+            ),
+        );
+    }
+    Ok(())
 }
 
 /// Checks out the existing local `branch`, fast-forwarding it first when it
 /// is strictly behind the remote's. Never resets: a diverged branch is left
 /// with a warning.
 fn existing_branch(source: &Path, remote: Option<&str>, branch: &str) -> Result<String> {
-    if let Some(at) = checked_out_at(source, branch)? {
-        bail!("branch {branch} is already checked out at {at}");
-    }
     let local = rev(source, &format!("refs/heads/{branch}")).expect("checked by the caller");
     let Some(remote) = remote else {
         return Ok(format!("existing branch {branch}"));
@@ -174,6 +261,7 @@ pub fn add(
     name: &str,
     start: Start,
     fetcher: &Fetcher,
+    report: &Report,
 ) -> Result<PathBuf> {
     let repo = checkout_repo(name)?;
     let repo_config = config.repo(&repo)?;
@@ -188,6 +276,11 @@ pub fn add(
     if let Some(remote) = &remote {
         fetcher.fetch(source, remote)?;
     }
+    let existing = match start {
+        Start::Branch(b) if rev(source, &format!("refs/heads/{b}")).is_some() => Some(b),
+        _ => None,
+    };
+    clear_stale_worktrees(source, &dest, existing, report)?;
     let dest_str = dest.to_string_lossy().into_owned();
     let how = match start {
         Start::Base => {
@@ -290,7 +383,14 @@ pub fn run(
         Some(b) => Start::Branch(b),
         None => Start::Base,
     };
-    let dest = add(config, root, name, start, fetcher)?;
+    let dest = add(
+        config,
+        root,
+        name,
+        start,
+        fetcher,
+        &Report::new("swl ws add"),
+    )?;
     match swl {
         Some(swl) => env_after_add(config, root, swl, &dest.display().to_string()),
         None => {
@@ -329,6 +429,30 @@ mod tests {
         );
         assert_eq!(base_remote(dir, "upstream/master").unwrap(), None);
         assert_eq!(base_remote(dir, "master").unwrap(), None);
+    }
+
+    #[test]
+    fn worktree_list_porcelain() {
+        let text = "worktree /src\nbare\n\n\
+            worktree /ws/a\nHEAD 1111\nbranch refs/heads/feature/x\nprunable gitdir file points to non-existent location\n\n\
+            worktree /ws/b\nHEAD 2222\ndetached\nlocked\n\n\
+            worktree /ws/c\nHEAD 3333\nbranch refs/heads/c\nlocked because\n";
+        let w = |path: &str, head: Option<&str>, branch: Option<&str>, locked, prunable| Worktree {
+            path: PathBuf::from(path),
+            head: head.map(str::to_string),
+            branch: branch.map(str::to_string),
+            locked,
+            prunable,
+        };
+        assert_eq!(
+            parse_worktrees(text),
+            [
+                w("/src", None, None, false, false),
+                w("/ws/a", Some("1111"), Some("feature/x"), false, true),
+                w("/ws/b", Some("2222"), None, true, false),
+                w("/ws/c", Some("3333"), Some("c"), true, false),
+            ]
+        );
     }
 
     #[test]

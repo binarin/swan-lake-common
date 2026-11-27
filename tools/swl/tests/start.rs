@@ -270,3 +270,80 @@ fn start_from_joins_an_open_and_a_merged_mr() {
         "no such MR",
     );
 }
+
+#[test]
+fn start_from_rejoins_a_workspace_removed_by_hand() {
+    let f = Forge::new("start-rejoin");
+    let work = f.root.join("work");
+    fs::create_dir_all(&work).unwrap();
+    let feature = f.commit_on_forge("swan-lake-common", "feature", "c2");
+    f.git(
+        &f.forge_repo("swan-lake-common"),
+        &["update-ref", "refs/pull/1/head", &feature],
+    );
+    f.api
+        .set_pr("swan-lake-common", 1, "open", "feature", &feature, None);
+    let head = publish_consumer(
+        &f,
+        "sl-0004-rejoin",
+        "[inputs.lib]\nrepo = \"swan-lake-common\"\nmr = 1\n",
+        5,
+    );
+    let from = ["start", "--from", "swan-lake#5"];
+    stdout(&f.swl(&work, &from));
+    let ws = work.join("sl-0004-rejoin");
+    let consumer = ws.join("swan-lake");
+    let common = ws.join("swan-lake-common@lib");
+
+    let heads = [&consumer, &common].map(|d| f.git(d, &["rev-parse", "HEAD"]));
+    // rm -rf: the sources still have the worktrees and the branches.
+    fs::remove_dir_all(&ws).unwrap();
+    let out = stdout(&f.swl(&work, &from));
+    for ((repo, dir, branch), at) in [
+        ("swan-lake", &consumer, "sl-0004-rejoin"),
+        ("swan-lake-common", &common, "feature"),
+    ]
+    .into_iter()
+    .zip(&heads)
+    {
+        assert!(
+            out.contains(&format!(
+                "swl start: pruned the worktree {} (branch {branch} at {at}) of {}, whose \
+                 directory is gone (git worktree remove)",
+                dir.display(),
+                f.source(repo).display()
+            )),
+            "{out}"
+        );
+        assert_eq!(
+            f.git(dir, &["symbolic-ref", "--short", "HEAD"]),
+            branch,
+            "{out}"
+        );
+    }
+    assert_eq!(f.git(&consumer, &["rev-parse", "HEAD"]), head);
+    assert_eq!(f.git(&common, &["rev-parse", "HEAD"]), feature);
+    assert!(consumer.join(".envrc.local").is_file());
+
+    // A branch checked out in a worktree that exists is still refused.
+    let elsewhere = work.join("elsewhere");
+    let out = f.swl(
+        &work,
+        &[
+            "start",
+            "--from",
+            "swan-lake#5",
+            "--workspace",
+            elsewhere.to_str().unwrap(),
+        ],
+    );
+    failed(
+        &out,
+        2,
+        &format!(
+            "branch sl-0004-rejoin is already checked out at {}",
+            consumer.display()
+        ),
+    );
+    assert!(!support::text(&out).contains("pruned"));
+}

@@ -16,7 +16,7 @@ use crate::{
     forge::{PrReader, PrState},
     git::{git, git_ok, short},
     manifest::{MANIFEST_FILE, Manifest},
-    report,
+    report::{self, Report},
     shim::find_real_tool,
     style::{self, BOLD, Tone, pad, paint, width},
     workspace::parse_shared_name,
@@ -343,6 +343,7 @@ pub fn execute(
 ) -> Result<Started> {
     std::fs::create_dir_all(root).with_context(|| format!("creating {}", root.display()))?;
     let root = root.canonicalize()?;
+    let report = Report::new("swl start");
     let mut summary = Vec::new();
     for item in items {
         let dest = root.join(&item.name);
@@ -355,7 +356,7 @@ pub fn execute(
                 Target::Branch(b) => Start::Branch(b),
                 Target::Detached(rev) => Start::Detached(rev),
             };
-            ws_add::add(config, &root, &item.name, start, fetcher)?;
+            ws_add::add(config, &root, &item.name, start, fetcher, &report)?;
             if let Some(note) = &item.note {
                 println!("  {note}");
             }
