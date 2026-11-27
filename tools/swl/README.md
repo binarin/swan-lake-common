@@ -478,10 +478,13 @@ nothing. When that branch or those sources cannot be read, it is
 An open consumer MR whose change its base has already (a duplicate of a
 bump that landed by another MR on the same parent, as nixos-config#377 was
 of #376; a rebased copy that landed) is `obsolete: its change is in
-origin/master`, next `close <consumer>#<MR>`, waiting for anyone, with a
-detail line `<consumer>#<MR>: its change is in origin/master already
+<base>`, next `close <consumer>#<MR>`, waiting for anyone, with a
+detail line `<consumer>#<MR>: its change is in <base> already
 (merging it changes nothing)`; unpushed commits of the checkout come first
-(`swl publish`). The test is git's: merging the MR head into the base's tip
+(`swl publish`). Once it is closed the row reads as any closed MR's,
+`reopen <consumer>#<MR>, or swl publish <consumer> for a new MR`; neither
+applies here (a new MR would be obsolete too): remove the workspace
+instead (`swl ws remove`). The test is git's: merging the MR head into the base's tip
 with `git merge-tree --write-tree` (in the object store, no checkout) is
 clean and gives the tip's own tree. A head that its base contains is
 `landed` instead; a change that the base has only in part, or that
@@ -1203,7 +1206,8 @@ whom. Rerun it to continue. The steps:
    entries just has its merge requested. An obsolete consumer MR (its change
    is in its base already, see [Status](#status)) is not rebased, finalized
    or merged: `land` stops there, for anyone, `<consumer>#<MR>: obsolete:
-   its change is in origin/master; close it`. It only reports it: whoever
+   its change is in <base>; close it` (then remove the workspace, `swl ws
+   remove`). It only reports it: whoever
    opened the MR, or the owner, closes it (`swl bump` closes its own, see
    [Bump](#bump)).
 
@@ -1492,14 +1496,22 @@ mirror, and goes on from there.
 - A consumer with nothing to bump whose `swl-bump-common` is still there
   (its change landed by another MR, as nixos-config#377 duplicated #376, or
   it is in the base): when the branch is swl's own (the rules below, as for
-  rebuilding it), its open bump MR is closed (`PATCH
-  /repos/{owner}/{repo}/pulls/{n}` with `{"state": "closed"}`, fj's
-  login), then the branch is deleted, `git push
+  rebuilding it) and moves common no further than the base locks it (each
+  common input at the base's rev or one of its ancestors), its open bump
+  MR is closed (`PATCH /repos/{owner}/{repo}/pulls/{n}` with `{"state":
+  "closed"}`, fj's login), then the branch is deleted, `git push
   --force-with-lease=refs/heads/swl-bump-common:<head read> <remote>
   --delete refs/heads/swl-bump-common` from the consumer's source; without
-  an open MR it is only deleted. A branch with anything else on it is left
+  an open MR it is only deleted. Only the consumer's own bump MR is
+  closed: an open MR at the branch's head into another branch, or from
+  another repo, waits for anyone, and nothing is closed or deleted. A
+  branch with anything else on it is left
   and reported (`… is not needed any more, but it has commits other than
-  swl bump's own; left as it is`). A close that the forge refuses (403:
+  swl bump's own; left as it is`). One that moves common past this run's
+  rev may be another run's newer bump, pushed meanwhile: it is left too,
+  and waits for nobody (`… moves lib to <rev>, past <target>, which this
+  run bumps to: another run's newer bump, maybe; left as it is; rerun swl
+  bump`). A close that the forge refuses (403:
   the agent may not edit the MR) waits for the owner, to close it on the
   forge (its URL is given), then rerun, which deletes the branch; a refused
   deletion (a protected branch) waits for the owner with `git -C <source>

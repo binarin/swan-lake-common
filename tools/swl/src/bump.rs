@@ -35,7 +35,7 @@ use crate::{
     ancestry::{self, History, Source},
     check,
     config::{Config, RepoConfig},
-    forge::{CloseOutcome, ForgeWriter, PrInfo, PrReader, PrState, pr_url},
+    forge::{CloseOutcome, ForgeWriter, PrInfo, PrReader, PrState, pr_url, slug},
     git::{git, git_ok, is_rev, short, valid_branch},
     land::{self, Lander, Rejection, Repeated, Step, push_rejection, stop},
     lock_change, lock_rules,
@@ -960,9 +960,9 @@ impl Bumper<'_> {
             return match (at, &tip) {
                 (Some(at), Some(tip)) => {
                     self.report().outcome(Tone::Good, at);
-                    self.drop_unneeded(c, tip)
+                    self.drop_unneeded(c, tip, target, common_src)
                 }
-                (None, Some(tip)) => self.drop_unneeded(c, tip),
+                (None, Some(tip)) => self.drop_unneeded(c, tip, target, common_src),
                 (Some(at), None) => {
                     self.report().end(Tone::Good, at);
                     Ok(Step::Done)
@@ -1158,12 +1158,21 @@ impl Bumper<'_> {
         Ok(())
     }
 
-    /// A consumer with nothing to bump whose bump branch is at `tip`: when
-    /// the branch is swl bump's own (as [`Bumper::foreign_branch`] judges it
-    /// for a rebuild), its open bump MR is closed, then the branch is
-    /// deleted with a lease on `tip`. Anything else is left and reported. A
-    /// refused close or delete waits for the owner.
-    fn drop_unneeded(&self, c: &Consumer, tip: &str) -> Result<Step> {
+    /// A consumer with nothing to bump to `target` whose bump branch is at
+    /// `tip`: when the branch is swl bump's own (as [`Bumper::foreign_branch`]
+    /// judges it for a rebuild) and moves common no further than the base
+    /// locks it ([`Bumper::ahead_of_base`]), its open bump MR is closed, then
+    /// the branch is deleted with a lease on `tip`. Anything else is left and
+    /// reported; a branch that moves common further may be another run's
+    /// newer bump, so it waits for nobody. A refused close or delete waits
+    /// for the owner.
+    fn drop_unneeded(
+        &self,
+        c: &Consumer,
+        tip: &str,
+        target: &str,
+        common_src: &Path,
+    ) -> Result<Step> {
         let name = &c.name;
         let unneeded = format!(
             "{name}: {BUMP_BRANCH} (at {}) is not needed any more",
@@ -1176,6 +1185,18 @@ impl Bumper<'_> {
                 format!("{unneeded}, but it {why}; left as it is"),
             );
             return Ok(Step::Done);
+        }
+        if let Some((input, rev)) = self.ahead_of_base(c, tip, common_src)? {
+            return stop(
+                Waits::Nobody,
+                format!(
+                    "{name}: {BUMP_BRANCH} (at {}) moves {input} to {}, past {}, which this run \
+                     bumps to: another run's newer bump, maybe; left as it is; rerun {CMD}",
+                    short(tip),
+                    short(&rev),
+                    short(target)
+                ),
+            );
         }
         self.report().step(&unneeded);
         let mut open = self
@@ -1195,6 +1216,23 @@ impl Bumper<'_> {
                         "{which}: the forge has its head at {}, not {} yet; rerun {CMD}",
                         short(&info.head_sha),
                         short(tip)
+                    ),
+                );
+            }
+            // Only the consumer's own bump MR into its base is closed.
+            if info.base_ref.as_deref() != Some(c.branch.as_str())
+                || info.head_repo.as_deref().is_some_and(|r| r != slug(name))
+            {
+                return stop(
+                    Waits::Anyone,
+                    format!(
+                        "{which}, open at {BUMP_BRANCH}'s head {}, is not {name}'s bump MR into \
+                         {} (it is from {} into {}): check it on the forge; {BUMP_BRANCH} is \
+                         left",
+                        short(tip),
+                        c.branch,
+                        info.head_repo.as_deref().unwrap_or("(unknown)"),
+                        info.base_ref.as_deref().unwrap_or("(unknown)")
                     ),
                 );
             }
@@ -1249,6 +1287,33 @@ impl Bumper<'_> {
         self.report()
             .end(Tone::Good, format!("{name}: deleted {BUMP_BRANCH}"));
         Ok(Step::Done)
+    }
+
+    /// A common input that the bump branch at `tip` locks at a rev that is
+    /// neither the one the consumer's base locks nor one of its ancestors
+    /// in common (asked of `common_src`, fetched by this run): its name and
+    /// that rev. A branch that is in the base has none.
+    fn ahead_of_base(
+        &self,
+        c: &Consumer,
+        tip: &str,
+        common_src: &Path,
+    ) -> Result<Option<(String, String)>> {
+        if is_ancestor(&c.source, tip, &c.head) {
+            return Ok(None);
+        }
+        let Some(lock) = check::lock_at(&c.source, tip)? else {
+            return Ok(None);
+        };
+        for i in &c.inputs {
+            let Some(rev) = locked_rev(&lock, &i.name) else {
+                continue;
+            };
+            if rev != i.rev && !is_ancestor(common_src, &rev, &i.rev) {
+                return Ok(Some((i.name.clone(), rev)));
+            }
+        }
+        Ok(None)
     }
 
     /// Why the bump branch at `tip` is not swl bump's own, if it is not. It

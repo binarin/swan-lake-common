@@ -1321,3 +1321,169 @@ fn bump_starts_a_consumer_over_when_its_base_moves_before_the_push() {
     );
     t.no_worktrees_left();
 }
+
+#[test]
+fn bump_leaves_a_bump_branch_that_moves_common_past_its_target() {
+    let t = Bump::new("bump-newer-branch");
+    // Common is current everywhere; swan-lake's bump branch, as another run
+    // would push it after promoting a newer common, moves lib past it, on
+    // swan-lake's master as it is.
+    let c1 = t.rev(COMMON, "master");
+    let newer = t.f.commit_on_forge(COMMON, "feature", "c2");
+    let dir = t.f.clone_elsewhere("swan-lake", "newer-bump");
+    t.f.git(&dir, &["checkout", "-qB", BRANCH, "origin/master"]);
+    let mut lock: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(dir.join("flake.lock")).unwrap()).unwrap();
+    let key = lock["nodes"]["root"]["inputs"]["lib"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    lock["nodes"][&key]["locked"]["rev"] = newer.clone().into();
+    fs::write(dir.join("flake.lock"), lock.to_string()).unwrap();
+    let subject = format!("swl: bump common to {}", short(&newer));
+    t.f.git(&dir, &["commit", "-qam", &subject]);
+    t.f.git(&dir, &["push", "-q", "origin", BRANCH]);
+    let tip = t.rev("swan-lake", BRANCH);
+    let sl = t.f.forge_repo("swan-lake");
+    t.f.git(&sl, &["update-ref", "refs/pull/1/head", &tip]);
+    t.f.api.set_pr("swan-lake", 1, "open", BRANCH, &tip, None);
+
+    // This run has nothing to bump: it leaves that branch and its MR.
+    let out = t.bump(&[]);
+    failed(
+        &out,
+        5,
+        &format!(
+            "waits for nobody: swan-lake: {BRANCH} (at {}) moves lib to {}, past {}, which this \
+             run bumps to: another run's newer bump, maybe; left as it is; rerun swl bump",
+            short(&tip),
+            short(&newer),
+            short(&c1)
+        ),
+    );
+    assert_eq!(t.rev("swan-lake", BRANCH), tip);
+    assert_eq!(t.pr_state("swan-lake", 1), "open");
+    assert!(t.f.api.writes().is_empty(), "{:?}", t.f.api.writes());
+
+    // Its change lands on master: the branch is not needed any more, but
+    // the open MR at its head goes into another branch: not closed, for
+    // anyone.
+    t.land_a_duplicate("swan-lake");
+    let path = "/api/v1/repos/binarin/swan-lake/pulls/1";
+    let mut pr: serde_json::Value =
+        serde_json::from_str(&t.f.api.responses.lock().unwrap()[path]).unwrap();
+    pr["base"]["ref"] = "release".into();
+    t.f.api
+        .responses
+        .lock()
+        .unwrap()
+        .insert(path.into(), pr.to_string());
+    failed(
+        &t.bump(&[]),
+        4,
+        &format!(
+            "waits for anyone: swan-lake#1, open at {BRANCH}'s head {}, is not swan-lake's bump \
+             MR into master (it is from binarin/swan-lake into release): check it on the forge; \
+             {BRANCH} is left",
+            short(&tip)
+        ),
+    );
+    assert_eq!(t.rev("swan-lake", BRANCH), tip);
+    assert!(t.f.api.writes().is_empty(), "{:?}", t.f.api.writes());
+}
+
+/// A `post-update` hook that, after each push to the bump branch, moves
+/// master on: with `copy`, to a copy of the pushed bump (as another run's
+/// MR of the same change merging), once; else to a new commit of master's
+/// tree, every time.
+fn moving_master(copy: bool) -> String {
+    let (guard, parent_tree) = if copy {
+        (
+            "[ -f hooks/once ] || exit 0; rm -f hooks/once",
+            "\"$(git rev-parse refs/heads/@BRANCH@)^{tree}\"",
+        )
+    } else {
+        (":", "\"master^{tree}\"")
+    };
+    format!(
+        "#!/bin/sh\ncase \" $* \" in *\" refs/heads/@BRANCH@ \"*) ;; *) exit 0 ;; esac\n{guard}\n\
+         moved=$(git commit-tree -p refs/heads/master -m 'landed meanwhile' {parent_tree})\n\
+         git update-ref refs/heads/master \"$moved\"\n"
+    )
+    .replace("@BRANCH@", BRANCH)
+}
+
+#[test]
+fn bump_starts_a_consumer_over_when_its_base_moves_before_its_mr_is_opened() {
+    let t = Bump::new("bump-base-race-open");
+    t.f.commit_on_forge("zwanenzang", "master", "z2");
+    let sl = t.f.forge_repo("swan-lake");
+
+    // swan-lake's master moves on after every push of its bump branch: four
+    // passes, then it waits for nobody; no MR is opened.
+    t.f.hook("swan-lake", "post-update", &moving_master(false));
+    let out = t.bump(&[]);
+    failed(
+        &out,
+        5,
+        "(found before opening its bump MR), 4 times in this run; rerun swl bump",
+    );
+    assert_eq!(
+        out_text(&out)
+            .matches("(found before opening its bump MR): starting swan-lake over on it")
+            .count(),
+        3,
+        "{}",
+        text(&out)
+    );
+    assert!(
+        !t.f.api
+            .writes()
+            .iter()
+            .any(|w| w.starts_with("POST /api/v1/repos/binarin/swan-lake/pulls ")),
+        "{:?}",
+        t.f.api.writes()
+    );
+    let stale = t.rev("swan-lake", BRANCH);
+    assert_ne!(
+        t.rev("swan-lake", &format!("{BRANCH}^")),
+        t.rev("swan-lake", "master")
+    );
+
+    // Next run: the rebuilt bump lands by another MR right after its push
+    // (nixos-config#376 against #377): the consumer starts over, has the
+    // change, and its branch is deleted without an MR.
+    fs::write(sl.join("hooks/once"), "").unwrap();
+    t.f.hook("swan-lake", "post-update", &moving_master(true));
+    let out = t.bump(&[]);
+    failed(&out, 5, "nixos-config#1 waits for CI");
+    let log = out_text(&out);
+    assert!(
+        log.contains(&format!(
+            "as origin's {BRANCH} (replacing its own commit {})",
+            short(&stale)
+        )),
+        "{log}"
+    );
+    let bumped = t.rev(COMMON, "master");
+    assert!(
+        log.contains(&format!(
+            "(found before opening its bump MR): starting swan-lake over on it\n├─ common is at \
+             {} already\n├─ {BRANCH} (at ",
+            short(&bumped)
+        )),
+        "{log}"
+    );
+    assert!(log.contains(&format!("└─ deleted {BRANCH}\n")), "{log}");
+    assert!(!t.has_branch("swan-lake"));
+    assert_eq!(t.locked("swan-lake", "master", "lib"), bumped);
+    assert!(
+        !t.f.api
+            .writes()
+            .iter()
+            .any(|w| w.starts_with("POST /api/v1/repos/binarin/swan-lake/pulls ")),
+        "{:?}",
+        t.f.api.writes()
+    );
+    t.no_worktrees_left();
+}
