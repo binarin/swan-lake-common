@@ -43,6 +43,7 @@ let
         jinx
         ace-window
 
+        ob-http
         wgrep
         anki-editor
         avy
