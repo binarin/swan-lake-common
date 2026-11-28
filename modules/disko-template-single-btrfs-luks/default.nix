@@ -65,8 +65,9 @@
           default = null;
           description = ''
             Clevis JWE, sealed to this machine's TPM 2.0, that holds the LUKS
-            passphrase. When null, TPM unlock is off and every boot asks for
-            the passphrase.
+            passphrase. A Nix path is copied into the system closure for remote
+            deployment; an absolute string names a file already on the target.
+            When null, TPM unlock is off and every boot asks for the passphrase.
           '';
         };
         initrdSsh = {
@@ -190,7 +191,9 @@
         (lib.mkIf (cfg.clevisSecretFile != null) {
           boot.initrd.clevis = {
             enable = true;
-            devices.cryptroot.secretFile = cfg.clevisSecretFile;
+            # Interpolation imports a Nix path and retains its store context;
+            # toString alone leaves it inside the flake source, outside the closure.
+            devices.cryptroot.secretFile = "${cfg.clevisSecretFile}";
           };
         })
       ];
@@ -201,7 +204,9 @@
     let
       device = "/dev/disk/by-id/test-disk";
       authorizedKey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDPQXmEVMVLmeFRyafKMVWgPDkv8/uRBTwmcEDatZzMD test";
-      jwe = pkgs.writeText "test.jwe" "not a real JWE";
+      jwe = ./_test.jwe;
+      storeJwe = "${jwe}";
+      clevisConfig = evalWith [ { swanLake.encryptedRoot.clevisSecretFile = jwe; } ];
       evalWith =
         extraModules:
         (inputs.nixpkgs.lib.nixosSystem {
@@ -341,11 +346,11 @@
           initrdSecrets = {
             ${hostKey} = hostKey;
           }
-          // lib.optionalAttrs clevis { "/etc/clevis/cryptroot.jwe" = toString jwe; };
+          // lib.optionalAttrs clevis { "/etc/clevis/cryptroot.jwe" = storeJwe; };
           clevis = {
             enable = clevis;
             useTang = false;
-            devices = lib.optionalAttrs clevis { cryptroot = toString jwe; };
+            devices = lib.optionalAttrs clevis { cryptroot = storeJwe; };
           };
           bootEntryEditor = false;
           clevisInstalled = true;
@@ -363,8 +368,17 @@
           expected = expectedWith false;
         };
         with-clevis = {
-          actual = summarize (evalWith [ { swanLake.encryptedRoot.clevisSecretFile = jwe; } ]);
+          actual = summarize clevisConfig;
           expected = expectedWith true;
+        };
+        with-target-local-clevis = {
+          actual = summarize (evalWith [
+            { swanLake.encryptedRoot.clevisSecretFile = "/etc/secrets/initrd/cryptroot.jwe"; }
+          ]);
+          expected = lib.recursiveUpdate (expectedWith true) {
+            initrdSecrets."/etc/clevis/cryptroot.jwe" = "/etc/secrets/initrd/cryptroot.jwe";
+            clevis.devices.cryptroot = "/etc/secrets/initrd/cryptroot.jwe";
+          };
         };
       };
 
@@ -390,6 +404,9 @@
         ) "disko-template-single-btrfs-luks: failing assertions: ${builtins.toJSON baseFailedAssertions}";
         assert lib.assertMsg storeHostKeyRejected
           "disko-template-single-btrfs-luks: a host key in the store is not rejected";
+        assert lib.assertMsg (builtins.hasContext
+          clevisConfig.boot.initrd.secrets."/etc/clevis/cryptroot.jwe"
+        ) "disko-template-single-btrfs-luks: the JWE must retain its store dependency";
         pkgs.writeText "disko-template-single-btrfs-luks-check.json" (
           builtins.toJSON (lib.mapAttrs (_: c: c.actual) cases)
         );
