@@ -1487,3 +1487,37 @@ fn bump_starts_a_consumer_over_when_its_base_moves_before_its_mr_is_opened() {
     );
     t.no_worktrees_left();
 }
+
+#[test]
+fn bump_fast_forwards_the_views_at_the_end_of_a_successful_run() {
+    let t = Bump::new("bump-views");
+    let view = t.f.add_view("swan-lake");
+    let dirty = t.f.add_view("nixos-config");
+    let old = t.f.git(&view, &["rev-parse", "HEAD"]);
+    let new = t.f.commit_on_forge("swan-lake", "master", "sl-2");
+    fs::write(dirty.join("value.txt"), "edited").unwrap();
+
+    // A dry run writes nothing, the views neither.
+    let log = stdout(&t.bump(&["--dry-run"]));
+    assert!(log.contains("swl bump: nothing to bump"), "{log}");
+    assert!(!log.contains("views"), "{log}");
+    assert_eq!(t.f.git(&view, &["rev-parse", "HEAD"]), old);
+
+    let log = stdout(&t.bump(&[]));
+    assert!(
+        log.contains(&format!(
+            "swl bump: nothing to bump\nswl bump: views\n├─ nixos-config: skipped {}: it has \
+             uncommitted changes\n├─ swan-lake: fast-forwarded {} from {} to {} (origin/master)\n╵",
+            dirty.display(),
+            view.display(),
+            short(&old),
+            short(&new)
+        )),
+        "{log}"
+    );
+    assert_eq!(t.f.git(&view, &["rev-parse", "HEAD"]), new);
+
+    // Up to date: nothing to say.
+    let log = stdout(&t.bump(&[]));
+    assert!(!log.contains("swan-lake: fast-forwarded"), "{log}");
+}

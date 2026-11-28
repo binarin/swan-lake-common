@@ -1015,6 +1015,44 @@ impl Forge {
         );
     }
 
+    /// A view of `repo`, as the umbrella's checkouts: a worktree of its
+    /// source on `master` at `origin/master`, set as `view` in the config.
+    pub fn add_view(&self, repo: &str) -> PathBuf {
+        let view = self.root.join("umbrella").join(repo);
+        self.git(
+            &self.source(repo),
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "master",
+                &view.display().to_string(),
+                "origin/master",
+            ],
+        );
+        self.set_view(repo, &view);
+        view
+    }
+
+    /// Sets `view` of `repo` in the config, after its `source`.
+    pub fn set_view(&self, repo: &str, view: &Path) {
+        let config = self.root.join("repos.toml");
+        let source = format!("source = \"{}\"", self.source(repo).display());
+        let text = fs::read_to_string(&config).unwrap();
+        let mut lines: Vec<String> = text.lines().map(String::from).collect();
+        let at = lines
+            .iter()
+            .position(|l| *l == source)
+            .unwrap_or_else(|| panic!("no {source:?} in\n{text}"));
+        let line = format!("view = \"{}\"", view.display());
+        match lines.get(at + 1) {
+            Some(l) if l.starts_with("view = ") => lines[at + 1] = line,
+            _ => lines.insert(at + 1, line),
+        }
+        fs::write(config, lines.join("\n") + "\n").unwrap();
+    }
+
     pub fn source(&self, repo: &str) -> PathBuf {
         self.sources.join(format!("{repo}.git"))
     }

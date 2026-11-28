@@ -42,6 +42,8 @@ pub struct RepoConfig {
     /// Extra URL forms for this repo only, besides `url_patterns`.
     #[serde(default)]
     pub urls: Vec<String>,
+    /// A read-only checkout on `master` that `swl views` fast-forwards.
+    pub view: Option<PathBuf>,
 }
 
 impl RepoConfig {
@@ -228,6 +230,7 @@ url_patterns = ["git+file:///srv/{repo}"]
 [repos.zw]
 source = "/srv/zw"
 urls = ["git+https://example.org/zw-mirror"]
+view = "/u/zw"
 "#,
         )
         .unwrap();
@@ -235,6 +238,7 @@ urls = ["git+https://example.org/zw-mirror"]
         assert!(c.url_names_repo("git+https://example.org/zw-mirror", "zw"));
         assert!(!c.url_names_repo("github:binarin/zw", "zw"));
         assert_eq!(c.repo("zw").unwrap().base(), "origin/master");
+        assert_eq!(c.repo("zw").unwrap().view, Some(PathBuf::from("/u/zw")));
         assert!(c.repo("other").is_err());
     }
 

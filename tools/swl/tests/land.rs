@@ -804,6 +804,9 @@ fn land_merges_an_mr_with_green_checks_directly() {
 
     // CI reports success on the landing: the forge merges it by itself, and
     // the rerun finds it merged.
+    // The run that lands it fast-forwards the consumer's view.
+    let view = t.f.add_view("swan-lake");
+    let old = t.f.git(&view, &["rev-parse", "HEAD"]);
     let landing = t.f.git(&t.consumer, &["rev-parse", "HEAD"]);
     let writes = t.f.api.writes().len();
     t.f.api.set_status("swan-lake", &landing, "success");
@@ -812,6 +815,18 @@ fn land_merges_an_mr_with_green_checks_directly() {
     assert!(log.contains("every MR of the change is merged"), "{log}");
     assert!(!t.ws.exists(), "{log}");
     assert_eq!(t.f.api.writes().len(), writes, "nothing more to write");
+    let new =
+        t.f.git(&t.f.forge_repo("swan-lake"), &["rev-parse", "master"]);
+    assert_eq!(t.f.git(&view, &["rev-parse", "HEAD"]), new);
+    assert!(
+        log.contains(&format!(
+            "swl land: views\n├─ swan-lake: fast-forwarded {} from {} to {} (origin/master)\n╵",
+            view.display(),
+            &old[..12],
+            &new[..12]
+        )),
+        "{log}"
+    );
 }
 
 #[test]

@@ -32,6 +32,7 @@ mod status_tree;
 mod style;
 mod tempdir;
 mod version;
+mod views;
 mod workspace;
 mod workspace_location;
 mod ws_add;
@@ -196,6 +197,15 @@ enum Commands {
         /// Seconds between checks while waiting
         #[arg(long, default_value_t = 10, value_name = "SECONDS")]
         interval: u64,
+    },
+    /// Fast-forward each repo's view, its umbrella checkout on master, to the repo's base
+    #[command(
+        after_help = "Exit status: 0 when every view is up to date, fast-forwarded or skipped with a warning, 2 on errors."
+    )]
+    Views {
+        /// Do not fetch; use the refs already known
+        #[arg(long)]
+        no_fetch: bool,
     },
     // In `about`, not a doc comment, so that rustdoc does not read the
     // placeholder as an HTML tag.
@@ -502,7 +512,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 Box::new(forge::FjWriter::from_env()?)
             };
             let writer = writer.as_ref();
-            return match from {
+            let code = match from {
                 Some(from) => land::run_from(
                     &config,
                     &std::env::current_dir().context("current directory")?,
@@ -520,7 +530,11 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     writer,
                     &opts,
                 ),
-            };
+            }?;
+            if code == ExitCode::SUCCESS && !dry_run {
+                views::quietly("swl land", &config);
+            }
+            return Ok(code);
         }
         Commands::Refresh {
             workspace_name,
@@ -569,12 +583,22 @@ fn run(cli: Cli) -> Result<ExitCode> {
             } else {
                 Box::new(forge::FjWriter::from_env()?)
             };
-            return bump::run(
+            let code = bump::run(
                 &config,
                 &forge::ForgeReader::from_env(),
                 writer.as_ref(),
                 &ancestry::RemoteHistory::from_env(),
                 &opts,
+            )?;
+            if code == ExitCode::SUCCESS && !dry_run {
+                views::quietly("swl bump", &config);
+            }
+            return Ok(code);
+        }
+        Commands::Views { no_fetch } => {
+            return views::run(
+                &Config::load(config_flag)?,
+                &ws_add::Fetcher::new(!no_fetch),
             );
         }
         Commands::Promote {

@@ -15,8 +15,8 @@ where it stands (and `swl ls` where all work in progress stands), `swl
 refresh` rebases its MR branches onto their bases, and `swl land` takes it
 to master. `swl bump` moves
 common's inputs forward and the consumers after it; `swl promote` promotes
-what reached common's master without a consumer. `plan` is not part of
-swl yet.
+what reached common's master without a consumer. `swl views` keeps the
+umbrella's `master` checkouts current. `plan` is not part of swl yet.
 
 ## Workspace layout
 
@@ -53,6 +53,7 @@ swl land [--dry-run] [--keep] [--from swan-lake#12]   # merge, promote, finalize
 swl refresh [--dry-run]                   # the change's MR branches rebased onto their bases, pushed with a lease
 swl bump [--dry-run] [--check]            # common's inputs forward, promoted, a bump MR per consumer
 swl promote [<rev>] [--dry-run]           # common's swan-lake-current fast-forwarded to master (or <rev> of it)
+swl views [--no-fetch]                    # the configured views (master checkouts) fast-forwarded to their bases
 swl hook zsh|bash                         # the shell function swl, which cds after start: eval "$(swl hook zsh)"
 ```
 
@@ -245,6 +246,36 @@ terminal.
   [Status](#status).
 - `ls [--no-fetch]` shows all work in progress: a line per workspace, and
   the forge's open MRs that no workspace holds; see [Ls](#ls).
+- `views [--no-fetch]` keeps the views current: the read-only checkouts on
+  `master` that the config's `view` keys name (see [Config](#config)), such
+  as the umbrella's `nixos-config` or `swan-lake`. Repos without `view` are
+  left out. For each view, in the order of the repo names:
+  - A missing path, or one that is not the top of a git checkout, is
+    skipped with a warning. So is a view on another branch than `master`,
+    detached, or with uncommitted changes to tracked files (untracked files
+    do not count).
+  - Then it fetches the remote that the repo's `base` names (`origin` for
+    `origin/master`) in the view's repository, once per repository: for a
+    worktree of the source, that is the source. `--no-fetch` skips it.
+  - Then `git merge --ff-only <base>`. It never rebases: a `master` with
+    commits that are not on the base (ahead or diverged) is skipped with a
+    warning, naming how many. A view at the base is up to date, and said
+    so.
+
+  A section per view, closed by its outcome:
+
+  ```
+  swl views: nixos-config
+  └─ fast-forwarded /home/binarin/personal-workspace/swan-lake-umbrella/nixos-config from 4f5d3c028d43 to 8ab4ff130b05 (origin/master)
+  swl views: swan-lake
+  └─ skipped /home/binarin/personal-workspace/swan-lake-umbrella/swan-lake: it has uncommitted changes
+  ```
+
+  A skipped view is left as it is. Exit status: 0 when every view is up to
+  date, fast-forwarded or skipped with a warning, 2 on errors (a fetch or
+  merge that fails; the other views are still done). `land` and `bump` run
+  it quietly at the end of a successful run (see [Landing](#landing) and
+  [Bump](#bump)).
 - `hook zsh|bash` prints, on stdout, the shell function `swl` for an
   interactive shell, to be loaded with `eval "$(swl hook zsh)"` (or `bash`)
   in its rc file; `homeModules.swl` adds that line to home-manager's zsh and
@@ -294,7 +325,7 @@ git -C <source> branch -D <branch>                     # drop the stale branch, 
 ## Progress output
 
 The multi-step commands (`land`, `bump`, `promote`, `refresh`, `publish`,
-`finalize`, `ws remove`) print their progress as a tree, as the run goes on: a section
+`finalize`, `ws remove`, `views`) print their progress as a tree, as the run goes on: a section
 per repo, MR or phase, headed `swl <cmd>: <name>`, its steps nested below.
 A `swl bump` that bumps common and opens the consumers' bump MRs:
 
@@ -330,7 +361,8 @@ swl bump: swan-lake
   removal; `bump` one for common and one per consumer; `promote` one for
   what it promotes (`swan-lake-common origin/master`); `refresh` one per MR;
   `publish` one per checkout; `finalize` one for `swl.toml`; `ws remove`
-  one, `workspace <dir>`.
+  one, `workspace <dir>`; `views` one per view, and `land` and `bump` one,
+  `views`, at their end.
 - `├─ ` a step: what swl does (with `--dry-run`, `would …`) or found;
   outcomes (pushed, promoted, merged, committed, an MR opened) bold, in
   green.
@@ -709,7 +741,13 @@ base = "origin/master"        # optional; the default
 [repos.zwanenzang]
 source = "/home/binarin/personal-workspace/swan-lake-umbrella/zwanenzang"
 urls = ["git+https://example.org/mirror/zwanenzang"]   # optional extra forms
+view = "/home/binarin/personal-workspace/swan-lake-umbrella/zwanenzang"   # optional
 ```
+
+`view` is optional: a read-only checkout of the repo on `master`, which
+`swl views` fast-forwards to the repo's base. It is usually a worktree of
+`source`, or `source` itself, as for zwanenzang. Repos without it have no
+view; swl does not look for one among the source's worktrees.
 
 `workspaces` may be absolute or relative to the config file's directory;
 `~` and `~/…` expand to `$HOME`. It need not exist yet: `start` creates it.
@@ -1238,6 +1276,10 @@ whom. Rerun it to continue. The steps:
    merged MR (its MR merged, also once the merge deleted its branch and a
    fetch pruned it, or its pushed branch, now in the base, the head of a
    merged MR) has nothing to land and stays.
+5. After a run that exits 0, but for a dry run, it runs `swl views`
+   quietly: a section `views` with the views it fast-forwarded or skipped,
+   nothing for those up to date. Its problems are warnings there; they
+   never change the exit status.
 
 A consumer at its base (`no change`, `not a change`) is skipped, unless the
 workspace's branch has an open MR in its repo (see [Status](#status)): then
@@ -1272,10 +1314,10 @@ Writes are only those: the title and merge requests through fj's login (see
 [Forge access](#forge-access)), the git pushes of the promotion, of the
 landing commit and of rebased MR branches (with a lease, the checkouts
 moved to them, and `swl env` rerun when a lock moved), the finalize commit,
-and the workspace removal; besides, the scratch worktrees of rebases, and
-fetches of the base branches and the MRs' branches into the sources. A write
-that one run did already and that the forge does not show yet is not
-repeated: the run stops, rerun it.
+the workspace removal, and the views' fast-forwards; besides, the scratch
+worktrees of rebases, and fetches of the base branches and the MRs'
+branches into the sources. A write that one run did already and that the
+forge does not show yet is not repeated: the run stops, rerun it.
 
 ### Refresh
 
@@ -1530,6 +1572,8 @@ mirror, and goes on from there.
   between that read and the push, or after the MR is opened: then the MR is
   rebuilt (or found obsolete and closed) by the next run.
 - Nothing new anywhere: `nothing to bump`, and nothing is written.
+- At the end of a run that exits 0, but for a dry run, `swl views` runs
+  quietly, as at the end of `land` (see [Landing](#landing)).
 
 `--dry-run` reads as a run does, prints the plan and the first write it
 would do, and writes nothing on the forge or GitHub: no worktree, commit,
